@@ -79,7 +79,7 @@ deep_r_1_model = {
         const bool inhibitory = ((rowInhibitory[id_post / 32] & (1 << (id_post % 32))) != 0);
         
         // If weight sign doesn't match inhibitoryness
-        if(signbit(g) != inhibitory) {
+        if((g < 0.0) != inhibitory) {
             // Increment dormant counter
             NumDormant++;
             
