@@ -15,7 +15,7 @@ _rm_regex = re.compile(r"!rm -rf /content/ml_genn-ml_genn_([_0-9a-zA-Z]+)")
 _wget_regex = re.compile(r"!wget https://github.com/genn-team/ml_genn/archive/refs/tags/ml_genn_([_0-9a-zA-Z]+).zip")
 _unzip_regex = re.compile(r"!unzip -q ml_genn_([_0-9a-zA-Z]+).zip")
 _pip_regex = re.compile(r"!pip install ./ml_genn-ml_genn_([_0-9a-zA-Z]+)/ml_genn")
-
+_pip_tf_regex = re.compile(r"!pip install ./ml_genn-ml_genn_([_0-9a-zA-Z]+)/ml_genn_tf")
 
 def update_ml_genn(source, ml_genn_tag):
     # Search for matches
@@ -23,6 +23,7 @@ def update_ml_genn(source, ml_genn_tag):
     wget_match = _wget_regex.search(source)
     unzip_match = _unzip_regex.search(source)
     pip_match = _pip_regex.search(source)
+    pip_tf_match = _pip_tf_regex.search(source)
     
     if rm_match and wget_match and unzip_match and pip_match:
         print(f"\tOld mlGeNN tag {rm_match[1]}")
@@ -37,6 +38,12 @@ def update_ml_genn(source, ml_genn_tag):
         source = _wget_regex.sub(f"!wget https://github.com/genn-team/ml_genn/archive/refs/tags/ml_genn_{ml_genn_tag}.zip", source)
         source = _unzip_regex.sub(f"!unzip -q ml_genn_{ml_genn_tag}.zip", source)
         source = _pip_regex.sub(f"!pip install ./ml_genn-ml_genn_{ml_genn_tag}/ml_genn", source)
+        
+        if pip_tf_match:
+            print("\tmlGeNN TF usage installation detected")
+            assert rm_match[1] == pip_tf_match[1]
+            source = _pip_tf_regex.sub(f"!pip install ./ml_genn-ml_genn_{ml_genn_tag}/ml_genn_tf", source)
+    
         return source
     else:
         raise RuntimeError("mlGeNN installation not found in cell")
