@@ -50,16 +50,3 @@ Directly train a simple three layer network of densely connected leaky integrate
     
 .. image:: https://colab.research.google.com/assets/colab-badge.svg
    :target: https://colab.research.google.com/github/genn-team/ml_genn/blob/master/docs/tutorials/tutorial_4.ipynb
-
-
-Training using TensorFlow and converting to an SNN using FewSpike
-=================================================================
-Create and train a simple convolutional neural network in Keras, convert to SNN using `FewSpike <http://dx.doi.org/10.1038/s42256-021-00311-4>`_ and evaluate using mlGeNN
-
-.. toctree::
-    :maxdepth: 3
-
-    tutorial_5.ipynb
-    
-.. image:: https://colab.research.google.com/assets/colab-badge.svg
-   :target: https://colab.research.google.com/github/genn-team/ml_genn/blob/master/docs/tutorials/tutorial_5.ipynb
