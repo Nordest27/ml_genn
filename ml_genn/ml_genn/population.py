@@ -68,7 +68,7 @@ class Population:
 
     @property
     def outgoing_connections(self) -> List["Connection"]:
-        """Outgoing connections fromt his population"""
+        """Outgoing connections from this population"""
         return self._outgoing_connections
 
     @property

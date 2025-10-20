@@ -83,7 +83,6 @@ else:
 print(f"Max spikes {max_spikes}, latest spike time {latest_spike_time}")
 
 # Get number of input and output neurons from dataset 
-# and round up outputs to power-of-two
 num_input = int(np.prod(dataset.sensor_size))
 num_output = len(dataset.classes)
 
