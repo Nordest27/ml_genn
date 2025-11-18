@@ -4,10 +4,10 @@ import matplotlib.pyplot as plt
 from ml_genn import Connection, Population, Network
 from ml_genn.callbacks import (OptimiserParamSchedule, SpikeRecorder,
                                VarRecorder)
-from ml_genn.compilers import EPropCompiler
-from ml_genn.connectivity import Dense
+from ml_genn.compilers import EPropCompiler, RandEPropCompiler
+from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
-from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, SpikeInput
+from ml_genn.neurons import LeakyIntegrate, SpikeInput, AdaptiveLeakyIntegrateFire
 from ml_genn.optimisers import Adam
 
 from time import perf_counter
@@ -69,19 +69,21 @@ with network:
     # Populations
     input = Population(SpikeInput(max_spikes=len(in_spike_ids)),
                                   NUM_INPUT, record_spikes=True)
-    hidden = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
+    hidden = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
                                            tau_refrac=5.0),
                         NUM_HIDDEN, record_spikes=True)
     output = Population(LeakyIntegrate(tau_mem=20.0, readout="var"),
                         NUM_OUTPUT)
     
     # Connections
-    Connection(input, hidden, Dense(Normal(sd=1.0 / np.sqrt(NUM_INPUT))))
-    Connection(hidden, hidden, Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN))))
-    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN))))
+    Connection(input,  hidden, FixedProbability(0.5, (Normal(sd=1.0 / np.sqrt(NUM_INPUT)))))
+    Connection(hidden, hidden, FixedProbability(0.1, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
+    Connection(hidden, output, FixedProbability(0.2, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
+    # Random feedback matrix
+    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_id="base")
 
-compiler = EPropCompiler(example_timesteps=1000, losses="mean_square_error",
-                         optimiser=Adam(0.003), c_reg=3.0)
+compiler = RandEPropCompiler(example_timesteps=1000, losses="mean_square_error",
+                         optimiser=Adam(0.003), c_reg=1.0)
 compiled_net = compiler.compile(network)
 
 with compiled_net:

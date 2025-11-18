@@ -44,7 +44,8 @@ class Connection:
                  synapse: SynapseInitializer = "delta", 
                  name: Optional[str] = None, 
                  max_delay_steps: Optional[int] = None,
-                 add_to_model: bool = True):
+                 add_to_model: bool = True,
+                 is_feedback: bool = False):
         # Store weak references to source and target in class
         self._source = ref(source)
         self._target = ref(target)
@@ -60,6 +61,10 @@ class Connection:
         # Generate unique name if required
         self.name = (f"Conn_{source.name}_{target.name}" if name is None
                      else name)
+        # Store feedback flag
+        self.is_feedback = is_feedback
+        if self.is_feedback:
+            self.name += "Feedback"
 
         # Add weak references to ourselves to source
         # and target's outgoing and incoming connection lists
@@ -73,6 +78,7 @@ class Connection:
         # Add connection to model
         if add_to_model:
             Network._add_connection(self)
+
 
     @property
     def source(self):

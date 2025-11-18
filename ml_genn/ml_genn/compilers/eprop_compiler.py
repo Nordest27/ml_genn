@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 
+from copy import deepcopy
 from typing import Iterator, Sequence
 from pygenn import CustomUpdateVarAccess, SynapseMatrixType, VarAccess
 from . import Compiler
@@ -54,6 +55,16 @@ def _has_connection_to_output(pop):
         # i.e. it's an output, return true
         if c().target().neuron.readout is not None:
             return True
+
+    return False
+
+def _has_feedback_from_output(pop):
+    # Loop through population's outgoing connections
+    for c in pop.outgoing_connections:
+        # If target of connection has a readout 
+        # i.e. it's an output, return true
+        if c().is_feedback:
+            return True   # Loop t
 
     return False
 
@@ -241,6 +252,20 @@ output_learning_model = {
     addToPre(g * E_post);
     """}
 
+output_random_learning_model = deepcopy(output_learning_model)
+output_random_learning_model["synapse_dynamics_code"] =  """
+    DeltaG += ZFilter * E_post;
+"""
+
+output_random_feedback_model = {
+    "params": [("g", "scalar")],
+    "post_neuron_var_refs": [("E_post", "scalar")],
+    
+    "synapse_dynamics_code": """
+    addToPre(g * E_post);
+    """}
+
+
 gradient_batch_reduce_model = {
     "vars": [("ReducedGradient", "scalar", CustomUpdateVarAccess.REDUCE_BATCH_SUM)],
     "var_refs": [("Gradient", "scalar")],
@@ -309,6 +334,7 @@ class EPropCompiler(Compiler):
                  deep_r_conns: Sequence = [],
                  deep_r_l1_strength: float = 0.01,
                  deep_r_record_rewirings = {},
+                 feedback_type: str = "symmetric",
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -330,6 +356,7 @@ class EPropCompiler(Compiler):
         self.deep_r_l1_strength = deep_r_l1_strength
         self.deep_r_record_rewirings = {get_underlying_conn(c): k
                                         for c, k in deep_r_record_rewirings.items()}
+        self.feedback_type = feedback_type
 
     def pre_compile(self, network: Network, 
                     genn_model, **kwargs) -> CompileState:
@@ -412,10 +439,14 @@ class EPropCompiler(Compiler):
         # Otherwise, if neuron isn't an input i.e. it's hidden
         elif not isinstance(pop.neuron, Input):
             # Check hidden population is connected directly to output
-            if not _has_connection_to_output(pop):
-                raise RuntimeError("In models trained with e-prop, all "
+            if self.feedback_type == "symmetric" and not _has_connection_to_output(pop):
+                raise RuntimeError("In models trained with symmetric e-prop, all "
                                    "hidden populations must be directly "
                                    "connected to an output population")
+            if self.feedback_type == "random" and not _has_feedback_from_output(pop):
+                raise RuntimeError("In models trained with random e-prop all "
+                                   "hidden populations must be connected with "
+                                   "feedback connections to an output population")
 
             # Add additional input variable to receive feedback
             model_copy.add_additional_input_var("ISynFeedback", "scalar", 0.0)
@@ -472,7 +503,18 @@ class EPropCompiler(Compiler):
 
         # If target neuron is LIF, create weight update model with eProp LIF
         target_neuron = conn.target().neuron
-        if isinstance(target_neuron, LeakyIntegrateFire):
+        # Check if conn are feedback
+        if conn.is_feedback:
+            if self.feedback_type != "random":
+                raise ValueError("Feedback type must be 'random' when using random feedback connections")
+            wum = WeightUpdateModel(
+                model=output_random_feedback_model,
+                param_vals={"g": connect_snippet.weight},
+                post_neuron_var_refs={"E_post": "E"}
+            )
+            # Add connection to list of feedback connections
+            compile_state.feedback_connections.append(conn)
+        elif isinstance(target_neuron, LeakyIntegrateFire):
             wum = WeightUpdateModel(
                 model=eprop_lif_model,
                 param_vals={"CReg": self.c_reg, "Alpha": alpha,
@@ -508,20 +550,24 @@ class EPropCompiler(Compiler):
         # weight update model with simple output learning rule
         elif target_neuron.readout is not None:
             wum = WeightUpdateModel(
-                model=output_learning_model,
+                model=output_learning_model 
+                    if self.feedback_type == "symmetric" 
+                    else output_random_learning_model,
                 param_vals={"Alpha": alpha},
                 var_vals={"g": connect_snippet.weight, "DeltaG": 0.0},
                 pre_var_vals={"ZFilter": 0.0},
                 post_neuron_var_refs={"E_post": "E"})
 
-            # Add connection to list of feedback connections
-            compile_state.feedback_connections.append(conn)
+            if self.feedback_type == "symmetric":
+                # Add connection to list of feedback connections
+                compile_state.feedback_connections.append(conn)
 
         # Add weights to list of checkpoint vars
         compile_state.checkpoint_connection_vars.append((conn, "g"))
-
+ 
         # Add connection to list of connections to optimise
-        compile_state.weight_optimiser_connections.append(conn)
+        if not conn.is_feedback:
+            compile_state.weight_optimiser_connections.append(conn)
 
         # Return weight update model
         return wum
