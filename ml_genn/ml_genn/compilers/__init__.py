@@ -9,11 +9,10 @@ from .compiler import Compiler
 from .compiled_network import CompiledNetwork
 from .compiled_training_network import CompiledTrainingNetwork
 from .eprop_compiler import EPropCompiler
-from .eprop_rand_compiler import RandEPropCompiler
 from .event_prop_compiler import EventPropCompiler
 from .few_spike_compiler import CompiledFewSpikeNetwork, FewSpikeCompiler
 from .inference_compiler import CompiledInferenceNetwork, InferenceCompiler
 
 __all__ = ["Compiler", "CompiledFewSpikeNetwork", "CompiledInferenceNetwork",
-           "CompiledNetwork", "CompiledTrainingNetwork", "EPropCompiler", "RandEpropCompiler",
+           "CompiledNetwork", "CompiledTrainingNetwork", "EPropCompiler",
            "EventPropCompiler", "FewSpikeCompiler", "InferenceCompiler"]

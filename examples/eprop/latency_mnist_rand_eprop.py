@@ -4,7 +4,7 @@ import mnist
 
 from ml_genn import InputLayer, Layer, Network, Population, Connection
 from ml_genn.callbacks import Checkpoint
-from ml_genn.compilers import EPropCompiler, RandEPropCompiler, InferenceCompiler
+from ml_genn.compilers import EPropCompiler, InferenceCompiler
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput

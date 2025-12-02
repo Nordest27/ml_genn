@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from ml_genn import Connection, Population, Network
 from ml_genn.callbacks import (OptimiserParamSchedule, SpikeRecorder,
                                VarRecorder)
-from ml_genn.compilers import EPropCompiler, RandEPropCompiler
+from ml_genn.compilers import EPropCompiler
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, SpikeInput, AdaptiveLeakyIntegrateFire
@@ -80,9 +80,9 @@ with network:
     Connection(hidden, hidden, FixedProbability(0.1, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
     Connection(hidden, output, FixedProbability(0.2, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
     # Random feedback matrix
-    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_id="base")
+    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), is_feedback=True)
 
-compiler = RandEPropCompiler(example_timesteps=1000, losses="mean_square_error",
+compiler = EPropCompiler(example_timesteps=1000, losses="mean_square_error", feedback_type="random",
                          optimiser=Adam(0.003), c_reg=1.0)
 compiled_net = compiler.compile(network)
 

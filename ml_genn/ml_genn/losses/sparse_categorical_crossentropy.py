@@ -14,6 +14,8 @@ class SparseCategoricalCrossentropy(Loss):
         # Add variable, shared across neurons to hold true label for batch
         model.add_var("YTrue", "uint8_t", 0, 
                       VarAccess.READ_ONLY_SHARED_NEURON)
+        model.add_var("tdError", "scalar", 1.0)
+        model.add_var("actionTaken", "scalar", 0.0)
 
         # Add sim-code to convert label to one-hot
         model.append_sim_code(
@@ -38,3 +40,7 @@ class SparseCategoricalCrossentropy(Loss):
 
         # Push YTrue to device
         genn_pop.vars["YTrue"].push_to_device()
+    
+    def set_var(self, genn_pop, var_string, value):
+        genn_pop.vars[var_string].view[:] = value
+        genn_pop.vars[var_string].push_to_device()

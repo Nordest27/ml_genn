@@ -13,6 +13,7 @@ class MeanSquareError(Loss):
         egp_size = (example_timesteps * batch_size * flat_shape)
         model.add_egp("YTrue", "scalar*",
                       np.empty(egp_size, dtype=np.float32))
+        model.add_var("tdError", "scalar", 1.0)
 
         # Add sim-code to read out correct yTrue value 
         model.append_sim_code(
@@ -38,3 +39,6 @@ class MeanSquareError(Loss):
         # Push YTrue to device
         genn_pop.extra_global_params["YTrue"].push_to_device()
 
+    def set_var(self, genn_pop, var_string, value):
+        genn_pop.vars[var_string].view[:] = value
+        genn_pop.vars[var_string].push_to_device()
