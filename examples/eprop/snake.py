@@ -89,19 +89,14 @@ class SnakeEnv:
         # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
         
-        reward = 0 #-max(2 * (self.steps_since_last_apple-1) / self.size, 5)
-        # r            # self.spawn_apples()
-            # reward += 100.0
-            # if len(self.apples) == 0:
-            #     self.done = True
-            #     reward += 500.0
-            # self.steps_since_last_apple = 0eward = 0
-        # if (self.direction == 'up' and new_dir == 'down') or \
-        #    (self.direction == 'down' and new_dir == 'up') or \
-        #    (self.direction == 'left' and new_dir == 'right') or \
-        #    (self.direction == 'right' and new_dir == 'left'):
+        reward = -0.1 #-max(0.5 * (self.steps_since_last_apple-1) / self.size, 5)
+
+        if (self.direction == 'up' and new_dir == 'down') or \
+           (self.direction == 'down' and new_dir == 'up') or \
+           (self.direction == 'left' and new_dir == 'right') or \
+           (self.direction == 'right' and new_dir == 'left'):
         #     reward -= 10
-        #     new_dir = self.direction
+            new_dir = self.direction
             # reward -= 100
             # self.done = True
             # return self.get_observation(), reward/100, True 
@@ -299,33 +294,36 @@ class SnakeEnv:
 
 ################### DEFINE MODEL ####################
 #####################################################
-BOARD_SIZE = 5
+BOARD_SIZE = 15
 VISIBLE_RANGE = 5
 
-WAIT_INC = 10
+WAIT_INC = 30
 
 INPUT_SIZE = 3 * VISIBLE_RANGE**2
-NUM_HIDDEN_1 = 512
+NUM_HIDDEN_1 = 4096
 NUM_OUTPUT = 4
 CONN_P = {
-    "I-H": 0.5,
-    "H-H": 0.1,
-    "H-P": 0.5,
-    "H-V": 0.5
+    "I-H": 0.1,
+    # "H-H": 0.01,
+    "H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
+    "H-P": 0.1,
+    "H-V": 0.1
 }
 TRAIN = True
 
 KERNEL_PROFILING = False
 
 gamma = 0.99 ** (1/WAIT_INC)
+td_lambda = 0.8 ** (1/WAIT_INC)
+td_error_trace_discount = 0.001**(1/WAIT_INC)
 
 serialiser = Numpy("snake_checkpoints")
 network = Network(default_params)
 with network:
     # Populations
-    input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE), INPUT_SIZE)
+    input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC // 2), INPUT_SIZE)
     hidden_1 = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0,
-                                           tau_refrac=3.0, tau_adapt=50, beta=0),
+                                           tau_refrac=3.0, tau_adapt=100),
                         NUM_HIDDEN_1)
     policy = Population(LeakyIntegrate(tau_mem=10.0, readout="var"),
                         NUM_OUTPUT)
@@ -353,13 +351,14 @@ compiler = EPropCompiler(
     example_timesteps=max_example_timesteps,
     losses={policy: "sparse_categorical_crossentropy",
             value: "mean_square_error"},
-    optimiser=Adam(1e-4),
+    optimiser=Adam(1e-5),
     batch_size=1,
     kernel_profiling=KERNEL_PROFILING,
     feedback_type="random",
     gamma=gamma,          # 0.99
-    td_lambda=0.05 ** (1/WAIT_INC),        # or whatever you want
-    train_output_bias=False
+    td_lambda=td_lambda,        # or whatever you want
+    train_output_bias=False,
+    reset_time_between_batches=False
 )
 
 compiled_net = compiler.compile(network)
@@ -386,6 +385,20 @@ all_metrics.update(value_train_metrics)
 
 ####################### TRAIN #######################
 #####################################################
+
+def make_repeated_spikes(indices, base_timestep, input_size, K=5, period=1):
+    if len(indices) == 0 or K <= 0:
+        return preprocess_spikes([], [], input_size)
+
+    indices = np.asarray(indices, dtype=np.int64)
+
+    # Build times and indices
+    times = np.repeat(base_timestep + np.arange(K) * period, len(indices))
+    idxs = np.tile(indices, K)
+
+    # Convert back to Python lists because preprocess_spikes expects list-like
+    return preprocess_spikes(times, idxs, input_size)
+
 
 with compiled_net:
 
@@ -435,6 +448,8 @@ with compiled_net:
         smoothing = 0.95
         avg = 0
 
+
+        train_callback_list.on_batch_begin(0)
         for ep in range(episodes):            
             # Reset time to 0 if desired
             for m in all_metrics.values():
@@ -451,15 +466,14 @@ with compiled_net:
             frame = 1
             value_target = 0
 
-            # Reset network
-            train_callback_list.on_batch_begin(0)
-
-            compiled_net.genn_model.timestep = 0
-
             indices = obs.nonzero()[0]
-            times = np.zeros_like(indices)
-            spikes = preprocess_spikes(times, indices, INPUT_SIZE)
-
+            spikes = make_repeated_spikes(
+                indices,
+                compiled_net.genn_model.timestep,
+                INPUT_SIZE,
+                K=WAIT_INC,
+                period=1
+            )
             compiled_net.set_input({input_pop: [spikes]})
             compiled_net.step_time(train_callback_list)
 
@@ -467,18 +481,14 @@ with compiled_net:
             env.wait_count = WAIT_INC
             reward_trace = 0
             rewards_gotten = 0
+            td_error_trace = 0
             while not done:      
                 action_label = 0
 
+                current_values.append(previous_value_estimate)
                 if env.wait_count == 0:       
-                    current_values.append(previous_value_estimate)
-
                     probs = compiled_net.get_readout(policy).flatten()
-    
-                    # print(logits)
-                    # exp_logits = np.exp(logits - np.max(logits))
-                    # probs = exp_logits / np.sum(exp_logits)
-                    #print(probs)
+   
                     if abs(sum(probs) - 1.0) > 0.0001:
                         print("BAD PROBS", sum(probs))
 
@@ -504,17 +514,31 @@ with compiled_net:
                 if env.wait_count == env.wait_inc:
                     current_run.append(env.img(scale=20))
                 
-                indices = obs.nonzero()[0]
-                times = np.zeros_like(indices) + compiled_net.genn_model.timestep
-                spikes = preprocess_spikes(times, indices, INPUT_SIZE)
+                    train_callback_list.on_batch_end(0, all_metrics)
+                    for o, custom_updates in compiled_net.optimisers:
+                        # Set step on all custom updates
+                        for c in custom_updates:
+                            o.set_step(c, ep)
 
-                compiled_net.set_input({input_pop: [spikes]})
+                    # train_callback_list.on_batch_begin(0)
+                    
+                    indices = obs.nonzero()[0]
+                    spikes = make_repeated_spikes(
+                        indices,
+                        compiled_net.genn_model.timestep,
+                        INPUT_SIZE,
+                        K=WAIT_INC,
+                        period=1
+                    )
+                    compiled_net.set_input({input_pop: [spikes]})
+
                 compiled_net.step_time(train_callback_list)
 
                 value_estimate = compiled_net.get_readout(value)[0][0]
                 
                 value_target = reward_trace + gamma * value_estimate
                 td_error = value_target - previous_value_estimate
+                td_error_trace = td_error_trace_discount * td_error_trace + td_error
 
                 total_td += td_error
                 
@@ -529,18 +553,18 @@ with compiled_net:
                     #     compiled_net.example_timesteps
                     # )
                     compiled_net.losses[value].set_var(
-                        compiled_net.neuron_populations[value], "tdError", td_error
+                        compiled_net.neuron_populations[value], "tdError", td_error_trace
                     )
                     compiled_net.losses[policy].set_var(
-                        compiled_net.neuron_populations[policy], "tdError", td_error
+                        compiled_net.neuron_populations[policy], "tdError", td_error_trace
                     )
-                    compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error
+                    compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
                     compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
-
+                    td_error_trace = 0
+                    
                 frame += 1
             
             for _ in range(1):
-                rewards_gotten += 1
                 compiled_net.step_time(train_callback_list)
 
                 # value_estimate = compiled_net.get_readout(value)[0][0]
@@ -562,9 +586,12 @@ with compiled_net:
                 # compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
             
             train_callback_list.on_batch_end(0, all_metrics)
-            # compiled_net.optimisers[0][0].alpha = (
-            #     1e-3 / rewards_gotten # max(1e-5, compiled_net.optimisers[0][0].alpha*0.9999)
-            # )
+            if np.mean(snake_len_history) > 7.5 and compiled_net.optimisers[0][0].alpha != 1e-5:
+                compiled_net.optimisers[0][0].alpha = 1e-5
+                # compiled_net.optimisers[0][0].alpha = (
+                #    max(1e-5, 5e-4 / rewards_gotten) 
+                #    # max(1e-5, compiled_net.optimisers[0][0].alpha*0.9999)
+                # )
 
             for o, custom_updates in compiled_net.optimisers:
                 # Set step on all custom updates
@@ -601,14 +628,17 @@ with compiled_net:
                     cv2.waitKey(1)
                     time.sleep(0.1)
 
-            print(f"Episode {ep+1} - "
-            f"Total reward: {total_reward:.2f} -"
-            f" Td Error: {total_td/frame:.3f} -"
-            f" Frame death: {frame} -"
-            f" Alpha: {compiled_net.optimisers[0][0].alpha:.8f}")
-
             reward_history.append(total_reward)
             snake_len_history.append(len(env.snake)-1)
+
+            print(f"Episode {ep+1} - "
+            f"Total reward: {' ' if total_reward >= 0 else ''}{total_reward:.2f}"
+            # f" - Td Error: {total_td/frame:.3f}"
+            f" - Snake len: {len(env.snake)-1:2d}"
+            f" - Snake len avg (last 300): {np.mean(snake_len_history):.2f}"
+            f" - Frame death: {frame}"
+            f" - Alpha: {compiled_net.optimisers[0][0].alpha:.8f}")
+
             if avg == 0:
                 avg = total_reward
             else:

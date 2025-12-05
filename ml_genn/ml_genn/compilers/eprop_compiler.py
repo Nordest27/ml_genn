@@ -321,15 +321,19 @@ eprop_alif_td_model = {
 }
 
 output_learning_model = {
-    "params": [("Alpha", "scalar")],
+    "params": [("Alpha", "scalar"), ("GammaLambda", "scalar")],
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY), 
         ("DeltaG", "scalar"), 
         ("PrevZFilter", "scalar"),
         ("PrevPrevZFilter", "scalar"),
+        ("RLTrace", "scalar")
     ],
     "pre_vars": [("ZFilter", "scalar")],
-    "post_neuron_var_refs": [("E_post", "scalar")],
+    "post_neuron_var_refs": [
+        ("E_post", "scalar"),
+        ("ValReg_post", "scalar")
+    ],
 
     "pre_spike_code": """
     ZFilter += 1.0;
@@ -342,8 +346,8 @@ output_learning_model = {
     addToPost(g);
     """,
     "synapse_dynamics_code": """
-    DeltaG -= PrevZFilter * E_post;
-    DeltaG += ZFilter * E_post;
+    RLTrace = GammaLambda * RLTrace + (ZFilter - PrevZFilter);
+    DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
     
     // addToPre(g * E_post);
     addToPre(g);
@@ -354,9 +358,9 @@ output_learning_model = {
 
 output_random_learning_model = deepcopy(output_learning_model)
 output_random_learning_model["synapse_dynamics_code"] =  """
-    DeltaG -= PrevZFilter * E_post;
-    DeltaG += ZFilter * E_post;
-    
+    RLTrace = GammaLambda * RLTrace + (ZFilter - PrevZFilter);
+    DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
+
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
 """
@@ -500,7 +504,7 @@ class EPropCompiler(Compiler):
                  # --- NEW ---
                  gamma: float = None,
                  td_lambda: float = None,
-                 entropy_coeff: float = 1e-4,
+                 entropy_coeff: float = 1e-3,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -614,10 +618,12 @@ class EPropCompiler(Compiler):
                     """
                 )
             else:
+                model_copy.add_var("ValReg", "scalar", 0.0)
                 model_copy.append_sim_code(
                     f"""
                     // E = ({model_copy.output_var_name} - yTrue);
                     E = tdError;
+                    ValReg = 0.001 * {model_copy.output_var_name};
                     tdError = 0;
                     """
                 )
@@ -844,14 +850,17 @@ class EPropCompiler(Compiler):
 
                 wum = WeightUpdateModel(
                     model=model,
-                    param_vals={"Alpha": alpha},
+                    param_vals={"Alpha": alpha, "GammaLambda": self.gamma_lambda},
                     var_vals={
                         "g": connect_snippet.weight, 
-                        "DeltaG": 0.0, 
+                        "DeltaG": 0.0,
+                        "RLTrace": 0.0, 
                         "PrevZFilter": 0.0,
                         "PrevPrevZFilter": 0.0},
                     pre_var_vals={"ZFilter": 0.0},
-                    post_neuron_var_refs={"E_post": "E"})
+                    post_neuron_var_refs={
+                        "E_post": "E", 
+                        "ValReg_post": "ValReg"})
 
             if self.feedback_type == "symmetric" and not conn.is_feedback:
                 compile_state.feedback_connections.append(conn)
