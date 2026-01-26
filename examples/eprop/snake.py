@@ -1,20 +1,18 @@
 ##################### SNAKE ENV #####################
 #####################################################
-from ftplib import all_errors
+import multiprocessing as mp
+from multiprocessing import Manager, Queue
+import numpy as np
+import cv2
+import time
+import matplotlib.pyplot as plt
 from ml_genn.metrics.metric import Metric
 from ml_genn.metrics import default_metrics
 from ml_genn.callbacks.custom_update import CustomUpdateOnBatchEnd
 from ml_genn.utils.module import get_object_mapping
 from ml_genn.utils.data import preprocess_spikes
 from ml_genn.utils.callback_list import CallbackList
-import numpy as np
 import random
-import cv2
-import matplotlib.pyplot as plt
-import time
-import numpy as np
-import matplotlib.pyplot as plt
-import mnist
 from line_profiler import profile
 
 from ml_genn import InputLayer, Layer, Network, Population, Connection
@@ -26,9 +24,6 @@ from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyInt
 from ml_genn.serialisers import Numpy
 from ml_genn.optimisers import Adam
 
-from time import perf_counter
-from ml_genn.utils.data import (calc_latest_spike_time, calc_max_spikes,
-                                log_latency_encode_data)
 
 from ml_genn.compilers.eprop_compiler import default_params
 
@@ -294,27 +289,27 @@ class SnakeEnv:
 
 ################### DEFINE MODEL ####################
 #####################################################
-BOARD_SIZE = 15
+BOARD_SIZE = 9
 VISIBLE_RANGE = 5
 
 WAIT_INC = 30
 
 INPUT_SIZE = 3 * VISIBLE_RANGE**2
-NUM_HIDDEN_1 = 4096
+NUM_HIDDEN_1 = 512
 NUM_OUTPUT = 4
 CONN_P = {
-    "I-H": 0.1,
-    # "H-H": 0.01,
+    "I-H": 0.5,
+    #"H-H": 0.25,
     "H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
-    "H-P": 0.1,
-    "H-V": 0.1
+    "H-P": 0.5,
+    "H-V": 0.5
 }
 TRAIN = True
 
 KERNEL_PROFILING = False
 
 gamma = 0.99 ** (1/WAIT_INC)
-td_lambda = 0.8 ** (1/WAIT_INC)
+td_lambda = 0.01 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
 serialiser = Numpy("snake_checkpoints")
@@ -351,7 +346,7 @@ compiler = EPropCompiler(
     example_timesteps=max_example_timesteps,
     losses={policy: "sparse_categorical_crossentropy",
             value: "mean_square_error"},
-    optimiser=Adam(1e-5),
+    optimiser=Adam(1e-4),
     batch_size=1,
     kernel_profiling=KERNEL_PROFILING,
     feedback_type="random",
@@ -399,64 +394,225 @@ def make_repeated_spikes(indices, base_timestep, input_size, K=5, period=1):
     # Convert back to Python lists because preprocess_spikes expects list-like
     return preprocess_spikes(times, idxs, input_size)
 
+# --- Helper: optionally compress frames before sending to reduce IPC size ---
+def encode_frame(frame, compress=True, ext='.jpg', quality=80):
+    if not compress:
+        return frame
+    ret, buf = cv2.imencode(ext, frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ret:
+        return frame
+    return buf.tobytes()
 
-with compiled_net:
+def decode_frame(blob_or_array):
+    if isinstance(blob_or_array, bytes):
+        arr = np.frombuffer(blob_or_array, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return img
+    return blob_or_array
 
-    @profile
-    def train_snake_agent(episodes=100000):
+# --- Visualization process: matplotlib live charts ---
+def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
+    plt.ion()
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
+    plt.subplots_adjust(hspace=0.5)
+    # initial empty lines
+    snake_len_line, = ax1.plot([], [], label='Snake length', color=(0, 0.8, 0.1, 0.5), zorder=1)
+    line_reward,    = ax1.plot([], [], label='Total Reward', color=(0, 0.1, 0.8, 0.5), zorder=2)
+    avg_line,       = ax1.plot([], [], label='Running Avg',  color=(0.8, 0.05, 0.05, 1.0), zorder=3)
+
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Reward')
+    ax1.set_title('Training Progress')
+    ax1.legend()
+
+    value_line, = ax2.plot([], [], label='Value'); ax2.set_title('Value (best run)')
+    ax2.set_xlabel('Frame'); ax2.set_ylabel('Value')
+
+    prob_img = ax3.imshow(np.zeros((4,1)), aspect='auto', origin='lower', vmin=0, vmax=1)
+    ax3.set_xlabel('Timestep'); ax3.set_ylabel('Action'); ax3.set_title('Action probs (best run)')
+    fig.colorbar(prob_img, ax=ax3, fraction=0.02, pad=0.04)
+
+    # local buffers
+    ep_list = []
+    rewards = []
+    avgs = []
+    lens = []
+    best_values = []
+    best_probs = None
+
+    last_plot_time = 0.0
+    plot_interval = 0.2  # seconds
+
+    while not stop_event.is_set():
+        try:
+            # drain queue (non-blocking) to keep latest metrics
+            while True:
+                metrics = metrics_q.get_nowait()
+                # expected fields: {'ep': int, 'reward': float, 'running_avg': float, 'snake_len': int,
+                #                   'best_values': [..] (optional), 'best_probs': 2D array (optional)}
+                ep = metrics.get('ep')
+                if ep is not None:
+                    ep_list.append(ep)
+                    rewards.append(metrics.get('reward', 0.0))
+                    avgs.append(metrics.get('running_avg', 0.0))
+                    lens.append(metrics.get('snake_len', 0))
+                if 'best_values' in metrics:
+                    best_values = metrics['best_values']
+                if 'best_probs' in metrics:
+                    best_probs = metrics['best_probs']
+        except Exception:
+            pass
+
+        now = time.time()
+        if now - last_plot_time > plot_interval:
+            if len(ep_list) > 0:
+                axis = ep_list
+                line_reward.set_data(axis, rewards)
+                avg_line.set_data(axis, avgs)
+                snake_len_line.set_data(axis, lens)
+                ax1.relim(); ax1.autoscale_view()
+
+            if best_values:
+                value_line.set_data(range(len(best_values)), best_values)
+                ax2.relim(); ax2.autoscale_view()
+
+            if best_probs is not None:
+                data = np.array(best_probs).T                     # shape: (n_actions, time_steps)
+                n_actions, time_steps = data.shape
+
+                prob_img.set_data(data)
+
+                # IMPORTANT: force full stretching just like original code
+                prob_img.set_extent([0, time_steps, 0, n_actions])
+
+                ax3.set_xlim(0, time_steps)
+                ax3.set_ylim(0, n_actions)
+                ax3.set_aspect('auto')
+
+            plt.pause(0.001)
+            last_plot_time = now
+
+        time.sleep(0.03)  # give CPU a break
+
+    plt.close(fig)
+
+# --- Visualization process: show best + random runs using OpenCV ---
+def viz_runs_loop(best_run_q: Queue, random_run_q: Queue, stop_event: mp.Event, decompress=True):
+    # best run stored as encoded frames (bytes) or arrays; we'll decode on display
+    best_run = []
+    random_run = []
+    window_best = "Best Run"
+    window_random = "Random Run"
+
+    cv2.namedWindow(window_best, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_random, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_best, 600, 600)
+    cv2.resizeWindow(window_random, 600, 600)
+
+    t = 0
+    while not stop_event.is_set():
+        try:
+            while True:
+                # latest best run (replace)
+                br = best_run_q.get_nowait()
+                if br is None:
+                    stop_event.set()
+                    break
+                # br is expected to be list of frames (encoded or arrays)
+                best_run = br
+        except Exception:
+            pass
+
+        try:
+            while True:
+                rr = random_run_q.get_nowait()
+                if rr is None:
+                    stop_event.set()
+                    break
+                random_run = rr
+        except Exception:
+            pass
+
+        # Play best run in one window, cycling
+        if best_run:
+            if stop_event.is_set():
+                break
+            f_blob = best_run[t%len(best_run)]
+            frame = decode_frame(f_blob) if decompress else f_blob
+            if frame is None:
+                continue
+            cv2.imshow(window_best, frame)
+            key = cv2.waitKey(1)  # adjust speed here
+            if key == 27:  # Esc to exit
+                stop_event.set()
+                break
+
+        # Play random run (if provided) once (or cycle)
+        if random_run and t%(len(random_run)+10) < len(random_run):
+            f_blob = random_run[t%(len(random_run)+10)]
+            if stop_event.is_set():
+                break
+            frame = decode_frame(f_blob) if decompress else f_blob
+            if frame is None:
+                continue
+            cv2.imshow(window_random, frame)
+            key = cv2.waitKey(1)
+            if key == 27:
+                stop_event.set()
+                break
+
+        time.sleep(0.1)
+        t += 1
+
+    cv2.destroyWindow(window_best)
+    cv2.destroyWindow(window_random)
+
+# --- Wiring: start processes and pass queues to trainer ---
+def start_visualizers():
+    manager = Manager()
+    metrics_q = manager.Queue(maxsize=10)
+    best_run_q = manager.Queue(maxsize=2)
+    random_run_q = manager.Queue(maxsize=2)
+    stop_event = manager.Event()
+
+    p_plots = mp.Process(target=viz_plots_loop, args=(metrics_q, stop_event), daemon=True)
+    p_runs = mp.Process(target=viz_runs_loop, args=(best_run_q, random_run_q, stop_event), daemon=True)
+
+    p_plots.start()
+    p_runs.start()
+    return manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs
+
+# --- Modify your train_snake_agent to send updates instead of internal plotting ---
+# Replace plt.ion() + figure creation in train_snake_agent with nothing and send updates to queues.
+# I will show a skeleton wrapper around your train loop:
+def train_snake_agent_with_ipc(episodes=100000,
+                               metrics_q: Queue=None,
+                               best_run_q: Queue=None,
+                               random_run_q: Queue=None,
+                               compress_frames=True,
+                               compress_quality=80):
+    """
+    This function is essentially your train_snake_agent() with the plotting removed.
+    Instead it sends metrics and best_run frames via the provided queues.
+    """
+    with compiled_net:
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC)
-        
         best_reward = -np.inf
         best_run = []
-        reward_history = []
         running_avg = []
         snake_len_history = []
-
-        plt.ion()
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10))
-        plt.subplots_adjust(hspace=0.5)
-
-        # --- 1. Training reward subplot ---
-        snake_len, = ax1.plot([], [], label='Snake length', color='green')
-        line, = ax1.plot([], [], label='Total Reward', color='blue')
-        avg_line, = ax1.plot([], [], label='Running Avg', color='red')
-        ax1.set_xlabel('Episode')
-        ax1.set_ylabel('Reward')
-        ax1.set_title('Training Progress')
-        ax1.legend()
-
-        # --- 2. Value output subplot ---
-        value_line, = ax2.plot([], [], color='green')
-        ax2.set_xlabel('Frame')
-        ax2.set_ylabel('Value Output')
-        ax2.set_title('Best Run Value Outputs')
-
-        # --- 3. Action probabilities heatmap subplot ---
-        prob_img = ax3.imshow(
-            np.zeros((3, 1)),
-            aspect='auto',
-            cmap='viridis',
-            origin='lower',
-            vmin=0.0,
-            vmax=1.0,
-            extent=[0, 1, 0, 3]  # <<-- explicit extent (x from 0→1, y from 0→n_actions)
-        )
-        ax3.set_xlabel('Time Step')
-        ax3.set_ylabel('Action')
-        ax3.set_title('Best Run Action Probabilities')
-        fig.colorbar(prob_img, ax=ax3, fraction=0.02, pad=0.04)
         smoothing = 0.95
         avg = 0
 
+        # keep last best values and probs for plot process
+        last_best_values = []
+        last_best_probs = None
 
         train_callback_list.on_batch_begin(0)
-        for ep in range(episodes):            
-            # Reset time to 0 if desired
+        for ep in range(episodes):
             for m in all_metrics.values():
                 m.reset()
-            
             obs = env.reset()
-
             done = False
             total_reward = 0
             current_run = []
@@ -476,26 +632,20 @@ with compiled_net:
             )
             compiled_net.set_input({input_pop: [spikes]})
             compiled_net.step_time(train_callback_list)
-
             previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
             reward_trace = 0
-            rewards_gotten = 0
             td_error_trace = 0
-            while not done:      
-                action_label = 0
 
+            while not done:
+                action_label = 0
                 current_values.append(previous_value_estimate)
-                if env.wait_count == 0:       
+                if env.wait_count == 0:
                     probs = compiled_net.get_readout(policy).flatten()
-   
                     if abs(sum(probs) - 1.0) > 0.0001:
                         print("BAD PROBS", sum(probs))
-
                     action_label = np.random.choice(4, p=probs)
-
                     current_probs.append(probs)
-
                     compiled_net.losses[policy].set_target(
                         compiled_net.neuron_populations[policy],
                         [action_label], policy.shape, 
@@ -505,23 +655,24 @@ with compiled_net:
                     compiled_net.losses[policy].set_var(
                         compiled_net.neuron_populations[policy], "actionTaken", 1.0
                     )
-                        
-                obs, reward, done = env.step(action_label)
 
+                obs, reward, done = env.step(action_label)
                 total_reward += reward
-                reward_trace = reward_trace*0.0 + reward
+                reward_trace = reward_trace*0.0 + reward*1.0
 
                 if env.wait_count == env.wait_inc:
-                    current_run.append(env.img(scale=20))
-                
+                    # capture frame scaled down for IPC
+                    frame_img = env.img(scale=8)  # smaller scale to reduce size
+                    if compress_frames:
+                        encoded = encode_frame(frame_img, compress=True, quality=compress_quality)
+                        current_run.append(encoded)
+                    else:
+                        current_run.append(frame_img.copy())
                     train_callback_list.on_batch_end(0, all_metrics)
                     for o, custom_updates in compiled_net.optimisers:
-                        # Set step on all custom updates
                         for c in custom_updates:
                             o.set_step(c, ep)
 
-                    # train_callback_list.on_batch_begin(0)
-                    
                     indices = obs.nonzero()[0]
                     spikes = make_repeated_spikes(
                         indices,
@@ -533,111 +684,97 @@ with compiled_net:
                     compiled_net.set_input({input_pop: [spikes]})
 
                 compiled_net.step_time(train_callback_list)
-
                 value_estimate = compiled_net.get_readout(value)[0][0]
-                
                 value_target = reward_trace + gamma * value_estimate
-                td_error = value_target - previous_value_estimate
-                td_error_trace = td_error_trace_discount * td_error_trace + td_error
 
-                total_td += td_error
+                td_error = value_target - previous_value_estimate
+                td_error_trace = 0 * td_error_trace_discount * td_error_trace + td_error
                 
+                total_td += td_error
                 previous_value_estimate = value_estimate
-                    
-                if reward != 0:
-                    rewards_gotten += 1
-                    # compiled_net.losses[value].set_target(
-                    #     compiled_net.neuron_populations[value], 
-                    #     [[[value_target]]], value.shape,
-                    #     compiled_net.genn_model.batch_size,
-                    #     compiled_net.example_timesteps
-                    # )
-                    compiled_net.losses[value].set_var(
-                        compiled_net.neuron_populations[value], "tdError", td_error_trace
-                    )
-                    compiled_net.losses[policy].set_var(
-                        compiled_net.neuron_populations[policy], "tdError", td_error_trace
-                    )
-                    compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
-                    compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
-                    td_error_trace = 0
-                    
+
+                # if reward != 0:
+                compiled_net.losses[value].set_var(
+                    compiled_net.neuron_populations[value], "tdError", td_error_trace
+                )
+                compiled_net.losses[policy].set_var(
+                    compiled_net.neuron_populations[policy], "tdError", td_error_trace
+                )
+                compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
+                compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
+                td_error_trace = 0
+
                 frame += 1
             
-            for _ in range(1):
+            for _ in range(WAIT_INC):
+                reward_trace = reward_trace*0.5
                 compiled_net.step_time(train_callback_list)
+                value_estimate = compiled_net.get_readout(value)[0][0]
+                value_target = reward_trace + gamma * value_estimate
 
-                # value_estimate = compiled_net.get_readout(value)[0][0]
+                td_error = value_target - previous_value_estimate
+                td_error_trace = 0 * td_error_trace_discount * td_error_trace + td_error
                 
-                # value_target = reward_trace + gamma * value_estimate
-                # td_error = value_target - previous_value_estimate
+                total_td += td_error
+                previous_value_estimate = value_estimate
 
-                # total_td += td_error
-                
-                # previous_value_estimate = value_estimate
-                
-                # compiled_net.losses[value].set_td_error(
-                #     compiled_net.neuron_populations[value], td_error
-                # )
-                # compiled_net.losses[policy].set_td_error(
-                #     compiled_net.neuron_populations[policy], td_error
-                # )
-                # compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error
-                # compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
-            
+                # if reward != 0 or True:
+                compiled_net.losses[value].set_var(
+                    compiled_net.neuron_populations[value], "tdError", td_error_trace
+                )
+                compiled_net.losses[policy].set_var(
+                    compiled_net.neuron_populations[policy], "tdError", td_error_trace
+                )
+                compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
+                compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
+                td_error_trace = 0
+
+            # end of episode bookkeeping
             train_callback_list.on_batch_end(0, all_metrics)
-            if np.mean(snake_len_history) > 7.5 and compiled_net.optimisers[0][0].alpha != 1e-5:
-                compiled_net.optimisers[0][0].alpha = 1e-5
-                # compiled_net.optimisers[0][0].alpha = (
-                #    max(1e-5, 5e-4 / rewards_gotten) 
-                #    # max(1e-5, compiled_net.optimisers[0][0].alpha*0.9999)
-                # )
-
             for o, custom_updates in compiled_net.optimisers:
-                # Set step on all custom updates
                 for c in custom_updates:
                     o.set_step(c, ep)
+            
+            if compiled_net.optimisers[0][0].alpha > 1e-5 and np.mean(snake_len_history) > 5:
+                compiled_net.optimisers[0][0].alpha = 1e-5
 
-            # --- Update if new best run ---
+            # Update if new best run (send best run to viz process)
             if total_reward >= best_reward and len(current_probs) > 0:
                 best_reward = total_reward
-                best_run = [img for img in current_run]
+                best_run = [img for img in current_run]  # frames already possibly encoded
+                last_best_values = list(current_values)
+                last_best_probs = list(current_probs)
 
-                # Update value plot
-                value_line.set_data(range(len(current_values)), current_values)
-                ax2.relim()
-                ax2.autoscale_view()
-                ax2.set_title(f'Best Run Value Outputs (Reward = {total_reward:.2f})')
+                # send best run into queue (non-blocking put — if queue full, replace oldest)
+                try:
+                    if best_run_q is not None:
+                        # make a tiny container with values + probs for plotting + frames
+                        # we'll send frames via best_run_q
+                        if best_run_q.full():
+                            try:
+                                _ = best_run_q.get_nowait()  # drop oldest
+                            except Exception:
+                                pass
+                        best_run_q.put_nowait(best_run)
+                except Exception as e:
+                    print("Best-run enqueue error:", e)
 
-                # --- Update heatmap plot with correct extent ---
-                time_steps = len(current_probs)
-                prob_img.set_data(np.array(current_probs).T)
-                prob_img.set_extent([0, time_steps, 0, 4])  # <<-- fix horizontal scaling
-                ax3.set_xlim(0, time_steps)
-                ax3.set_ylim(0, 4)
-                ax3.set_aspect('auto')
-                ax3.set_title(f'Best Run Action Probabilities (Reward = {total_reward:.2f})')
-                plt.pause(0.01)
+            # occasional random visualization sample (send a few frames)
+            if random_run_q is not None and (ep % 100 == 0):
+                # sample a short random chunk from current_run
+                try:
+                    if random_run_q.full():
+                        try:
+                            _ = random_run_q.get_nowait()
+                        except:
+                            pass
+                    random_run_q.put_nowait(current_run)
+                except Exception as e:
+                    print("Random-run enqueue error:", e)
 
-            if (ep) % 1000 == 0 and best_run:
-                print(f"Replaying best run so far (reward = {best_reward:.2f})...")
-                # agent.update_parameters()
-                best_reward = -np.inf
-                for img in best_run:
-                    cv2.imshow("Snake", img)
-                    cv2.waitKey(1)
-                    time.sleep(0.1)
-
-            reward_history.append(total_reward)
             snake_len_history.append(len(env.snake)-1)
-
-            print(f"Episode {ep+1} - "
-            f"Total reward: {' ' if total_reward >= 0 else ''}{total_reward:.2f}"
-            # f" - Td Error: {total_td/frame:.3f}"
-            f" - Snake len: {len(env.snake)-1:2d}"
-            f" - Snake len avg (last 300): {np.mean(snake_len_history):.2f}"
-            f" - Frame death: {frame}"
-            f" - Alpha: {compiled_net.optimisers[0][0].alpha:.8f}")
+            if len(snake_len_history) > 100:
+                snake_len_history = snake_len_history[-100:]
 
             if avg == 0:
                 avg = total_reward
@@ -645,22 +782,73 @@ with compiled_net:
                 avg = smoothing * avg + (1 - smoothing) * total_reward
             running_avg.append(avg)
 
-            if ep % 100 == 0:
-                snake_len_history = snake_len_history[-200:]
-                reward_history = reward_history[-200:]
-                running_avg = running_avg[-200:]
-                axis = range(ep - len(reward_history), ep)
-                snake_len.set_data(axis, snake_len_history)
-                line.set_data(axis, reward_history)
-                avg_line.set_data(axis, running_avg)
-                ax1.relim()
-                ax1.autoscale_view()
-                plt.pause(0.01)
+            # Send metrics for plotting
+            if metrics_q is not None:
+                metrics = {
+                    'ep': ep,
+                    'reward': total_reward,
+                    'running_avg': avg,
+                    'snake_len': len(env.snake)-1
+                }
+                if last_best_values:
+                    metrics['best_values'] = last_best_values
+                if last_best_probs is not None:
+                    metrics['best_probs'] = last_best_probs
+                try:
+                    if metrics_q.full():
+                        try:
+                            metrics_q.get_nowait()
+                        except:
+                            pass
+                    metrics_q.put_nowait(metrics)
+                except Exception as e:
+                    print("Metrics enqueue error:", e)
 
-        plt.ioff()
-        plt.show()
-        cv2.destroyAllWindows()
+            # logging
+            print(
+                f"Episode {ep+1} - "
+                f"Total reward: {' ' if total_reward >= 0 else ''}{total_reward:.2f} "
+                f"- Best reward: {best_reward:.2f} "
+                f"- Snake len: {len(env.snake)-1:2d} "
+                f"- Snake len avg (last 100): {np.mean(snake_len_history):.2f} "
+                f"- Frame death: {frame} "
+                f"- Alpha: {compiled_net.optimisers[0][0].alpha:.8f}"
+            )
 
+            # optional checkpoint / early stop etc.
 
-    if __name__ == "__main__":
-        train_snake_agent()
+        # After training finished, send sentinel None to visualizers so they stop cleanly
+        if best_run_q is not None:
+            try:
+                best_run_q.put_nowait(None)
+            except:
+                pass
+        if random_run_q is not None:
+            try:
+                random_run_q.put_nowait(None)
+            except:
+                pass
+
+# --- Example of launching everything in __main__ ---
+if __name__ == "__main__":
+    # start visualizers
+    manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs = start_visualizers()
+
+    # run trainer in main process (keeps compiled_net / GPU access local)
+    try:
+        train_snake_agent_with_ipc(
+            episodes=100000,
+            metrics_q=metrics_q,
+            best_run_q=best_run_q,
+            random_run_q=random_run_q,
+            compress_frames=True,
+            compress_quality=80
+        )
+    finally:
+        # signal visualizers to stop
+        stop_event.set()
+        time.sleep(0.2)
+        if p_plots.is_alive():
+            p_plots.terminate()
+        if p_runs.is_alive():
+            p_runs.terminate()

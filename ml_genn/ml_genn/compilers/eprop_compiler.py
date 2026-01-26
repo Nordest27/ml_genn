@@ -301,13 +301,7 @@ eprop_alif_td_model = {
     // E_post is the neuron-specific learning signal L_j^t (already
     // containing δ^t for the policy head via tdError).
     // Use previous trace eFiltered
-    RLTrace = GammaLambda * RLTrace;
-
-    if (PG_post != 0)
-        RLTrace += eFiltered * (PG_post);
-    
-    if (TdE_post != 0)
-        RLTrace += 0.1 * VE_post * (eF - eFiltered);
+    RLTrace = GammaLambda * RLTrace + eF * (PG_post - 0.1 * VE_post);
 
     // Gradient accumulation: Δg += RLTrace + regularisation (using previous value)
     DeltaG += fireReg 
@@ -346,7 +340,7 @@ output_learning_model = {
     addToPost(g);
     """,
     "synapse_dynamics_code": """
-    RLTrace = GammaLambda * RLTrace + (ZFilter - PrevZFilter);
+    RLTrace = GammaLambda * RLTrace - ZFilter;
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
     
     // addToPre(g * E_post);
@@ -358,7 +352,7 @@ output_learning_model = {
 
 output_random_learning_model = deepcopy(output_learning_model)
 output_random_learning_model["synapse_dynamics_code"] =  """
-    RLTrace = GammaLambda * RLTrace + (ZFilter - PrevZFilter);
+    RLTrace = GammaLambda * RLTrace - ZFilter;
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
 
     PrevPrevZFilter = PrevZFilter;
@@ -394,8 +388,8 @@ output_td_learning_model = {
     addToPost(g);
     """,
     "synapse_dynamics_code": """
-    RLTrace = GammaLambda * RLTrace + PrevZFilter * PG_post;
-    DeltaG += TdE_post * RLTrace + PrevZFilter * E_post;
+    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
+    DeltaG += TdE_post * RLTrace + ZFilter * E_post;
     
     addToPre(g * PG_post);
 
@@ -406,8 +400,8 @@ output_td_learning_model = {
 
 output_random_td_learning_model = deepcopy(output_td_learning_model)
 output_random_td_learning_model["synapse_dynamics_code"] = """
-    RLTrace = GammaLambda * RLTrace + PrevZFilter * PG_post;
-    DeltaG += TdE_post * RLTrace + PrevZFilter * E_post;
+    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
+    DeltaG += TdE_post * RLTrace + ZFilter * E_post;
 
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
@@ -504,7 +498,7 @@ class EPropCompiler(Compiler):
                  # --- NEW ---
                  gamma: float = None,
                  td_lambda: float = None,
-                 entropy_coeff: float = 1e-3,
+                 entropy_coeff: float = 1e-4,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -598,19 +592,18 @@ class EPropCompiler(Compiler):
                     # const scalar p = {model_copy.output_var_name};
                     f"""
                     TdE = tdError;
-                    PG = pre_PG;
                     
-                    if (actionTaken != 0) {{
-                        const scalar p = {model_copy.output_var_name};
-                        const scalar logp = log(fmax(p, (scalar)1e-8));
-                        const scalar entropyGrad = p * (logp + 1.0);
+                    const scalar p = {model_copy.output_var_name};
+                    const scalar logp = log(fmax(p, (scalar)1e-8));
+                    const scalar entropyGrad = p * (logp + 1.0);
 
-                        E = {self.entropy_coeff} * entropyGrad;
-                        pre_PG = (p - yTrue);
+                    E = {self.entropy_coeff} * entropyGrad;
+
+                    if (actionTaken != 0) {{
+                        PG = (p - yTrue);
                     }}
                     else {{
-                        E = 0;
-                        pre_PG = 0;
+                        PG = 0;
                     }}
 
                     tdError = 0;
@@ -623,7 +616,7 @@ class EPropCompiler(Compiler):
                     f"""
                     // E = ({model_copy.output_var_name} - yTrue);
                     E = tdError;
-                    ValReg = 0.001 * {model_copy.output_var_name};
+                    ValReg = 0.0 * {model_copy.output_var_name};
                     tdError = 0;
                     """
                 )
