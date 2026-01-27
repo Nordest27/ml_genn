@@ -499,6 +499,8 @@ class EPropCompiler(Compiler):
                  gamma: float = None,
                  td_lambda: float = None,
                  entropy_coeff: float = 1e-4,
+                 entropy_coeff_decay: float = 0.99,
+                 entropy_min: float = 1e-6,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -526,6 +528,7 @@ class EPropCompiler(Compiler):
         self.td_lambda = td_lambda
         self.gamma_lambda = None
         self.entropy_coeff = entropy_coeff
+        self.entropy_coeff_decay = entropy_coeff_decay
         if (gamma is not None) and (td_lambda is not None):
             self.gamma_lambda = gamma * td_lambda
 
@@ -587,6 +590,7 @@ class EPropCompiler(Compiler):
                 model_copy.add_var("PG", "scalar", 0.0)
                 model_copy.add_var("pre_PG", "scalar", 0.0)
                 model_copy.add_var("TdE", "scalar", 0.0)
+                model_copy.add_var("entropyCoeff", "scalar", self.entropy_coeff)
                 # Reward-based policy gradient + entropy reg:
                 model_copy.append_sim_code(
                     # const scalar p = {model_copy.output_var_name};
@@ -597,7 +601,8 @@ class EPropCompiler(Compiler):
                     const scalar logp = log(fmax(p, (scalar)1e-8));
                     const scalar entropyGrad = p * (logp + 1.0);
 
-                    E = {self.entropy_coeff} * entropyGrad;
+                    E = entropyCoeff * entropyGrad;
+                    entropyCoeff = {self.entropy_coeff_decay} * entropyCoeff;
 
                     if (actionTaken != 0) {{
                         PG = (p - yTrue);

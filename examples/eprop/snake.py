@@ -84,7 +84,7 @@ class SnakeEnv:
         # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
         
-        reward = -0.1 #-max(0.5 * (self.steps_since_last_apple-1) / self.size, 5)
+        reward = - 90/self.size * (self.steps_since_last_apple % self.size == 0)
 
         if (self.direction == 'up' and new_dir == 'down') or \
            (self.direction == 'down' and new_dir == 'up') or \
@@ -148,7 +148,7 @@ class SnakeEnv:
         
         if self.steps_since_last_apple > self.size**2:
             self.done = True
-            # reward -= 100.0
+            reward -= 50.0
             return self.get_observation(), reward/100, self.done
 
         self.wait_count = self.wait_inc
@@ -289,7 +289,7 @@ class SnakeEnv:
 
 ################### DEFINE MODEL ####################
 #####################################################
-BOARD_SIZE = 9
+BOARD_SIZE = 15
 VISIBLE_RANGE = 5
 
 WAIT_INC = 30
@@ -311,6 +311,10 @@ KERNEL_PROFILING = False
 gamma = 0.99 ** (1/WAIT_INC)
 td_lambda = 0.01 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
+
+entropy_coeff = 1e-2
+entropy_decay = 0.9999 ** (1/WAIT_INC)
+entropy_min = 1e-5
 
 serialiser = Numpy("snake_checkpoints")
 network = Network(default_params)
@@ -346,14 +350,17 @@ compiler = EPropCompiler(
     example_timesteps=max_example_timesteps,
     losses={policy: "sparse_categorical_crossentropy",
             value: "mean_square_error"},
-    optimiser=Adam(1e-4),
+    optimiser=Adam(5e-5),
     batch_size=1,
     kernel_profiling=KERNEL_PROFILING,
     feedback_type="random",
     gamma=gamma,          # 0.99
     td_lambda=td_lambda,        # or whatever you want
     train_output_bias=False,
-    reset_time_between_batches=False
+    reset_time_between_batches=False,
+    entropy_coeff=entropy_coeff,
+    entropy_coeff_decay=entropy_decay,
+    entropy_min=entropy_min
 )
 
 compiled_net = compiler.compile(network)
@@ -669,9 +676,9 @@ def train_snake_agent_with_ipc(episodes=100000,
                     else:
                         current_run.append(frame_img.copy())
                     train_callback_list.on_batch_end(0, all_metrics)
-                    for o, custom_updates in compiled_net.optimisers:
-                        for c in custom_updates:
-                            o.set_step(c, ep)
+                    # for o, custom_updates in compiled_net.optimisers:
+                    #     for c in custom_updates:
+                    #         o.set_step(c, ep)
 
                     indices = obs.nonzero()[0]
                     spikes = make_repeated_spikes(
@@ -735,8 +742,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                 for c in custom_updates:
                     o.set_step(c, ep)
             
-            if compiled_net.optimisers[0][0].alpha > 1e-5 and np.mean(snake_len_history) > 5:
-                compiled_net.optimisers[0][0].alpha = 1e-5
+            # if compiled_net.optimisers[0][0].alpha > 1e-5 and np.mean(snake_len_history) > 5:
+            #     compiled_net.optimisers[0][0].alpha = 1e-5
 
             # Update if new best run (send best run to viz process)
             if total_reward >= best_reward and len(current_probs) > 0:
