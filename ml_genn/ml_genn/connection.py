@@ -45,7 +45,7 @@ class Connection:
                  name: Optional[str] = None, 
                  max_delay_steps: Optional[int] = None,
                  add_to_model: bool = True,
-                 is_feedback: bool = False):
+                 feedback_name: Optional[str] = None):
         # Store weak references to source and target in class
         self._source = ref(source)
         self._target = ref(target)
@@ -62,9 +62,9 @@ class Connection:
         self.name = (f"Conn_{source.name}_{target.name}" if name is None
                      else name)
         # Store feedback flag
-        self.is_feedback = is_feedback
+        self.is_feedback = feedback_name is not None
         if self.is_feedback:
-            self.name += "Feedback"
+            self.name += f"_{feedback_name}"
 
         # Add weak references to ourselves to source
         # and target's outgoing and incoming connection lists
