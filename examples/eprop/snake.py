@@ -144,7 +144,7 @@ class SnakeEnv:
                 self.done = True
                 # reward += 500.0
                 self.won = True
-            if len(self.snake) > self.size**2 - self.size and self.size > 5:
+            if len(self.snake) > 0.75 * self.size**2 and self.size > 5:
                 self.won = True
             self.steps_since_last_apple = 0
         else:
@@ -295,30 +295,32 @@ class SnakeEnv:
 ################### DEFINE MODEL ####################
 #####################################################
 WINDOW_EPISODES = 100
-BOARD_SIZE = 2
+BOARD_SIZE = 6
 VISIBLE_RANGE = 5
 
 WAIT_INC = 30
 
 INPUT_SIZE = 3 * VISIBLE_RANGE**2
-NUM_HIDDEN_1 = 512
+NUM_HIDDEN_1 = 2048
 NUM_OUTPUT = 4
 CONN_P = {
-    "I-H": 0.5,
+    "I-H": 0.25,
     #"H-H": 0.25,
     "H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
-    "H-P": 0.5,
-    "H-V": 0.5
+    "H-P": 0.25,
+    "H-V": 0.25
 }
 TRAIN = True
+CHECKPOINT_BOARD_SIZE = 5
 
 KERNEL_PROFILING = False
 
+
 gamma = 0.99 ** (1/WAIT_INC)
-td_lambda = 0.01 ** (1/WAIT_INC)
+td_lambda = 0.8 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-2
+entropy_coeff = 1e-4
 entropy_decay = 0.9999 ** (1/WAIT_INC)
 entropy_min = 1e-5
 
@@ -353,6 +355,8 @@ with network:
     Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
 
 
+if CHECKPOINT_BOARD_SIZE:
+    network.load((CHECKPOINT_BOARD_SIZE,), serialiser)
 
 max_example_timesteps = 1
 compiler = EPropCompiler(
@@ -647,10 +651,15 @@ def train_snake_agent_with_ipc(episodes=100000,
         train_callback_list.on_batch_begin(0)
         for ep in range(episodes):
             if env.won:
+                compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
+                compiled_net.save((BOARD_SIZE,), serialiser)
                 best_reward = -np.inf
                 BOARD_SIZE += 1
                 print(f"WON! Increasing board size to {BOARD_SIZE}")
                 env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC)
+            if ep % 1000 == 0:
+                compiled_net.save_connectivity((BOARD_SIZE,"mid-complition"), serialiser)
+                compiled_net.save((BOARD_SIZE, "mid-completion"), serialiser)
 
             for m in all_metrics.values():
                 m.reset()

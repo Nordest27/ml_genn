@@ -237,18 +237,44 @@ eprop_alif_model = {
     eFiltered = eF;
     """}
 
+output_learning_model = {
+    "params": [("Alpha", "scalar")],
+    "vars": [("g", "scalar", VarAccess.READ_ONLY), ("DeltaG", "scalar")],
+    "pre_vars": [("ZFilter", "scalar")],
+    "post_neuron_var_refs": [("E_post", "scalar")],
+
+    "pre_spike_code": """
+    ZFilter += 1.0;
+    """,
+    "pre_dynamics_code": """
+    ZFilter *= Alpha;
+    """,
+
+    "pre_spike_syn_code": """
+    addToPost(g);
+    """,
+    "synapse_dynamics_code": """
+    DeltaG += ZFilter * E_post;
+    addToPre(g * E_post);
+    """}
+
+output_random_learning_model = deepcopy(output_learning_model)
+output_random_learning_model["synapse_dynamics_code"] =  """
+    DeltaG += ZFilter * E_post;
+"""
+
 eprop_alif_td_model = {
     "params": [("CReg", "scalar"), ("Alpha", "scalar"), ("Rho", "scalar"),
                ("FTarget", "scalar"),("AlphaFAv", "scalar"),
-               ("Vthresh_post", "scalar"), ("Beta_post", "scalar")],
+               ("Vthresh_post", "scalar"), ("Beta_post", "scalar"),
+               ("GammaLambda", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY),
              ("eFiltered", "scalar"),
              ("PrevEFiltered", "scalar"),
              ("epsilonA", "scalar"),
              ("DeltaG", "scalar"),
              # extra per-synapse RL trace Fγ(·)
-             ("RLTrace", "scalar"),
-             ("GammaLambda", "scalar")],
+             ("RLTrace", "scalar")],
     "pre_vars": [("ZFilter", "scalar")],
     "post_vars": [("Psi", "scalar"), ("FAvg", "scalar")],
     "post_neuron_var_refs": [
@@ -313,23 +339,24 @@ eprop_alif_td_model = {
         + TdE_post * (
             RLTrace
         );
-        // + (PR_post + VR_post) * eFiltered;
+        + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
     
     PrevEFiltered = eFiltered;
     eFiltered = eF;
-    GammaLambda = fmin(1e-10 + GammaLambda, 1-1e-3);
     """
 }
 
-output_learning_model = {
-    "params": [("Alpha", "scalar")],
+output_value_learning_model = {
+    "params": [
+        ("Alpha", "scalar"),
+        ("GammaLambda", "scalar")
+    ],
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY), 
         ("DeltaG", "scalar"), 
         ("PrevZFilter", "scalar"),
         ("PrevPrevZFilter", "scalar"),
         ("RLTrace", "scalar"),
-        ("GammaLambda", "scalar")
     ],
     "pre_vars": [("ZFilter", "scalar")],
     "post_neuron_var_refs": [
@@ -356,32 +383,30 @@ output_learning_model = {
 
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
-
-    GammaLambda = fmin(1e-10 + GammaLambda, 1-1e-3);
     """}
 
-output_random_learning_model = deepcopy(output_learning_model)
-output_random_learning_model["synapse_dynamics_code"] =  """
+output_value_random_learning_model = deepcopy(output_value_learning_model)
+output_value_random_learning_model["synapse_dynamics_code"] =  """
     RLTrace = GammaLambda * RLTrace - ZFilter;
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
 
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
-
-    GammaLambda = fmin(1e-10 + GammaLambda, 1-1e-3);
 """
 
 
 # --- NEW: TD(λ) versions for policy head ---
-output_td_learning_model = {
-    "params": [("Alpha", "scalar")],
+output_policy_learning_model = {
+    "params": [
+        ("Alpha", "scalar"),       
+        ("GammaLambda", "scalar")
+    ],
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY),
         ("DeltaG", "scalar"),
         ("RLTrace", "scalar"),
         ("PrevZFilter", "scalar"),
         ("PrevPrevZFilter", "scalar"),
-        ("GammaLambda", "scalar")
     ],
     "pre_vars": [("ZFilter", "scalar")],
     "post_neuron_var_refs": [
@@ -408,20 +433,16 @@ output_td_learning_model = {
 
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
-
-    GammaLambda = fmin(1e-10 + GammaLambda, 1-1e-3);
     """
 }
 
-output_random_td_learning_model = deepcopy(output_td_learning_model)
-output_random_td_learning_model["synapse_dynamics_code"] = """
+output_policy_random_learning_model = deepcopy(output_policy_learning_model)
+output_policy_random_learning_model["synapse_dynamics_code"] = """
     RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
     DeltaG += TdE_post * RLTrace + ZFilter * E_post;
 
     PrevPrevZFilter = PrevZFilter;
     PrevZFilter = ZFilter;
-
-    GammaLambda = fmin(1e-10 + GammaLambda, 1-1e-3);
 """
 
 
@@ -603,49 +624,56 @@ class EPropCompiler(Compiler):
                                self.batch_size, self.example_timesteps)
 
             # Add sim-code to calculate error
-            if self.gamma_lambda is not None and isinstance(loss, SparseCategoricalCrossentropy):
-                model_copy.add_var("PG", "scalar", 0.0)
-                model_copy.add_var("pre_PG", "scalar", 0.0)
-                model_copy.add_var("TdE", "scalar", 0.0)
-                model_copy.add_var("entropyCoeff", "scalar", self.entropy_coeff)
-                # Reward-based policy gradient + entropy reg:
-                model_copy.append_sim_code(
-                    # const scalar p = {model_copy.output_var_name};
-                    f"""
-                    TdE = tdError;
-                    
-                    const scalar p = {model_copy.output_var_name};
-                    const scalar logp = log(fmax(p, (scalar)1e-8));
-                    const scalar entropyGrad = p * (logp + 1.0);
+            if self.gamma_lambda is not None:
+                if isinstance(loss, SparseCategoricalCrossentropy):
+                    model_copy.add_var("PG", "scalar", 0.0)
+                    model_copy.add_var("pre_PG", "scalar", 0.0)
+                    model_copy.add_var("TdE", "scalar", 0.0)
+                    model_copy.add_var("entropyCoeff", "scalar", self.entropy_coeff)
+                    # Reward-based policy gradient + entropy reg:
+                    model_copy.append_sim_code(
+                        # const scalar p = {model_copy.output_var_name};
+                        f"""
+                        TdE = tdError;
+                        
+                        const scalar p = {model_copy.output_var_name};
+                        const scalar logp = log(fmax(p, (scalar)1e-8));
+                        const scalar entropyGrad = p * (logp + 1.0);
 
-                    E = entropyCoeff * entropyGrad;
-                    entropyCoeff = {self.entropy_coeff_decay} * entropyCoeff;
+                        E = entropyCoeff * entropyGrad;
+                        entropyCoeff = {self.entropy_coeff_decay} * entropyCoeff;
 
-                    if (actionTaken != 0) {{
-                        PG = (p - yTrue);
-                    }}
-                    else {{
-                        PG = 0;
-                    }}
+                        if (actionTaken != 0) {{
+                            PG = (p - yTrue);
+                        }}
+                        else {{
+                            PG = 0;
+                        }}
 
-                    tdError = 0;
-                    actionTaken = 0;
-                    """
-                )
+                        tdError = 0;
+                        actionTaken = 0;
+                        """
+                    )
+                else:
+                    model_copy.add_var("ValReg", "scalar", 0.0)
+                    model_copy.add_var("PrevVal", "scalar", 0.0)
+                    model_copy.append_sim_code(
+                        f"""
+                        E = tdError;
+                        ValReg = (
+                            0.1 * ({model_copy.output_var_name} - PrevVal)
+                        );
+                        PrevVal = {model_copy.output_var_name};
+                        tdError = 0;
+                        """
+                    )
             else:
-                model_copy.add_var("ValReg", "scalar", 0.0)
-                model_copy.add_var("PrevVal", "scalar", 0.0)
+                # Add sim-code to calculate error
                 model_copy.append_sim_code(
                     f"""
-                    // E = ({model_copy.output_var_name} - yTrue);
-                    E = tdError;
-                    ValReg = (
-                        0.1 * ({model_copy.output_var_name} - PrevVal)
-                    );
-                    PrevVal = {model_copy.output_var_name};
-                    tdError = 0;
-                    """
-                )
+                    E = {model_copy.output_var_name} - yTrue;
+                    """)
+
 
             # If we should train output biases
             if self.train_output_bias:
@@ -769,7 +797,7 @@ class EPropCompiler(Compiler):
             if self.feedback_type != "random":
                 raise ValueError("Feedback type must be 'random' when using random feedback connections")
             # Add connection to list of feedback connections
-            if self.gamma_lambda != 0:
+            if self.gamma_lambda is not None:
                 if is_policy_head:
                     feedback_model = output_random_feedback_model
                     if conn.name.endswith("policy_feedback"):
@@ -787,6 +815,8 @@ class EPropCompiler(Compiler):
                         compile_state.value_regularisation_connections.append(conn)
                         post_var_name = "ValReg"
             else:
+                feedback_model = output_random_feedback_model
+                post_var_name = "E"
                 compile_state.feedback_connections.append(conn)
             wum = WeightUpdateModel(
                 model=feedback_model,
@@ -841,6 +871,7 @@ class EPropCompiler(Compiler):
                         "AlphaFAv": np.exp(-self.dt / self.tau_reg),
                         "Vthresh_post": target_neuron.v_thresh,
                         "Beta_post": target_neuron.beta,
+                        "GammaLambda": self.gamma_lambda
                     },
                     var_vals={"g": connect_snippet.weight,
                               "eFiltered": 0.0,
@@ -848,7 +879,7 @@ class EPropCompiler(Compiler):
                               "DeltaG": 0.0,
                               "epsilonA": 0.0,
                               "RLTrace": 0.0,
-                              "GammaLambda": self.gamma_lambda},
+                    },
                     pre_var_vals={"ZFilter": 0.0},
                     post_var_vals={"Psi": 0.0, "FAvg": 0.0},
                     post_neuron_var_refs={
@@ -862,46 +893,62 @@ class EPropCompiler(Compiler):
         # weight update model with simple output learning rule
         elif target_neuron.readout is not None:
 
-            if is_policy_head:
-                # --- TD(λ) rule for policy head ---
-                model = (output_td_learning_model
-                        if self.feedback_type == "symmetric"
-                        else output_random_td_learning_model)
+            if self.gamma_lambda is not None:
+                if is_policy_head:
+                    # --- TD(λ) rule for policy head ---
+                    model = (output_policy_learning_model
+                            if self.feedback_type == "symmetric"
+                            else output_policy_random_learning_model)
 
-                wum = WeightUpdateModel(
-                    model=model,
-                    param_vals={"Alpha": alpha},
-                    var_vals={"g": connect_snippet.weight,
+                    wum = WeightUpdateModel(
+                        model=model,
+                        param_vals={
+                            "Alpha": alpha,
+                            "GammaLambda": self.gamma_lambda
+                        },
+                        var_vals={
+                            "g": connect_snippet.weight,
                             "DeltaG": 0.0,
                             "RLTrace": 0.0,
                             "PrevZFilter": 0.0,
                             "PrevPrevZFilter": 0.0,
-                            "GammaLambda": self.gamma_lambda},
-                    pre_var_vals={"ZFilter": 0.0},
-                    post_neuron_var_refs={
-                        "E_post": "E", "PG_post": "PG",
-                        "TdE_post": "TdE"})
-            else:
-                # Original rule for other readouts (e.g. value head)
-                model = (output_learning_model
-                        if self.feedback_type == "symmetric"
-                        else output_random_learning_model)
+                        },
+                        pre_var_vals={"ZFilter": 0.0},
+                        post_neuron_var_refs={
+                            "E_post": "E", "PG_post": "PG",
+                            "TdE_post": "TdE"})
+                else:
+                    model = (output_value_learning_model
+                            if self.feedback_type == "symmetric"
+                            else output_value_random_learning_model)
 
+                    wum = WeightUpdateModel(
+                        model=model,
+                        param_vals={
+                            "Alpha": alpha,
+                            "GammaLambda": self.gamma_lambda
+                        },
+                        var_vals={
+                            "g": connect_snippet.weight, 
+                            "DeltaG": 0.0,
+                            "RLTrace": 0.0, 
+                            "PrevZFilter": 0.0,
+                            "PrevPrevZFilter": 0.0,
+                        },
+                        pre_var_vals={"ZFilter": 0.0},
+                        post_neuron_var_refs={
+                            "E_post": "E", 
+                            "ValReg_post": "ValReg"})
+            else:
                 wum = WeightUpdateModel(
-                    model=model,
+                    model=output_learning_model 
+                        if self.feedback_type == "symmetric" 
+                        else output_random_learning_model,
                     param_vals={"Alpha": alpha},
-                    var_vals={
-                        "g": connect_snippet.weight, 
-                        "DeltaG": 0.0,
-                        "RLTrace": 0.0, 
-                        "PrevZFilter": 0.0,
-                        "PrevPrevZFilter": 0.0,
-                        "GammaLambda": self.gamma_lambda    
-                    },
+                    var_vals={"g": connect_snippet.weight, "DeltaG": 0.0},
                     pre_var_vals={"ZFilter": 0.0},
-                    post_neuron_var_refs={
-                        "E_post": "E", 
-                        "ValReg_post": "ValReg"})
+                    post_neuron_var_refs={"E_post": "E"})
+
 
             if self.feedback_type == "symmetric" and not conn.is_feedback:
                 compile_state.feedback_connections.append(conn)

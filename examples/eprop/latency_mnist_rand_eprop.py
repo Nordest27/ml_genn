@@ -4,7 +4,7 @@ import mnist
 
 from ml_genn import InputLayer, Layer, Network, Population, Connection
 from ml_genn.callbacks import Checkpoint
-from ml_genn.compilers import EPropCompiler, InferenceCompiler
+from ml_genn.compilers import EPropCompiler, InferenceCompiler, RandEPropCompiler
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput
@@ -32,7 +32,7 @@ spikes = log_latency_encode_data(
     mnist.train_images() if TRAIN else mnist.test_images(),
     20.0, 51)
 
-serialiser = Numpy("latency_mnist_checkpoints")
+serialiser = Numpy("latency_mnist_rand_checkpoints")
 network = Network(default_params)
 with network:
     # Populations
@@ -56,8 +56,8 @@ with network:
     # Connection(hidden_1, output, FixedProbability(0.0001, Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_1))))
 
     # Random feedback matrices (COMMENT THESE LINES TO COMPARE WITH SYMMETRIC EPROP)
-    Connection(hidden_1, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), is_feedback=True)
-    Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), is_feedback=True)
+    Connection(hidden_1, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f1")
+    Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f2")
 
 max_example_timesteps = int(np.ceil(calc_latest_spike_time(spikes)))
 if TRAIN:

@@ -105,17 +105,20 @@ class DoorKeyMNISTMemoryEnv:
         nx = self.agent_pos[1] + dx
 
         self.steps_since_reveal += 1
+        # Timeout penalty (too many steps after seeing digit)
+        if self.steps_since_reveal > GRID_SIZE*GRID_SIZE//2:
+            reward -= 1.0
+            self.done = True
 
         # out of bounds
         if ny < 0 or ny >= GRID_SIZE or nx < 0 or nx >= GRID_SIZE:
-            self.wait_count = self.wait_inc
-            self.done = True
-            return self.get_observation(), -1.0, self.done
+            # self.reward -= 1.0
+            # self.done = True
+            return self.get_observation(), reward, self.done
 
         if (ny, nx) in self.doors and self.doors_locked:
-            self.wait_count = self.wait_inc
-            self.done = True
-            reward -= 1.0
+            # self.done = True
+            # reward -= 0.1
             # self.head_butts += 1
             # if self.head_butts > 10:
             #     self.done = True
@@ -127,7 +130,7 @@ class DoorKeyMNISTMemoryEnv:
         # reveal zone
         if (ny, nx) == self.reveal_pos:
             if self.doors_locked:
-                reward += 1.0
+                reward += 0.5
                 self.steps_since_reveal = 0
             self.sample_digit()
             self.visualizing_digit = True
@@ -146,14 +149,9 @@ class DoorKeyMNISTMemoryEnv:
 
         if (ny, nx) in self.doors and not self.doors_locked:
             if nx == self.correct_door:
-                reward += 5.0
-            else:
                 reward += 1.0
-            self.done = True
-
-        # Timeout penalty (too many steps after seeing digit)
-        if self.steps_since_reveal > GRID_SIZE*GRID_SIZE//2:
-            reward -= 1.0
+            else:
+                reward -= 0.1
             self.done = True
 
         self.wait_count = self.wait_inc
@@ -327,13 +325,13 @@ class DoorKeyMNISTMemoryEnv:
 ################### DEFINE MODEL ####################
 #####################################################
 WINDOW_EPISODES = 100
-WAIT_INC = 10
+WAIT_INC = 30
 
 INPUT_SIZE = GRID_SIZE * GRID_SIZE * 2 + 28 * 28  # walls + reveal + MNIST = 984
-NUM_HIDDEN_1 = 1024
+NUM_HIDDEN_1 = 2048
 NUM_OUTPUT = 5  # 4 actions + wait
 CONN_P = {
-    "I-H": 0.1,
+    "I-H": 0.5,
     "H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
     # "H-H": 0.25,
     "H-P": 0.1,
@@ -346,7 +344,7 @@ gamma = 0.99 ** (1/WAIT_INC)
 td_lambda = 0.01 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-3
+entropy_coeff = 1e-2
 entropy_decay = 0.9999 ** (1/WAIT_INC)
 entropy_min = 1e-5
 
@@ -718,7 +716,7 @@ def train_door_key_agent(episodes=100000,
                 reward_trace = reward_trace * 0.0 + reward * 1.0
 
                 # Track success (agent chose correct door)
-                if done and reward > 5:
+                if done and reward > 0.5:
                     success = True
 
                 if env.wait_count == env.wait_inc:
@@ -730,7 +728,7 @@ def train_door_key_agent(episodes=100000,
                     else:
                         current_run.append(frame_img.copy())
                     
-                    train_callback_list.on_batch_end(0, all_metrics)
+                    # train_callback_list.on_batch_end(0, all_metrics)
 
                     # Encode next observation
                     indices = obs.nonzero()[0]
