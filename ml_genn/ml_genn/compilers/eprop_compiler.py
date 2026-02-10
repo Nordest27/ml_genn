@@ -338,8 +338,7 @@ eprop_alif_td_model = {
     DeltaG += fireReg 
         + TdE_post * (
             RLTrace
-        );
-        + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
+        ) + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
     
     PrevEFiltered = eFiltered;
     eFiltered = eF;

@@ -658,8 +658,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                 print(f"WON! Increasing board size to {BOARD_SIZE}")
                 env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC)
             if ep % 1000 == 0:
-                compiled_net.save_connectivity((BOARD_SIZE,"mid-complition"), serialiser)
-                compiled_net.save((BOARD_SIZE, "mid-completion"), serialiser)
+                compiled_net.save_connectivity((f"{BOARD_SIZE}_mid_completion",), serialiser)
+                compiled_net.save((f"{BOARD_SIZE}_mid_completion",), serialiser)
 
             for m in all_metrics.values():
                 m.reset()

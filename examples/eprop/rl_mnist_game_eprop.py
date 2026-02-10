@@ -28,7 +28,7 @@ import multiprocessing as mp
 from multiprocessing import Manager, Queue
 
 # ---------------- CONFIG ----------------
-GRID_SIZE = 10
+GRID_SIZE = 4
 CELL_SIZE = 60
 
 AGENT_COLOR = (50, 200, 50)
@@ -63,16 +63,20 @@ class DoorKeyMNISTMemoryEnv:
         self.reset()
 
     def reset(self):
-        self.agent_pos = [9, 5]
-
-        self.current_digit = np.random.randint(0, 10)
+        self.agent_pos = (
+                np.random.randint(2, GRID_SIZE), 
+                np.random.randint(0, GRID_SIZE)
+            )
+        self.current_digit = np.random.randint(0, GRID_SIZE)
         self.current_mnist = np.zeros((28, 28), dtype=np.uint8)
 
-        self.reveal_pos = (
-            np.random.randint(4, GRID_SIZE), 
-            np.random.choice([i for i in range(GRID_SIZE) 
-                if i != self.current_digit])
-        )
+        self.reveal_pos = self.agent_pos
+        while self.reveal_pos[0] == self.agent_pos[0] and self.reveal_pos[1] == self.agent_pos[1]:
+            self.reveal_pos = (
+                np.random.randint(2, GRID_SIZE), 
+                np.random.choice([i for i in range(GRID_SIZE) 
+                    if i != self.current_digit])
+            )
 
         self.doors = [(0, i) for i in range(GRID_SIZE)]
         self.doors_locked = True
@@ -83,6 +87,8 @@ class DoorKeyMNISTMemoryEnv:
         self.wait_count = self.wait_inc
         self.visualizing_digit = False
         self.head_butts = 0
+        self.no_move_count = 0
+        self.digit_visualizations = 0
 
         return self.get_observation()
 
@@ -100,25 +106,32 @@ class DoorKeyMNISTMemoryEnv:
 
         reward = 0.0
         dy, dx = [(0,-1),(-1,0),(0,1),(1,0),(0,0)][action]
+        if (dy, dx) == (0, 0):
+            self.no_move_count += 1
+            reward -= 0.05
+            if self.no_move_count > 20:
+                reward -= 1.0
+                self.done = True
 
         ny = self.agent_pos[0] + dy
         nx = self.agent_pos[1] + dx
 
         self.steps_since_reveal += 1
         # Timeout penalty (too many steps after seeing digit)
-        if self.steps_since_reveal > GRID_SIZE*GRID_SIZE//2:
+        if self.steps_since_reveal > 100:
             reward -= 1.0
             self.done = True
+            return self.get_observation(), reward, self.done
 
         # out of bounds
         if ny < 0 or ny >= GRID_SIZE or nx < 0 or nx >= GRID_SIZE:
-            # self.reward -= 1.0
-            # self.done = True
+            reward -= 1.0
+            self.done = True
             return self.get_observation(), reward, self.done
 
         if (ny, nx) in self.doors and self.doors_locked:
-            # self.done = True
-            # reward -= 0.1
+            self.done = True
+            reward -= 1.0
             # self.head_butts += 1
             # if self.head_butts > 10:
             #     self.done = True
@@ -132,18 +145,16 @@ class DoorKeyMNISTMemoryEnv:
             if self.doors_locked:
                 reward += 0.5
                 self.steps_since_reveal = 0
-            self.sample_digit()
+                self.doors_locked = False
+            if self.digit_visualizations < 3:
+                self.digit_visualizations += 1
+                self.sample_digit()
             self.visualizing_digit = True
-        else:
-            # MNIST disappears immediately when leaving reveal
-            self.current_mnist[:] = 0
-            self.visualizing_digit = False
-
         # door entry
-        if ny==1:
+        elif ny==1:
             self.sample_door_digit(nx)
             self.visualizing_digit = True
-        elif ny == 2:
+        else:
             self.current_mnist[:] = 0
             self.visualizing_digit = False
 
@@ -151,7 +162,7 @@ class DoorKeyMNISTMemoryEnv:
             if nx == self.correct_door:
                 reward += 1.0
             else:
-                reward -= 0.1
+                reward += 0.25
             self.done = True
 
         self.wait_count = self.wait_inc
@@ -189,7 +200,7 @@ class DoorKeyMNISTMemoryEnv:
         agent_y, agent_x = self.agent_pos
 
         # Local grid observation (3 channels)
-        obs = np.zeros((3, v, v), dtype=np.float32)
+        obs = np.zeros((2, v, v), dtype=np.float32)
 
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
@@ -208,13 +219,13 @@ class DoorKeyMNISTMemoryEnv:
                     obs[1, local_y, local_x] = 1.0
 
         # MNIST image channel (always full 28x28, separate from local view)
-        mnist_channel = (self.current_mnist.astype(np.float32) / 255.0 > 0.5).astype(np.int32)
-
-        # Concatenate: local view (3 * v * v) + MNIST (28 * 28)
-        return np.concatenate([
-            obs.flatten(),
-            mnist_channel.flatten()
-        ])
+        prob = self.current_mnist.astype(np.float32) / 255.0
+        mnist_channel = (np.random.rand(*prob.shape) < prob).astype(np.int32)
+        # mnist_channel = np.zeros_like(self.current_mnist)
+        # mnist_channel[0][self.current_digit] = 1.0
+        # Concatenate: local view (2 * v * v) + MNIST (28 * 28)
+        return (obs.flatten(),
+            mnist_channel.flatten())
 
     # ------------------------------------------------------------ #
     #                     VISUALIZATION                            #
@@ -250,13 +261,13 @@ class DoorKeyMNISTMemoryEnv:
         # Add MNIST digit overlay if doors are unlocked (digit has been seen)
         if self.visualizing_digit:
             # Resize MNIST to fit in corner (e.g., 150x150 pixels)
-            mnist_size = int(scale * 2.5)  # 2.5 cells worth of space
+            mnist_size = int(scale*1.5)  # 2.5 cells worth of space
             mnist_display = cv2.resize(self.current_mnist, (mnist_size, mnist_size),
                                       interpolation=cv2.INTER_NEAREST)
             mnist_display = cv2.cvtColor(mnist_display, cv2.COLOR_GRAY2BGR)
             
             # Add border around MNIST
-            border_size = 5
+            border_size = GRID_SIZE//2
             mnist_display = cv2.copyMakeBorder(mnist_display, border_size, border_size, 
                                               border_size, border_size,
                                               cv2.BORDER_CONSTANT, value=(255, 255, 0))
@@ -264,53 +275,13 @@ class DoorKeyMNISTMemoryEnv:
             # Place in bottom-right corner
             h, w = img.shape[:2]
             mh, mw = mnist_display.shape[:2]
-            y_offset = h - mh - 10
-            x_offset = w - mw - 10
+            y_offset = max(0, h - mh - GRID_SIZE)
+            x_offset = max(0, w - mw - GRID_SIZE)
             
             # Overlay the MNIST with slight transparency effect
             img[y_offset:y_offset+mh, x_offset:x_offset+mw] = mnist_display
 
         return img
-
-    def local_img(self, scale=40):
-        """
-        Returns a local RGB image centered on the agent,
-        matching the visible_range used in get_observation().
-        Channels:
-            Gray   = walls (out of bounds)
-            Yellow = reveal button
-            Green  = agent (center)
-        """
-        v = self.visible_range
-        r = v // 2
-        agent_y, agent_x = self.agent_pos
-
-        img = np.zeros((v, v, 3), dtype=np.uint8)
-        img[:] = BG_COLOR  # default background
-
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                y = agent_y + dy
-                x = agent_x + dx
-                local_y = dy + r
-                local_x = dx + r
-
-                # Walls (out of bounds)
-                if y < 0 or y >= GRID_SIZE or x < 0 or x >= GRID_SIZE:
-                    img[local_y, local_x] = (100, 100, 100)  # gray
-                    continue
-
-                # Reveal button
-                if (y, x) == self.reveal_pos:
-                    img[local_y, local_x] = REVEAL_COLOR  # yellow
-
-                # Agent position (center)
-                if (y, x) == tuple(self.agent_pos):
-                    img[local_y, local_x] = AGENT_COLOR  # green
-
-        # Upscale for visualization
-        return cv2.resize(img, (v * scale, v * scale), interpolation=cv2.INTER_NEAREST)
-
 
     def render(self):
         cv2.imshow("Door-Key MNIST", self.img())
@@ -326,25 +297,33 @@ class DoorKeyMNISTMemoryEnv:
 #####################################################
 WINDOW_EPISODES = 100
 WAIT_INC = 30
+CHECKPOINT_BOARD_SIZE = 3
 
-INPUT_SIZE = GRID_SIZE * GRID_SIZE * 2 + 28 * 28  # walls + reveal + MNIST = 984
-NUM_HIDDEN_1 = 2048
-NUM_OUTPUT = 5  # 4 actions + wait
+VISIBLE_RANGE = 5
+AGENT_INPUT_SIZE = VISIBLE_RANGE * VISIBLE_RANGE * 2
+MNIST_INPUT_SIZE = 28 * 28
+INPUT_SIZE = AGENT_INPUT_SIZE + MNIST_INPUT_SIZE
+NUM_HIDDEN_MNIST = 64
+NUM_HIDDEN_1 = 512-64
+NUM_OUTPUT = 4  # 4 actions + wait
 CONN_P = {
-    "I-H": 0.5,
-    "H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
-    # "H-H": 0.25,
-    "H-P": 0.1,
-    "H-V": 0.1
+    "IA-H1": 0.5,
+    "IM-HM1": 0.5,
+    "HM1-HM1": 0.1,
+    "HM1-H1": 0.1,
+    "H1-H1": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
+    # "H1-H1": 0.1,
+    "H1-P": 0.5,
+    "H1-V": 0.5
 }
 
 KERNEL_PROFILING = False
 
 gamma = 0.99 ** (1/WAIT_INC)
-td_lambda = 0.01 ** (1/WAIT_INC)
+td_lambda = 0.1 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-2
+entropy_coeff = 1e-4
 entropy_decay = 0.9999 ** (1/WAIT_INC)
 entropy_min = 1e-5
 
@@ -352,32 +331,59 @@ serialiser = Numpy("door_key_mnist_checkpoints")
 network = Network(default_params)
 with network:
     # Populations
-    input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SIZE)
-    hidden_1 = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=30.0,
-                                           tau_refrac=3.0, tau_adapt=1000),
-                        NUM_HIDDEN_1)
-    policy = Population(LeakyIntegrate(tau_mem=10.0, readout="var"),
-                        NUM_OUTPUT)
+    input_pop_mnist = Population(SpikeInput(max_spikes=MNIST_INPUT_SIZE * WAIT_INC), MNIST_INPUT_SIZE)
+    hidden_mnist = Population(
+        AdaptiveLeakyIntegrateFire(
+            v_thresh=0.61, tau_mem=30.0,
+            tau_refrac=3.0, tau_adapt=300, beta=0.17),
+        NUM_HIDDEN_MNIST)
+    
+    input_pop_agent = Population(SpikeInput(max_spikes=AGENT_INPUT_SIZE * WAIT_INC), AGENT_INPUT_SIZE)
+    hidden_1 = Population(
+        AdaptiveLeakyIntegrateFire(
+            v_thresh=0.61, tau_mem=30.0,
+            tau_refrac=3.0, tau_adapt=300, beta=0.17),
+        NUM_HIDDEN_1)
 
-    value = Population(LeakyIntegrate(tau_mem=10.0, readout="var"),
-                        1)
+    policy = Population(
+        LeakyIntegrate(tau_mem=30.0, readout="var"),
+        NUM_OUTPUT)
+
+    value = Population(
+        LeakyIntegrate(tau_mem=60.0, readout="var"), 
+        1)
     
     # Connections
-    Connection(input_pop,  hidden_1, 
-        FixedProbability(CONN_P['I-H'], (Normal(sd=1.0 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE)))))
+    Connection(input_pop_mnist,  hidden_mnist, 
+        FixedProbability(CONN_P['IM-HM1'], (Normal(sd=1.0 / np.sqrt(CONN_P['IM-HM1'] * MNIST_INPUT_SIZE)))))
+    Connection(hidden_mnist,  hidden_mnist, 
+        FixedProbability(CONN_P['HM1-HM1'], (Normal(sd=1.0 / np.sqrt(CONN_P['HM1-HM1'] * NUM_HIDDEN_MNIST)))))
+    Connection(hidden_mnist,  hidden_1, 
+        FixedProbability(CONN_P['HM1-H1'], (Normal(sd=1.0 / np.sqrt(CONN_P['HM1-H1'] * NUM_HIDDEN_MNIST)))))
+
+    Connection(input_pop_agent,  hidden_1, 
+        FixedProbability(CONN_P['IA-H1'], (Normal(sd=1.0 / np.sqrt(CONN_P['IA-H1'] * AGENT_INPUT_SIZE)))))
     Connection(hidden_1, hidden_1, 
-        FixedProbability(CONN_P['H-H'], (Normal(sd=1.0 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1)))))
+        FixedProbability(CONN_P['H1-H1'], (Normal(sd=1.0 / np.sqrt(CONN_P['H1-H1'] * NUM_HIDDEN_1)))))
     
     Connection(hidden_1, policy, 
-        FixedProbability(CONN_P['H-P'], (Normal(sd=1.0 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_1)))))
+        FixedProbability(CONN_P['H1-P'], (Normal(sd=1.0 / np.sqrt(CONN_P['H1-P'] * NUM_HIDDEN_1)))))
     Connection(hidden_1, value, 
-        FixedProbability(CONN_P['H-V'], (Normal(sd=1.0 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_1)))))
+        FixedProbability(CONN_P['H1-V'], (Normal(sd=1.0 / np.sqrt(CONN_P['H1-V'] * NUM_HIDDEN_1)))))
     
+        
+    Connection(hidden_mnist, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
+    Connection(hidden_mnist, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
+    Connection(hidden_mnist, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
+    Connection(hidden_mnist, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
+
     Connection(hidden_1, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
     Connection(hidden_1, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
     Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
     Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
 
+if CHECKPOINT_BOARD_SIZE:
+    network.load((CHECKPOINT_BOARD_SIZE,), serialiser)
 
 max_example_timesteps = 1
 compiler = EPropCompiler(
@@ -390,7 +396,7 @@ compiler = EPropCompiler(
     feedback_type="random",
     gamma=gamma,
     td_lambda=td_lambda,
-    train_output_bias=False,
+    train_output_bias=True,
     reset_time_between_batches=False,
     entropy_coeff=entropy_coeff,
     entropy_coeff_decay=entropy_decay,
@@ -646,7 +652,7 @@ def train_door_key_agent(episodes=100000,
     Train the Door-Key MNIST Memory agent using e-prop learning.
     """
     with compiled_net:
-        env = DoorKeyMNISTMemoryEnv(wait_inc=WAIT_INC)
+        env = DoorKeyMNISTMemoryEnv(wait_inc=WAIT_INC, visible_range=VISIBLE_RANGE)
         best_reward = -np.inf
         best_run = []
         running_avg = []
@@ -675,15 +681,23 @@ def train_door_key_agent(episodes=100000,
             success = False
 
             # Initial spike encoding
-            indices = obs.nonzero()[0]
-            spikes = make_repeated_spikes(
-                indices,
+            indices_agent = obs[0].nonzero()[0]
+            spikes_agent = make_repeated_spikes(
+                indices_agent,
                 compiled_net.genn_model.timestep,
-                INPUT_SIZE,
+                AGENT_INPUT_SIZE,
                 K=WAIT_INC,
                 period=1
             )
-            compiled_net.set_input({input_pop: [spikes]})
+            indices_mnist = obs[1].nonzero()[0]
+            spikes_mnist = make_repeated_spikes(
+                indices_mnist,
+                compiled_net.genn_model.timestep,
+                MNIST_INPUT_SIZE,
+                K=WAIT_INC//3,
+                period=3
+            )
+            compiled_net.set_input({input_pop_agent: [spikes_agent], input_pop_mnist: [spikes_mnist]})
             compiled_net.step_time(train_callback_list)
             previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
@@ -694,11 +708,15 @@ def train_door_key_agent(episodes=100000,
                 action_label = 0
                 current_values.append(previous_value_estimate)
                 
+                if ep % 10000 == 0:
+                    compiled_net.save_connectivity((GRID_SIZE,), serialiser)
+                    compiled_net.save((GRID_SIZE,), serialiser)
+
                 if env.wait_count == 0:
                     probs = compiled_net.get_readout(policy).flatten()
                     if abs(sum(probs) - 1.0) > 0.0001:
                         print("BAD PROBS", sum(probs))
-                    action_label = np.random.choice(5, p=probs)
+                    action_label = np.random.choice(NUM_OUTPUT, p=probs)
                     current_probs.append(probs)
                     
                     compiled_net.losses[policy].set_target(
@@ -710,10 +728,11 @@ def train_door_key_agent(episodes=100000,
                     compiled_net.losses[policy].set_var(
                         compiled_net.neuron_populations[policy], "actionTaken", 1.0
                     )
+                    train_callback_list.on_batch_end(0, all_metrics)
 
                 obs, reward, done = env.step(action_label)
                 total_reward += reward
-                reward_trace = reward_trace * 0.0 + reward * 1.0
+                reward_trace = reward_trace * 0.5 + reward * 0.5
 
                 # Track success (agent chose correct door)
                 if done and reward > 0.5:
@@ -728,18 +747,24 @@ def train_door_key_agent(episodes=100000,
                     else:
                         current_run.append(frame_img.copy())
                     
-                    # train_callback_list.on_batch_end(0, all_metrics)
-
                     # Encode next observation
-                    indices = obs.nonzero()[0]
-                    spikes = make_repeated_spikes(
-                        indices,
+                    indices_agent = obs[0].nonzero()[0]
+                    spikes_agent = make_repeated_spikes(
+                        indices_agent,
                         compiled_net.genn_model.timestep,
-                        INPUT_SIZE,
+                        AGENT_INPUT_SIZE,
                         K=WAIT_INC,
                         period=1
                     )
-                    compiled_net.set_input({input_pop: [spikes]})
+                    indices_mnist = obs[1].nonzero()[0]
+                    spikes_mnist = make_repeated_spikes(
+                        indices_mnist,
+                        compiled_net.genn_model.timestep,
+                        MNIST_INPUT_SIZE,
+                        K=WAIT_INC//3,
+                        period=3
+                    )
+                    compiled_net.set_input({input_pop_agent: [spikes_agent], input_pop_mnist: [spikes_mnist]})
 
                 compiled_net.step_time(train_callback_list)
                 value_estimate = compiled_net.get_readout(value)[0][0]
@@ -758,24 +783,30 @@ def train_door_key_agent(episodes=100000,
                 )
                 compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
                 compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
-                td_error_trace = 0
+                
+                compiled_net.neuron_populations[hidden_mnist].vars["TdE"].view[:] = td_error_trace
+                compiled_net.neuron_populations[hidden_mnist].vars["TdE"].push_to_device()
 
+                td_error_trace = 0
+                # train_callback_list.on_batch_end(0, all_metrics)
                 frame += 1
             
-            # Flash agent to signal end of episode
-            indices = np.arange(28*28) + (INPUT_SIZE - 28*28)
-            spikes = make_repeated_spikes(
-                indices,
-                compiled_net.genn_model.timestep,
-                INPUT_SIZE,
-                K=WAIT_INC//2,
-                period=1
-            )
-            compiled_net.set_input({input_pop: [spikes]})
+            # Flash agent to signal end of episodescale
+            # indices = np.arange(28*28) + (INPUT_SIZE - 28*28)
+            # spikes = make_repeated_spikes(
+            #     indices,
+            #     compiled_net.genn_model.timestep,
+            #     INPUT_SIZE,
+            #     K=WAIT_INC//2,
+            #     period=1
+            # )
+            # compiled_net.set_input({input_pop: [spikes]})
             for _ in range(WAIT_INC):
                 reward_trace = reward_trace * 0.5
                 compiled_net.step_time(train_callback_list)
                 value_estimate = compiled_net.get_readout(value)[0][0]
+                current_values.append(previous_value_estimate)
+                
                 value_target = reward_trace + gamma * value_estimate
 
                 td_error = value_target - previous_value_estimate
@@ -791,6 +822,10 @@ def train_door_key_agent(episodes=100000,
                 )
                 compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
                 compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
+                
+                compiled_net.neuron_populations[hidden_mnist].vars["TdE"].view[:] = td_error_trace
+                compiled_net.neuron_populations[hidden_mnist].vars["TdE"].push_to_device()
+                # train_callback_list.on_batch_end(0, all_metrics)
                 td_error_trace = 0
 
             # End of episode
@@ -889,56 +924,26 @@ def train_door_key_agent(episodes=100000,
             except:
                 pass
 
-##############################################################
-#                     RANDOM AGENT                           #
-##############################################################
-
-def run_random_agent(episodes=1000, delay=0.05):
-    env = DoorKeyMNISTMemoryEnv(wait_inc=0)
-
-    for ep in range(episodes):
-        obs = env.reset()
-        done = False
-        total_reward = 0
-
-        while not done:
-            action = random.randint(0, 3)
-            obs, reward, done = env.step(action)
-            total_reward += reward
-
-            env.render()
-            time.sleep(delay)
-
-        print(f"Episode {ep:4d} | Total reward: {total_reward:+.2f}")
-
 ####################################################################
 #                              MAIN                                #
 ####################################################################
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) > 1 and sys.argv[1] == "random":
-        # Run random agent for testing
-        run_random_agent(episodes=1e10, delay=0.03)
-        cv2.destroyAllWindows()
-    else:
-        # Train agent with visualization
-        manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs = start_visualizers()
+    manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs = start_visualizers()
 
-        try:
-            train_door_key_agent(
-                episodes=int(1e10),
-                metrics_q=metrics_q,
-                best_run_q=best_run_q,
-                random_run_q=random_run_q,
-                compress_frames=True,
-                compress_quality=80
-            )
-        finally:
-            stop_event.set()
-            time.sleep(0.2)
-            if p_plots.is_alive():
-                p_plots.terminate()
-            if p_runs.is_alive():
-                p_runs.terminate()
+    try:
+        train_door_key_agent(
+            episodes=int(1e10),
+            metrics_q=metrics_q,
+            best_run_q=best_run_q,
+            random_run_q=random_run_q,
+            compress_frames=True,
+            compress_quality=80
+        )
+    finally:
+        stop_event.set()
+        time.sleep(0.2)
+        if p_plots.is_alive():
+            p_plots.terminate()
+        if p_runs.is_alive():
+            p_runs.terminate()
