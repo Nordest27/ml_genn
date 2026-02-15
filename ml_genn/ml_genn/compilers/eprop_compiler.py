@@ -314,6 +314,8 @@ eprop_alif_td_model = {
     """,
 
     "synapse_dynamics_code": """
+    DeltaG += TdE_post * RLTrace + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
+    
     // --- Standard ALIF e-prop eligibility update ---
     scalar epsA = epsilonA;
     const scalar psiZFilter = Psi * ZFilter;
@@ -322,26 +324,12 @@ eprop_alif_td_model = {
     const scalar e = psiZFilter  - psiBetaEpsilonA;
     epsilonA = psiZFilter + ((Rho * epsA) - psiBetaEpsilonA);
 
-    scalar eF = eFiltered;
-    eF = (eF * Alpha) + e;
-
     // Firing-rate regularisation term
     const scalar fireReg = (FAvg - FTarget) * CReg * e;
+    DeltaG += fireReg;
 
-    // --- NEW: reward-based e-prop TD(λ) trace (Bellec eq. 36) ---
-    // E_post is the neuron-specific learning signal L_j^t (already
-    // containing δ^t for the policy head via tdError).
-    // Use previous trace eFiltered
-    RLTrace = GammaLambda * RLTrace + eF * (PG_post - 0.1 * VE_post);
-
-    // Gradient accumulation: Δg += RLTrace + regularisation (using previous value)
-    DeltaG += fireReg 
-        + TdE_post * (
-            RLTrace
-        ) + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
-    
-    PrevEFiltered = eFiltered;
-    eFiltered = eF;
+    RLTrace = GammaLambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
+    eFiltered = (eFiltered * Alpha) + e;
     """
 }
 
@@ -374,23 +362,17 @@ output_value_learning_model = {
     addToPost(g);
     """,
     "synapse_dynamics_code": """
-    RLTrace = GammaLambda * RLTrace - ZFilter;
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
+    RLTrace = GammaLambda * RLTrace - ZFilter;
     
     // addToPre(g * E_post);
     addToPre(g);
-
-    PrevPrevZFilter = PrevZFilter;
-    PrevZFilter = ZFilter;
     """}
 
 output_value_random_learning_model = deepcopy(output_value_learning_model)
 output_value_random_learning_model["synapse_dynamics_code"] =  """
-    RLTrace = GammaLambda * RLTrace - ZFilter;
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
-
-    PrevPrevZFilter = PrevZFilter;
-    PrevZFilter = ZFilter;
+    RLTrace = GammaLambda * RLTrace - ZFilter;
 """
 
 
@@ -425,23 +407,17 @@ output_policy_learning_model = {
     addToPost(g);
     """,
     "synapse_dynamics_code": """
-    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
     DeltaG += TdE_post * RLTrace + ZFilter * E_post;
+    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
     
     addToPre(g * PG_post);
-
-    PrevPrevZFilter = PrevZFilter;
-    PrevZFilter = ZFilter;
     """
 }
 
 output_policy_random_learning_model = deepcopy(output_policy_learning_model)
 output_policy_random_learning_model["synapse_dynamics_code"] = """
-    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
     DeltaG += TdE_post * RLTrace + ZFilter * E_post;
-
-    PrevPrevZFilter = PrevZFilter;
-    PrevZFilter = ZFilter;
+    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
 """
 
 
@@ -537,7 +513,7 @@ class EPropCompiler(Compiler):
                  td_lambda: float = None,
                  entropy_coeff: float = 1e-4,
                  entropy_coeff_decay: float = 0.99,
-                 entropy_min: float = 1e-6,
+                 entropy_coeff_min: float = 1e-6,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -566,6 +542,7 @@ class EPropCompiler(Compiler):
         self.gamma_lambda = None
         self.entropy_coeff = entropy_coeff
         self.entropy_coeff_decay = entropy_coeff_decay
+        self.entropy_coeff_min = entropy_coeff_min
         if (gamma is not None) and (td_lambda is not None):
             self.gamma_lambda = gamma * td_lambda
 
@@ -640,7 +617,10 @@ class EPropCompiler(Compiler):
                         const scalar entropyGrad = p * (logp + 1.0);
 
                         E = entropyCoeff * entropyGrad;
-                        entropyCoeff = {self.entropy_coeff_decay} * entropyCoeff;
+                        entropyCoeff = fmax(
+                            {self.entropy_coeff_decay} * entropyCoeff,
+                            {self.entropy_coeff_min}
+                        );
 
                         if (actionTaken != 0) {{
                             PG = (p - yTrue);
@@ -661,6 +641,7 @@ class EPropCompiler(Compiler):
                         E = tdError;
                         ValReg = (
                             0.1 * ({model_copy.output_var_name} - PrevVal)
+                            + 0.01 * ({model_copy.output_var_name})
                         );
                         PrevVal = {model_copy.output_var_name};
                         tdError = 0;

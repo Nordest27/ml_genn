@@ -52,7 +52,6 @@ class Network:
         for c in self.connections:
             # Deserialize everthing relating to connection
             state = serialiser.deserialise_all(keys + (c,))
-            
             # Set any variables in copnnectivity
             # **TODO** synapse
             # **TODO** give error/warning if variable not found
@@ -62,7 +61,6 @@ class Network:
         for p in self.populations:
             # Deserialize everthing relating to population
             state = serialiser.deserialise_all(keys + (p,))
-
             # Set any variables in neuron
             # **TODO** give error if variable was not found
             set_values(p.neuron, state)

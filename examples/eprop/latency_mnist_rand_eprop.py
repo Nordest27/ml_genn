@@ -4,7 +4,7 @@ import mnist
 
 from ml_genn import InputLayer, Layer, Network, Population, Connection
 from ml_genn.callbacks import Checkpoint
-from ml_genn.compilers import EPropCompiler, InferenceCompiler, RandEPropCompiler
+from ml_genn.compilers import EPropCompiler, InferenceCompiler
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput
@@ -44,7 +44,7 @@ with network:
     hidden_2 = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
                                            tau_refrac=5.0),
                         NUM_HIDDEN_2)
-    output = Population(LeakyIntegrate(tau_mem=20.0, readout="sum_var"),
+    output = Population(LeakyIntegrate(tau_mem=20.0, readout="var"),
                         NUM_OUTPUT)
     
     # Connections

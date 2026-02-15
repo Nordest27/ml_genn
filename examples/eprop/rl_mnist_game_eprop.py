@@ -325,7 +325,7 @@ td_error_trace_discount = 0.001**(1/WAIT_INC)
 
 entropy_coeff = 1e-4
 entropy_decay = 0.9999 ** (1/WAIT_INC)
-entropy_min = 1e-5
+entropy_coeff_min = 1e-5
 
 serialiser = Numpy("door_key_mnist_checkpoints")
 network = Network(default_params)
@@ -400,7 +400,7 @@ compiler = EPropCompiler(
     reset_time_between_batches=False,
     entropy_coeff=entropy_coeff,
     entropy_coeff_decay=entropy_decay,
-    entropy_min=entropy_min
+    entropy_coeff_min=entropy_coeff_min
 )
 
 compiled_net = compiler.compile(network)
