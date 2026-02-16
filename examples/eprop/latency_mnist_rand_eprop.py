@@ -36,7 +36,7 @@ serialiser = Numpy("latency_mnist_rand_checkpoints")
 network = Network(default_params)
 with network:
     # Populations
-    input = Population(SpikeInput(max_spikes=BATCH_SIZE * calc_max_spikes(spikes)),
+    input_pop = Population(SpikeInput(max_spikes=BATCH_SIZE * calc_max_spikes(spikes)),
                                   NUM_INPUT)
     hidden_1 = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
                                            tau_refrac=5.0),
@@ -48,7 +48,7 @@ with network:
                         NUM_OUTPUT)
     
     # Connections
-    Connection(input,  hidden_1, Dense(Normal(sd=1.0 / np.sqrt(NUM_INPUT))))
+    Connection(input_pop,  hidden_1, Dense(Normal(sd=1.0 / np.sqrt(NUM_INPUT))))
     Connection(hidden_1, hidden_2, FixedProbability(0.5, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_1)))))
     Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2))))
     
@@ -73,7 +73,7 @@ if TRAIN:
         # Evaluate model on numpy dataset
         start_time = perf_counter()
         callbacks = ["batch_progress_bar", Checkpoint(serialiser)]
-        metrics, _  = compiled_net.train({input: spikes},
+        metrics, _  = compiled_net.train({input_pop: spikes},
                                          {output: labels},
                                          num_epochs=NUM_EPOCHS, shuffle=True,
                                          callbacks=callbacks)

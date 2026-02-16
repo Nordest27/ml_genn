@@ -9,6 +9,7 @@ from .conv_2d_transpose import Conv2DTranspose
 from .dense import Dense
 from .fixed_probability import FixedProbability
 from .one_to_one import OneToOne
+from .toroidal_gaussian_2d import ToroidalGaussian2D
 
 from ..utils.module import get_module_classes
 
@@ -16,4 +17,4 @@ default_connectivity = get_module_classes(globals(), Connectivity)
 
 __all__ = ["AvgPool2D", "AvgPoolConv2D", "AvgPoolDense2D", "Connectivity",
            "Conv2D", "Conv2DTranspose", "Dense", "FixedProbability",
-           "OneToOne", "default_connectivity"]
+           "OneToOne", "ToroidalGaussian2D", "default_connectivity"]

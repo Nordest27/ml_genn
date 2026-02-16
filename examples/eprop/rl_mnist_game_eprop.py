@@ -28,7 +28,7 @@ import multiprocessing as mp
 from multiprocessing import Manager, Queue
 
 # ---------------- CONFIG ----------------
-GRID_SIZE = 4
+GRID_SIZE = 6
 CELL_SIZE = 60
 
 AGENT_COLOR = (50, 200, 50)
@@ -297,7 +297,7 @@ class DoorKeyMNISTMemoryEnv:
 #####################################################
 WINDOW_EPISODES = 100
 WAIT_INC = 30
-CHECKPOINT_BOARD_SIZE = 3
+CHECKPOINT_BOARD_SIZE = 5
 
 VISIBLE_RANGE = 5
 AGENT_INPUT_SIZE = VISIBLE_RANGE * VISIBLE_RANGE * 2

@@ -429,6 +429,12 @@ output_random_feedback_model = {
     addToPre(g * E_post);
     """}
 
+output_adaptative_random_feedback_model = deepcopy(output_learning_model)
+del output_adaptative_random_feedback_model["pre_spike_syn_code"]
+output_adaptative_random_feedback_model["synapse_dynamics_code"] = """
+    DeltaG += ZFilter * E_post;
+    addToPre(g * E_post);
+"""
 output_random_model = {
     "params": [("g", "scalar")],
     "post_neuron_var_refs": [("E_post", "scalar")],
@@ -795,9 +801,16 @@ class EPropCompiler(Compiler):
                         compile_state.value_regularisation_connections.append(conn)
                         post_var_name = "ValReg"
             else:
-                feedback_model = output_random_feedback_model
+                feedback_model = output_random_feedback_model #output_adaptative_random_feedback_model
                 post_var_name = "E"
                 compile_state.feedback_connections.append(conn)
+            # wum = WeightUpdateModel(
+            #     model=feedback_model,
+            #     param_vals={"Alpha": alpha/10},
+            #     var_vals={"g": connect_snippet.weight, "DeltaG": 0.0},
+            #     pre_var_vals={"ZFilter": 0.0},
+            #     post_neuron_var_refs={"E_post": post_var_name})
+
             wum = WeightUpdateModel(
                 model=feedback_model,
                 param_vals={"g": connect_snippet.weight},
@@ -831,7 +844,6 @@ class EPropCompiler(Compiler):
                                 "Vthresh_post": target_neuron.v_thresh,
                                 "Beta_post": target_neuron.beta},
                     var_vals={"g": connect_snippet.weight, "eFiltered": 0.0,
-                              "PrevEFiltered": 0.0,
                               "DeltaG": 0.0, "epsilonA": 0.0},
                     pre_var_vals={"ZFilter": 0.0},
                     post_var_vals={"Psi": 0.0, "FAvg": 0.0},
