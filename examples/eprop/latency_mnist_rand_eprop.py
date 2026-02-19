@@ -22,7 +22,7 @@ NUM_HIDDEN_1 = 128
 NUM_HIDDEN_2 = 128
 NUM_OUTPUT = 10
 BATCH_SIZE = 32
-NUM_EPOCHS = 10
+NUM_EPOCHS = 30
 TRAIN = True
 KERNEL_PROFILING = False
 
@@ -39,18 +39,22 @@ with network:
     input_pop = Population(SpikeInput(max_spikes=BATCH_SIZE * calc_max_spikes(spikes)),
                                   NUM_INPUT)
     hidden_1 = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
-                                           tau_refrac=5.0),
+                                           tau_refrac=3.0),
                         NUM_HIDDEN_1)
     hidden_2 = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
-                                           tau_refrac=5.0),
+                                           tau_refrac=3.0),
                         NUM_HIDDEN_2)
     output = Population(LeakyIntegrate(tau_mem=20.0, readout="var"),
                         NUM_OUTPUT)
+    value = Population(LeakyIntegrate(tau_mem=20.0, readout="var"),
+                        1)
     
     # Connections
     Connection(input_pop,  hidden_1, Dense(Normal(sd=1.0 / np.sqrt(NUM_INPUT))))
     Connection(hidden_1, hidden_2, FixedProbability(0.5, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_1)))))
     Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2))))
+    
+    Connection(hidden_2, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2))))
     
     # UNCOMMENT FOR SYMMETRIC EPROP COMPARISON
     # Connection(hidden_1, output, FixedProbability(0.0001, Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_1))))
@@ -58,15 +62,24 @@ with network:
     # Random feedback matrices (COMMENT THESE LINES TO COMPARE WITH SYMMETRIC EPROP)
     Connection(hidden_1, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f1")
     Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f2")
+     
+    Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f1")
+    Connection(hidden_2, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f2")
+    
 
 max_example_timesteps = int(np.ceil(calc_latest_spike_time(spikes)))
 if TRAIN:
     compiler = EPropCompiler(example_timesteps=max_example_timesteps,
-                             losses="sparse_categorical_crossentropy",
-                             optimiser=Adam(5e-4),
+                            losses={output: "sparse_categorical_crossentropy",
+                                    value: "mean_square_error"},
+                             optimiser=Adam(1e-4),
                              batch_size=BATCH_SIZE,
                              kernel_profiling=KERNEL_PROFILING,
-                             feedback_type="random")
+                             feedback_type="random",
+                             reset_time_between_batches=False,
+                             gamma=0.99,
+                             td_lambda=0.1
+                             )
     compiled_net = compiler.compile(network)
 
     with compiled_net:

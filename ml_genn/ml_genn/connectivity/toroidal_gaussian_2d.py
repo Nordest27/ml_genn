@@ -54,7 +54,7 @@ genn_snippet = create_sparse_connect_init_snippet(
 
                     const float prob = p_max * exp(-d2 / (2.0f * sigma * sigma));
 
-                    if(gennrand_uniform() < prob) {
+                    if (gennrand_uniform() < prob) {
                         addSynapse(idPost);
                     }
                 }
@@ -112,11 +112,11 @@ class ToroidalGaussian2D(SparseBase):
             "tgt_h": self.tgt_h,
             "tgt_w": self.tgt_w,
             "tgt_c": self.tgt_c,
-            "self_connect": 1 if self.allow_self_connections else 0
+            "self_connect": 1 if self.allow_self_connections or \
+                connection.source() != connection.target() else 0
         })
 
-        return ConnectivitySnippet(
-            snippet=conn_init,
-            matrix_type=SynapseMatrixType.SPARSE,
-            weight=self.weight,
-            delay=self.delay)
+        return super(ToroidalGaussian2D, self)._get_snippet(
+            supported_matrix_type,
+            conn_init
+        )

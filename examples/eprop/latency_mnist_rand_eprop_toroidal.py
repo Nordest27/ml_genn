@@ -31,6 +31,8 @@ HIDDEN3_SHAPE = (8, 8, 1)
 NUM_INPUT = np.prod(INPUT_SHAPE)
 NUM_HIDDEN_1 = np.prod(HIDDEN1_SHAPE)
 NUM_HIDDEN_2 = np.prod(HIDDEN2_SHAPE)
+NUM_HIDDEN_3 = np.prod(HIDDEN3_SHAPE)
+
 NUM_OUTPUT = 10
 
 
@@ -38,12 +40,13 @@ NUM_OUTPUT = 10
 # User-Controlled Parameters
 # =========================
 
-SIGMA_IN = 0.25
+SIGMA_IN = 0.1
 SIGMA_H = 0.25
 
 DESIRED_FAN_IN_IN = int(NUM_INPUT*0.1)
-DESIRED_FAN_IN_H1 = int(NUM_HIDDEN_1*0.1)
-DESIRED_FAN_IN_H2 = int(NUM_HIDDEN_2*0.1)
+DESIRED_FAN_IN_H1 = int(NUM_HIDDEN_1*0.25)
+DESIRED_FAN_IN_H2 = int(NUM_HIDDEN_2*0.25)
+DESIRED_FAN_IN_H3 = int(NUM_HIDDEN_3*0.25)
 
 # =========================
 # Compute p_max analytically
@@ -55,7 +58,8 @@ def compute_p_max(desired_fan_in, n_pre, sigma):
 
 p_max_in = compute_p_max(DESIRED_FAN_IN_IN, NUM_INPUT, SIGMA_IN)
 p_max_h1 = compute_p_max(DESIRED_FAN_IN_H1, NUM_HIDDEN_1, SIGMA_H)
-p_max_h2 = compute_p_max(DESIRED_FAN_IN_H1, NUM_HIDDEN_1, SIGMA_H)
+p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, NUM_HIDDEN_2, SIGMA_H)
+p_max_h3 = compute_p_max(DESIRED_FAN_IN_H3, NUM_HIDDEN_3, SIGMA_H)
 
 # Clip in case σ is very small
 p_max_in = min(p_max_in, 1.0)
@@ -70,13 +74,13 @@ p_max_h2 = min(p_max_h2, 1.0)
 std_in = 1.0 / np.sqrt(DESIRED_FAN_IN_IN)
 std_h1 = 1.0 / np.sqrt(DESIRED_FAN_IN_H1)
 std_h2 = 1.0 / np.sqrt(DESIRED_FAN_IN_H2)
-
+std_h3 = 1.0 / np.sqrt(DESIRED_FAN_IN_H3)
 
 # =========================
 # Training parameters
 # =========================
 
-BATCH_SIZE = 32
+BATCH_SIZE = 1
 NUM_EPOCHS = 10
 TRAIN = True
 
@@ -155,6 +159,16 @@ with network:
 
     Connection(
         hidden_3,
+        hidden_3,
+        ToroidalGaussian2D(
+            sigma=SIGMA_H/2,
+            p_max=p_max_h2/2,
+            weight=Normal(sd=std_h3/4)
+        )
+    )
+
+    Connection(
+        hidden_3,
         output,
         Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2)))
     )
@@ -192,7 +206,7 @@ max_example_timesteps = int(np.ceil(calc_latest_spike_time(spikes)))
 compiler = EPropCompiler(
     example_timesteps=max_example_timesteps,
     losses="sparse_categorical_crossentropy",
-    optimiser=Adam(5e-4),
+    optimiser=Adam(1e-4),
     batch_size=BATCH_SIZE,
     feedback_type="random"
 )

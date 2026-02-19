@@ -18,7 +18,7 @@ from line_profiler import profile
 from ml_genn import InputLayer, Layer, Network, Population, Connection
 from ml_genn.callbacks import Checkpoint
 from ml_genn.compilers import EPropCompiler, InferenceCompiler
-from ml_genn.connectivity import Dense, FixedProbability, Conv2D
+from ml_genn.connectivity import Dense, FixedProbability, Conv2D, ToroidalGaussian2D
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput
 from ml_genn.serialisers import Numpy
@@ -85,7 +85,7 @@ class SnakeEnv:
         # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
         
-        reward = - 90/self.size * (self.steps_since_last_apple % self.size == 0)
+        reward = - 90/self.size * ((self.steps_since_last_apple+1) % self.size == 0)
         # reward = 0.0
 
         if (self.direction == 'up' and new_dir == 'down') or \
@@ -172,7 +172,7 @@ class SnakeEnv:
         r = v // 2
         head_y, head_x = self.snake[0]
 
-        obs = np.zeros((3, v, v), dtype=np.float32)
+        obs = np.zeros((v, v, 3), dtype=np.float32)
 
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
@@ -182,22 +182,21 @@ class SnakeEnv:
                 local_x = dx + r
 
                 # check walls
-                if y < 0 or y >= self.size or x < 0 or x >= self.size:
-                    obs[2, local_y, local_x] = 1.0
+                if y == -1 or y == self.size + 1 or x == -1 or x == self.size + 1:
+                    obs[local_y, local_x, 0] = 1.0
                     continue
 
                 # body
                 if (y, x) in self.snake:
-                    obs[0, local_y, local_x] = 1.0
+                    obs[local_y, local_x, 1] = 1.0
 
                 # # head
                 # if (y, x) == (head_y, head_x):
                 #     obs[3, local_y, local_x] = 1.0
 
                 # apple
-                for apple in self.apples:
-                    if (y, x) == apple:
-                        obs[1, local_y, local_x] = 1.0
+                if (y, x) in self.apples:
+                    obs[local_y, local_x, 2] = 1.0
 
         return obs.flatten()
 
@@ -300,62 +299,95 @@ VISIBLE_RANGE = 11
 
 WAIT_INC = 30
 
-
 INPUT_H = VISIBLE_RANGE
 INPUT_W = VISIBLE_RANGE
 INPUT_C = 3   # or more if you use feature planes
 
-INPUT_SIZE = INPUT_C * VISIBLE_RANGE**2
+INPUT_SHAPE = (VISIBLE_RANGE, VISIBLE_RANGE, INPUT_C)
+HIDDEN1_SHAPE = (VISIBLE_RANGE*5, VISIBLE_RANGE*5, INPUT_C)
+HIDDEN2_SHAPE = (VISIBLE_RANGE*2, VISIBLE_RANGE*2, INPUT_C)
 
-NUM_HIDDEN_2 = 256
+INPUT_SIZE = np.prod(INPUT_SHAPE)
+NUM_HIDDEN_1 = np.prod(HIDDEN1_SHAPE)
+NUM_HIDDEN_2 = np.prod(HIDDEN2_SHAPE)
+
+SIGMA_IN = 0.25
+SIGMA_H = 0.25
+
+DESIRED_FAN_IN_IN = 100
+DESIRED_FAN_IN_H1 = (NUM_HIDDEN_1)**(1/3.0)
+print("Desired Fan-in IN", DESIRED_FAN_IN_IN)
+print("Desired Fan-in H1", DESIRED_FAN_IN_H1)
+DESIRED_FAN_IN_H2 = int(NUM_HIDDEN_2*.5)
+def compute_p_max(desired_fan_in, n_pre, sigma):
+    return desired_fan_in / (n_pre * 2.0 * np.pi * sigma**2)
+
+p_max_in = compute_p_max(DESIRED_FAN_IN_IN, INPUT_SIZE, SIGMA_IN)
+p_max_h1 = compute_p_max(DESIRED_FAN_IN_H1, NUM_HIDDEN_1, SIGMA_H)
+p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, NUM_HIDDEN_2, SIGMA_H)
+
+# Clip in case σ is very small
+p_max_in = p_max_in
+p_max_h1 = p_max_h1
+p_max_h2 = p_max_h2
+
+print(p_max_in, p_max_h1, p_max_h2)
+
+std_in = 1.0 / np.sqrt(DESIRED_FAN_IN_IN)
+std_h1 = 1.0 / np.sqrt(DESIRED_FAN_IN_H1)
+std_h2 = 1.0 / np.sqrt(DESIRED_FAN_IN_H2)
+
 NUM_OUTPUT = 4
+
 CONN_P = {
-    "I-H": 0.9,
-    "H-H": 0.9,
-    #"H-H": np.log(NUM_HIDDEN_1)/NUM_HIDDEN_1,
-    "H-P": 0.9,
-    "H-V": 0.9
+    "I-H": 0.05,
+    "H-H": 0.05,
+    #"H-H": np.log(NUM_HIDDEN_1+NUM_HIDDEN_2)/(NUM_HIDDEN_1 + NUM_HIDDEN_2),
+    "H-P": 0.05,
+    "H-V": 0.05
 }
 TRAIN = True
-# CHECKPOINT_BOARD_SIZE = "15_mid_complition"
-CHECKPOINT_BOARD_SIZE = None
+
+CHECKPOINT_BOARD_SIZE = None # "5_mid_completion"
 
 KERNEL_PROFILING = False
 
 
 gamma = 0.99 ** (1/WAIT_INC)
-td_lambda = 0.1 ** (1/WAIT_INC)
+td_lambda = 0.01 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-2
+entropy_coeff = 1e-4
 entropy_decay = 0.9999 ** (1/WAIT_INC)
-entropy_coeff_min = 1e-5
+entropy_coeff_min = 1e-7
 
 serialiser = Numpy("snake_checkpoints")
 network = Network(default_params)
+hidden_layers = {}
+deep_r_conns = {}
 with network:
     # Populations
     input_pop = Population(
         SpikeInput(max_spikes=INPUT_H * INPUT_W * INPUT_C * WAIT_INC // 2),
         (INPUT_H, INPUT_W, INPUT_C)
     )
-    hidden_1 = Population(
+    hidden_layers["E"] = Population(
         AdaptiveLeakyIntegrateFire(
             v_thresh=0.61,
             tau_mem=10.0,
             tau_refrac=3.0,
-            tau_adapt=100
+            tau_adapt=300
         ),
-        1296
+        HIDDEN1_SHAPE
     )
-    hidden_2 = Population(
+    hidden_layers["I"] = Population(
         AdaptiveLeakyIntegrateFire(
             v_thresh=0.61,
             tau_mem=10.0,
             tau_refrac=3.0,
-            tau_adapt=100
+            tau_adapt=300
         ),
-        NUM_HIDDEN_2
+        HIDDEN2_SHAPE
     )
     policy = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
                         NUM_OUTPUT)
@@ -364,49 +396,153 @@ with network:
                         1)
     
     # Connections
+    deep_r_conns["Inp-E"] = Connection(input_pop,  hidden_layers["E"], 
+        FixedProbability(CONN_P['I-H'], Normal(
+            mean=+0.1 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
+            sd=+0.05 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
+        )),
+        exc_inh_sign=1,)
+    """
+        ToroidalGaussian2D(
+            sigma=SIGMA_IN,
+            p_max=p_max_in,
+            weight=Normal(
+                mean=+0.1 / np.sqrt(DESIRED_FAN_IN_IN), 
+                sd=+0.05 / np.sqrt(DESIRED_FAN_IN_IN), 
+        )),
+        exc_inh_sign=1,)"""
+    
+    deep_r_conns["Inp-I"] = Connection(input_pop,  hidden_layers["I"], 
+        FixedProbability(CONN_P['I-H'], Normal(
+            mean=+0.1 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
+            sd=+0.05 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
+        )),
+        exc_inh_sign=1,)
+    """
+        ToroidalGaussian2D(
+            sigma=SIGMA_IN,
+            p_max=p_max_in,
+            weight=Normal(
+                mean=+0.1 / np.sqrt(DESIRED_FAN_IN_IN), 
+                sd=+0.05 / np.sqrt(DESIRED_FAN_IN_IN), 
+        )),
+        exc_inh_sign=1,)"""
+    
+    ############ EXCITATORY ############
 
-    initial_hidden1_weight = Normal(mean=0.078, sd=0.045)
-    Connection(input_pop,  hidden_1, 
-        #FixedProbability(CONN_P['I-H'], (Normal(sd=1.0 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE)))))
-        Conv2D(initial_hidden1_weight, 16, 3, True))
-    Connection(hidden_1, hidden_1, 
-        Dense(Normal(sd=1.0 / np.sqrt(CONN_P['H-H'] * 1296))))
-    Connection(hidden_1, hidden_2, 
-        Dense(Normal(sd=1.0 / np.sqrt(CONN_P['H-H'] * 1296))))
-    Connection(hidden_2, hidden_2, 
-        Dense(Normal(sd=1.0 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2))))
+    deep_r_conns["E-I"] = Connection(hidden_layers["E"], hidden_layers["I"], 
+        FixedProbability(
+            CONN_P['H-H'], 
+            Normal(
+                mean=+0.1 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
+                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
+            )
+        ),
+        exc_inh_sign=1,)
     
-    Connection(hidden_2, policy, 
-        FixedProbability(CONN_P['H-P'], (Normal(sd=1.0 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_2)))))
-    Connection(hidden_2, value, 
-        FixedProbability(CONN_P['H-V'], (Normal(sd=1.0 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_2)))))
+    deep_r_conns["E-E"] = Connection(hidden_layers["E"], hidden_layers["E"], 
+        FixedProbability(
+            CONN_P['H-H'], 
+            Normal(
+                mean=+0.1 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
+                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
+            )
+        ),
+        exc_inh_sign=1,)
+    """
+        ToroidalGaussian2D(
+            sigma=SIGMA_H,
+            p_max=p_max_h1,
+            weight=Normal(sd=std_h1)
+        ))"""
     
-    Connection(hidden_1, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
-    Connection(hidden_1, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
-    Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
-    Connection(hidden_1, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
-    
-    Connection(hidden_2, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
-    Connection(hidden_2, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
-    Connection(hidden_2, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
-    Connection(hidden_2, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
+    deep_r_conns["E-V"] = Connection(hidden_layers["E"], value, 
+        FixedProbability(
+            CONN_P['H-V'], 
+            Normal(
+                mean=+0.1 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_1), 
+                sd=+0.05 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_1), 
+            )
+        ),
+        exc_inh_sign=1,)
 
+    deep_r_conns["E-P"] = Connection(hidden_layers["E"], policy, 
+        FixedProbability(
+            CONN_P['H-P'], 
+            Normal(
+                mean=+0.1 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_1), 
+                sd=+0.05 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_1), 
+            )
+        ),
+        exc_inh_sign=1,)
+    
+    ############ INHIBITORY ############
+
+    deep_r_conns["I-E"] = Connection(hidden_layers["I"], hidden_layers["E"], 
+        FixedProbability(
+            CONN_P['H-H'], 
+            Normal(
+                mean=-0.3 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
+                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
+            )
+        ),
+        exc_inh_sign=-1,)
+    
+    deep_r_conns["I-I"] = Connection(hidden_layers["I"], hidden_layers["I"], 
+        FixedProbability(
+            CONN_P['H-H'], 
+            Normal(
+                mean=-0.3 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
+                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
+            )
+        ),
+        exc_inh_sign=-1,)
+ 
+    deep_r_conns["I-V"] = Connection(hidden_layers["I"], value, 
+        FixedProbability(
+            CONN_P['H-V'], 
+            Normal(
+                mean=-0.3 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_2), 
+                sd=+0.05 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_2), 
+            )
+        ),
+        exc_inh_sign=-1,)
+    
+    deep_r_conns["I-P"] = Connection(hidden_layers["I"], policy, 
+        FixedProbability(
+            CONN_P['H-P'], 
+            Normal(
+                mean=-0.3 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_2), 
+                sd=+0.05 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_2), 
+            )
+        ),
+        exc_inh_sign=-1,)
+    
+    #######################################
+    
+    for hidden_layer in list(hidden_layers.values()):
+        Connection(hidden_layer, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
+        Connection(hidden_layer, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
+        Connection(hidden_layer, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
+        Connection(hidden_layer, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
 
 
 if CHECKPOINT_BOARD_SIZE is not None:
     network.load((CHECKPOINT_BOARD_SIZE,), serialiser)
 
-max_example_timesteps = 1
+max_example_timesteps = 1 
 compiler = EPropCompiler(
     example_timesteps=max_example_timesteps,
     losses={policy: "sparse_categorical_crossentropy",
             value: "mean_square_error"},
-    optimiser=Adam(1e-5),
+    optimiser=Adam(1e-4),
     batch_size=1,
     kernel_profiling=KERNEL_PROFILING,
     feedback_type="random",
-    gamma=gamma,          # 0.99
-    td_lambda=td_lambda,        # or whatever you want
+    # deep_r_conns=list(deep_r_conns.values()), 
+    # deep_r_l1_strength=0,
+    gamma=gamma, 
+    td_lambda=td_lambda, 
     train_output_bias=False,
     reset_time_between_batches=False,
     entropy_coeff=entropy_coeff,
@@ -426,11 +562,12 @@ value_train_metrics = get_object_mapping(
     "Metric", default_metrics)
 
 train_callback_list = CallbackList(
-    [*set(compiled_net.base_train_callbacks)],
+    [*set(compiled_net.base_train_callbacks)] + [Checkpoint(serialiser)],
     compiled_network=compiled_net,
     num_batches=1, 
     num_epochs=1
 )
+# train_callback_list.on_train_begin()
 
 all_metrics = {}
 all_metrics.update(policy_train_metrics)
@@ -445,7 +582,7 @@ def make_repeated_spikes(
     input_size,
     K,
     period=1,
-    spike_prob=0.1
+    spike_prob=0.5
 ):
     """
     Probabilistic spike encoding.
@@ -524,8 +661,12 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     ax1b.legend()
 
 
-    value_line, = ax2.plot([], [], label='Value'); ax2.set_title('Value (best run)')
-    ax2.set_xlabel('Frame'); ax2.set_ylabel('Value')
+    value_line, = ax2.plot([], [], label='Value')
+    reward_trace_line, = ax2.plot([], [], label='Reward Trace')
+    ax2.set_title('Value (best run)')
+    ax2.set_xlabel('Frame')
+    ax2.set_ylabel('Value')
+    ax2.legend()
 
     prob_img = ax3.imshow(np.zeros((4,1)), aspect='auto', origin='lower', vmin=0, vmax=1)
     ax3.set_xlabel('Timestep'); ax3.set_ylabel('Action'); ax3.set_title('Action probs (best run)')
@@ -537,6 +678,7 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     avgs = []
     lens = []
     best_values = []
+    best_reward_traces = []
     best_probs = None
 
     last_plot_time = 0.0
@@ -557,8 +699,10 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
                     lens.append(metrics.get('snake_len', 0))
                 if 'best_values' in metrics:
                     best_values = metrics['best_values']
+                    best_reward_traces = metrics['best_reward_traces']
                 if 'best_probs' in metrics:
                     best_probs = metrics['best_probs']
+                
                 
         except Exception:
             pass
@@ -585,6 +729,7 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
 
             if best_values:
                 value_line.set_data(range(len(best_values)), best_values)
+                reward_trace_line.set_data(range(len(best_reward_traces)), best_reward_traces)
                 ax2.relim(); ax2.autoscale_view()
 
             if best_probs is not None:
@@ -718,9 +863,12 @@ def train_snake_agent_with_ipc(episodes=100000,
 
         # keep last best values and probs for plot process
         last_best_values = []
+        last_best_reward_traces = []
         last_best_probs = None
 
+        train_callback_list.on_epoch_begin(0)
         train_callback_list.on_batch_begin(0)
+
         for ep in range(episodes):
             if env.won:
                 compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
@@ -729,7 +877,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                 BOARD_SIZE += 1
                 print(f"WON! Increasing board size to {BOARD_SIZE}")
                 env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC)
-            if ep % 1000 == 0:
+            if (ep+1) % 1000 == 0:
+                best_reward = -np.inf
                 compiled_net.save_connectivity((f"{BOARD_SIZE}_mid_completion",), serialiser)
                 compiled_net.save((f"{BOARD_SIZE}_mid_completion",), serialiser)
 
@@ -740,6 +889,7 @@ def train_snake_agent_with_ipc(episodes=100000,
             total_reward = 0
             current_run = []
             current_values = []
+            current_reward_traces = []
             current_probs = []
             total_td = 0
             frame = 1
@@ -763,10 +913,11 @@ def train_snake_agent_with_ipc(episodes=100000,
             while not done:
                 action_label = 0
                 current_values.append(previous_value_estimate)
+                current_reward_traces.append(reward_trace)
                 if env.wait_count == 0:
                     probs = compiled_net.get_readout(policy).flatten()
                     
-                    while abs(sum(probs) - 1.0) > 0.0001:
+                    if abs(sum(probs) - 1.0) > 0.0001:
                         raise ValueError(f"BAD PROBS {probs}")
                     
                     action_label = np.random.choice(4, p=probs)
@@ -801,8 +952,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                     
                     train_callback_list.on_batch_end(0, all_metrics)
                     # for o, custom_updates in compiled_net.optimisers:
-                    #     for c in custom_updates:
-                    #         o.set_step(c, ep)
+                    #    for c in custom_updates:
+                    #        o.set_step(c, ep)
 
                     indices = obs.nonzero()[0]
                     spikes = make_repeated_spikes(
@@ -831,13 +982,19 @@ def train_snake_agent_with_ipc(episodes=100000,
                 compiled_net.losses[policy].set_var(
                     compiled_net.neuron_populations[policy], "tdError", td_error_trace
                 )
-                compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
-                compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
+                for hidden_layer in list(hidden_layers.values()):
+                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].view[:] = td_error_trace
+                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].push_to_device()
                 td_error_trace = 0
 
                 frame += 1
             
-            for _ in range(WAIT_INC*3):
+            for i in range(WAIT_INC*3):
+                if i % WAIT_INC == 0:
+                    probs = compiled_net.get_readout(policy).flatten()
+                    current_probs.append(probs)
+                current_values.append(previous_value_estimate)
+                current_reward_traces.append(reward_trace)
                 reward_trace = reward_trace*0.5
                 compiled_net.step_time(train_callback_list)
                 value_estimate = compiled_net.get_readout(value)[0][0]
@@ -856,8 +1013,9 @@ def train_snake_agent_with_ipc(episodes=100000,
                 compiled_net.losses[policy].set_var(
                     compiled_net.neuron_populations[policy], "tdError", td_error_trace
                 )
-                compiled_net.neuron_populations[hidden_1].vars["TdE"].view[:] = td_error_trace
-                compiled_net.neuron_populations[hidden_1].vars["TdE"].push_to_device()
+                for hidden_layer in list(hidden_layers.values()):
+                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].view[:] = td_error_trace
+                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].push_to_device()
                 
                 # train_callback_list.on_batch_end(0, all_metrics)
                 # for o, custom_updates in compiled_net.optimisers:
@@ -865,7 +1023,6 @@ def train_snake_agent_with_ipc(episodes=100000,
                 #         o.set_step(c, ep)
                 td_error_trace = 0
 
-            # end of episode bookkeeping
             train_callback_list.on_batch_end(0, all_metrics)
             for o, custom_updates in compiled_net.optimisers:
                 for c in custom_updates:
@@ -879,6 +1036,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                 best_reward = total_reward
                 best_run = [img for img in current_run]  # frames already possibly encoded
                 last_best_values = list(current_values)
+                last_best_reward_traces = list(current_reward_traces)
                 last_best_probs = list(current_probs)
 
                 # send best run into queue (non-blocking put — if queue full, replace oldest)
@@ -928,6 +1086,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                 }
                 if last_best_values:
                     metrics['best_values'] = last_best_values
+                    metrics['best_reward_traces'] = last_best_reward_traces
                 if last_best_probs is not None:
                     metrics['best_probs'] = last_best_probs
                 try:

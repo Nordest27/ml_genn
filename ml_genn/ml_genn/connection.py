@@ -45,7 +45,8 @@ class Connection:
                  name: Optional[str] = None, 
                  max_delay_steps: Optional[int] = None,
                  add_to_model: bool = True,
-                 feedback_name: Optional[str] = None):
+                 feedback_name: Optional[str] = None,
+                 exc_inh_sign: Optional[int] = None):
         # Store weak references to source and target in class
         self._source = ref(source)
         self._target = ref(target)
@@ -74,11 +75,18 @@ class Connection:
         # Run connectivity-specific connection logic
         # e.g. automatically-calculating population sizes
         self.connectivity.connect(source, target)
+        
+        if exc_inh_sign not in [1, -1, None]:
+            raise ValueError(
+                "exc_inh_sign must be 1 (excitatory), -1 (inhibitory), "
+                "or None (no Dale constraint)."
+            )
+        
+        self.exc_inh_sign = exc_inh_sign
 
         # Add connection to model
         if add_to_model:
             Network._add_connection(self)
-
 
     @property
     def source(self):

@@ -28,6 +28,7 @@ from copy import deepcopy
 from pygenn import create_var_ref, create_wu_var_ref
 from .compiler import create_reset_custom_update
 from .deep_r import add_deep_r
+from .dale_rewiring import add_dale_rewiring
 from ..utils.module import get_object, get_object_mapping
 from ..utils.network import get_underlying_conn
 from ..utils.value import is_value_constant
@@ -270,7 +271,6 @@ eprop_alif_td_model = {
                ("GammaLambda", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY),
              ("eFiltered", "scalar"),
-             ("PrevEFiltered", "scalar"),
              ("epsilonA", "scalar"),
              ("DeltaG", "scalar"),
              # extra per-synapse RL trace Fγ(·)
@@ -341,8 +341,6 @@ output_value_learning_model = {
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY), 
         ("DeltaG", "scalar"), 
-        ("PrevZFilter", "scalar"),
-        ("PrevPrevZFilter", "scalar"),
         ("RLTrace", "scalar"),
     ],
     "pre_vars": [("ZFilter", "scalar")],
@@ -386,8 +384,6 @@ output_policy_learning_model = {
         ("g", "scalar", VarAccess.READ_ONLY),
         ("DeltaG", "scalar"),
         ("RLTrace", "scalar"),
-        ("PrevZFilter", "scalar"),
-        ("PrevPrevZFilter", "scalar"),
     ],
     "pre_vars": [("ZFilter", "scalar")],
     "post_neuron_var_refs": [
@@ -442,8 +438,6 @@ output_random_model = {
     "synapse_dynamics_code": """
     addToPre(g);
     """}
-
-
 
 gradient_batch_reduce_model = {
     "vars": [("ReducedGradient", "scalar", CustomUpdateVarAccess.REDUCE_BATCH_SUM)],
@@ -646,7 +640,7 @@ class EPropCompiler(Compiler):
                         f"""
                         E = tdError;
                         ValReg = (
-                            0.1 * ({model_copy.output_var_name} - PrevVal)
+                            0.05 * ({model_copy.output_var_name} - PrevVal)
                             + 0.01 * ({model_copy.output_var_name})
                         );
                         PrevVal = {model_copy.output_var_name};
@@ -782,6 +776,8 @@ class EPropCompiler(Compiler):
         if conn.is_feedback:
             if self.feedback_type != "random":
                 raise ValueError("Feedback type must be 'random' when using random feedback connections")
+
+            post_var_name = "E"
             # Add connection to list of feedback connections
             if self.gamma_lambda is not None:
                 if is_policy_head:
@@ -791,18 +787,15 @@ class EPropCompiler(Compiler):
                         post_var_name = "PG"
                     elif conn.name.endswith("policy_regularisation"):
                         compile_state.policy_regularisation_connections.append(conn)
-                        post_var_name = "E"
                 else:
                     feedback_model = output_random_model
                     if conn.name.endswith("value_feedback"):
                         compile_state.value_feedback_connections.append(conn)
-                        post_var_name = "E"
                     elif conn.name.endswith("value_regularisation"):
                         compile_state.value_regularisation_connections.append(conn)
                         post_var_name = "ValReg"
             else:
                 feedback_model = output_random_feedback_model #output_adaptative_random_feedback_model
-                post_var_name = "E"
                 compile_state.feedback_connections.append(conn)
             # wum = WeightUpdateModel(
             #     model=feedback_model,
@@ -867,7 +860,6 @@ class EPropCompiler(Compiler):
                     },
                     var_vals={"g": connect_snippet.weight,
                               "eFiltered": 0.0,
-                              "PrevEFiltered": 0.0,
                               "DeltaG": 0.0,
                               "epsilonA": 0.0,
                               "RLTrace": 0.0,
@@ -902,8 +894,6 @@ class EPropCompiler(Compiler):
                             "g": connect_snippet.weight,
                             "DeltaG": 0.0,
                             "RLTrace": 0.0,
-                            "PrevZFilter": 0.0,
-                            "PrevPrevZFilter": 0.0,
                         },
                         pre_var_vals={"ZFilter": 0.0},
                         post_neuron_var_refs={
@@ -923,9 +913,7 @@ class EPropCompiler(Compiler):
                         var_vals={
                             "g": connect_snippet.weight, 
                             "DeltaG": 0.0,
-                            "RLTrace": 0.0, 
-                            "PrevZFilter": 0.0,
-                            "PrevPrevZFilter": 0.0,
+                            "RLTrace": 0.0,
                         },
                         pre_var_vals={"ZFilter": 0.0},
                         post_neuron_var_refs={
@@ -978,9 +966,10 @@ class EPropCompiler(Compiler):
         # Add optimisers to connection weights that require them
         optimiser_custom_updates = []
         deep_r_record_rewirings_ccus = []
+        dale_rewiring_required = False
         for i, c in enumerate(compile_state.weight_optimiser_connections):
             genn_pop = connection_populations[c]
-
+            dale_sign = c.exc_inh_sign
             # If connection is in list of those to use Deep-R on
             delta_g_var_ref = create_wu_var_ref(genn_pop, "DeltaG")
             weight_var_ref = create_wu_var_ref(genn_pop, "g")
@@ -995,6 +984,17 @@ class EPropCompiler(Compiler):
                 if c in self.deep_r_record_rewirings:
                     deep_r_record_rewirings_ccus.append(
                         (deep_r_2_ccu, self.deep_r_record_rewirings[c]))
+                    
+            if dale_sign is not None:
+                dale_rewiring_required = True
+                add_dale_rewiring(
+                    synapse_group=genn_pop,
+                    genn_model=genn_model,
+                    compiler=self,
+                    sign=dale_sign,
+                    weight_var_ref=weight_var_ref
+                )
+        
             # Add optimiser
             optimiser_custom_updates.append(
                 self._create_optimiser_custom_update(
@@ -1058,6 +1058,10 @@ class EPropCompiler(Compiler):
             base_validate_callbacks.append(CustomUpdateOnTimestepEnd("Softmax1"))
             base_validate_callbacks.append(CustomUpdateOnTimestepEnd("Softmax2"))
             base_validate_callbacks.append(CustomUpdateOnTimestepEnd("Softmax3"))
+        
+        if dale_rewiring_required:
+            base_train_callbacks.append(CustomUpdateOnBatchEnd("DalePrune"))
+            base_train_callbacks.append(CustomUpdateOnBatchEnd("DaleRewire"))
         
         # Build list of optimisers and their custom updates
         optimisers = []
