@@ -1,5 +1,6 @@
 ##################### SNAKE ENV #####################
 #####################################################
+from pygenn import SynapseMatrixConnectivity
 import multiprocessing as mp
 from multiprocessing import Manager, Queue
 import numpy as np
@@ -26,7 +27,53 @@ from ml_genn.optimisers import Adam
 
 
 from ml_genn.compilers.eprop_compiler import default_params
+from collections import defaultdict
 
+def extract_actual_sparse_connections(compiled_net):
+    """
+    Extract the actual number of instantiated connections per connection group.
+    Returns a dict: {connection_name: n_connections}
+    """
+
+    connection_counts = {}
+
+    for c, genn_pop in compiled_net.connection_populations.items():
+
+        # Only meaningful for sparse connectivity
+        if genn_pop.matrix_type & SynapseMatrixConnectivity.SPARSE:
+
+            # Make sure connectivity is on host
+            genn_pop.pull_connectivity_from_device()
+
+            pre_inds = genn_pop.get_sparse_pre_inds()
+
+            n_conn = len(pre_inds)
+
+            connection_counts[c] = n_conn
+
+    return connection_counts
+
+def extract_fanin_statistics(compiled_net):
+    stats = {}
+
+    for c, genn_pop in compiled_net.connection_populations.items():
+
+        if genn_pop.matrix_type & SynapseMatrixConnectivity.SPARSE:
+
+            genn_pop.pull_connectivity_from_device()
+
+            post_inds = genn_pop.get_sparse_post_inds()
+            fanin = np.bincount(post_inds)
+
+            stats[c] = {
+                "total": len(post_inds),
+                "mean_fanin": np.mean(fanin),
+                "std_fanin": np.std(fanin),
+                "min_fanin": np.min(fanin),
+                "max_fanin": np.max(fanin)
+            }
+
+    return stats
 
 class SnakeEnv:
     def __init__(self, size=28, visible_range=7, wait_inc=5):
@@ -293,8 +340,32 @@ class SnakeEnv:
 
 ################### DEFINE MODEL ####################
 #####################################################
+def expected_toroidal_connections(
+    src_size,
+    dst_size,
+    sigma,
+    desired_fan_in=None,
+    p_max=None
+):
+    """
+    Computes expected total number of toroidal connections.
+
+    Either desired_fan_in OR p_max must be provided.
+    """
+
+    if desired_fan_in is None and p_max is None:
+        raise ValueError("Provide either desired_fan_in or p_max")
+
+    if desired_fan_in is None:
+        # derive fan-in from p_max
+        desired_fan_in = src_size * 2.0 * np.pi * sigma**2 * p_max
+
+    # total connections = fan_in per neuron × number of postsyn neurons
+    return dst_size * desired_fan_in
+
+
 WINDOW_EPISODES = 100
-BOARD_SIZE = 3
+BOARD_SIZE = 2
 VISIBLE_RANGE = 11
 
 WAIT_INC = 30
@@ -304,27 +375,26 @@ INPUT_W = VISIBLE_RANGE
 INPUT_C = 3   # or more if you use feature planes
 
 INPUT_SHAPE = (VISIBLE_RANGE, VISIBLE_RANGE, INPUT_C)
-HIDDEN1_SHAPE = (VISIBLE_RANGE*5, VISIBLE_RANGE*5, INPUT_C)
-HIDDEN2_SHAPE = (VISIBLE_RANGE*2, VISIBLE_RANGE*2, INPUT_C)
+DOWNSAMPLE_SHAPE = (VISIBLE_RANGE*5, VISIBLE_RANGE*5, INPUT_C)
+HIDDEN_E_SHAPE = (VISIBLE_RANGE*5, VISIBLE_RANGE*5, INPUT_C)
+HIDDEN_I_SHAPE = (VISIBLE_RANGE*3, VISIBLE_RANGE*3, INPUT_C)
 
 INPUT_SIZE = np.prod(INPUT_SHAPE)
-NUM_HIDDEN_1 = np.prod(HIDDEN1_SHAPE)
-NUM_HIDDEN_2 = np.prod(HIDDEN2_SHAPE)
+NUM_HIDDEN_E = np.prod(HIDDEN_E_SHAPE)
+NUM_HIDDEN_I = np.prod(HIDDEN_I_SHAPE)
 
-SIGMA_IN = 0.25
-SIGMA_H = 0.25
+SIGMA_IN = 0.1
+SIGMA_H = 0.05
 
-DESIRED_FAN_IN_IN = 100
-DESIRED_FAN_IN_H1 = (NUM_HIDDEN_1)**(1/3.0)
-print("Desired Fan-in IN", DESIRED_FAN_IN_IN)
-print("Desired Fan-in H1", DESIRED_FAN_IN_H1)
-DESIRED_FAN_IN_H2 = int(NUM_HIDDEN_2*.5)
+DESIRED_FAN_IN_IN = 500
+DESIRED_FAN_IN_H1 = 40
+DESIRED_FAN_IN_H2 = 40
 def compute_p_max(desired_fan_in, n_pre, sigma):
     return desired_fan_in / (n_pre * 2.0 * np.pi * sigma**2)
 
 p_max_in = compute_p_max(DESIRED_FAN_IN_IN, INPUT_SIZE, SIGMA_IN)
-p_max_h1 = compute_p_max(DESIRED_FAN_IN_H1, NUM_HIDDEN_1, SIGMA_H)
-p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, NUM_HIDDEN_2, SIGMA_H)
+p_max_h1 = compute_p_max(DESIRED_FAN_IN_H1, NUM_HIDDEN_E, SIGMA_H)
+p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, NUM_HIDDEN_I, SIGMA_H)
 
 # Clip in case σ is very small
 p_max_in = p_max_in
@@ -338,219 +408,338 @@ std_h1 = 1.0 / np.sqrt(DESIRED_FAN_IN_H1)
 std_h2 = 1.0 / np.sqrt(DESIRED_FAN_IN_H2)
 
 NUM_OUTPUT = 4
-
+CONNECTIVITY_TYPE = "toroidal"
 CONN_P = {
-    "I-H": 0.05,
-    "H-H": 0.05,
+    "I-H": 0.1,
+    "D-O": 0.1,
+    "H-H": 0.01,
     #"H-H": np.log(NUM_HIDDEN_1+NUM_HIDDEN_2)/(NUM_HIDDEN_1 + NUM_HIDDEN_2),
-    "H-P": 0.05,
-    "H-V": 0.05
+    "H-P": 0.1,
+    "H-V": 0.1,
+    "F": 0.5
 }
+
+
+print("Expected random connections:")
+expected_conns = 0
+print("- I-H:", aux_conns := INPUT_SIZE * (NUM_HIDDEN_E + NUM_HIDDEN_I) * CONN_P["I-H"])
+expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="fixed")
+print("- H-H:", aux_conns := ((NUM_HIDDEN_E + NUM_HIDDEN_I)**2) * CONN_P["H-H"])
+expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="fixed")
+print("- H-P:", aux_conns := (NUM_HIDDEN_E + NUM_HIDDEN_I) * NUM_OUTPUT * CONN_P["H-P"])
+expected_conns += aux_conns
+print("- H-V:", aux_conns := (NUM_HIDDEN_E + NUM_HIDDEN_I) * CONN_P["H-V"])
+expected_conns += aux_conns
+
+print("Expected toroidal connections:")
+print("- I-H:",
+      aux_conns := expected_toroidal_connections(
+          INPUT_SIZE,
+          NUM_HIDDEN_E + NUM_HIDDEN_I,
+          SIGMA_IN,
+          desired_fan_in=DESIRED_FAN_IN_IN
+      ))
+expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
+
+print("- H-H:",
+      aux_conns := expected_toroidal_connections(
+          NUM_HIDDEN_E + NUM_HIDDEN_I,
+          NUM_HIDDEN_E + NUM_HIDDEN_I,
+          SIGMA_H,
+          desired_fan_in=DESIRED_FAN_IN_H1
+      ))
+expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
+
 TRAIN = True
 
 CHECKPOINT_BOARD_SIZE = None # "5_mid_completion"
-
+if CHECKPOINT_BOARD_SIZE is not None:
+    CONNECTIVITY_TYPE = "fixed"
 KERNEL_PROFILING = False
 
 
 gamma = 0.99 ** (1/WAIT_INC)
-td_lambda = 0.01 ** (1/WAIT_INC)
+td_lambda = .1 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-4
+entropy_coeff = 1e-2
 entropy_decay = 0.9999 ** (1/WAIT_INC)
-entropy_coeff_min = 1e-7
+entropy_coeff_min = 1e-4
 
 serialiser = Numpy("snake_checkpoints")
 network = Network(default_params)
 hidden_layers = {}
-deep_r_conns = {}
-with network:
-    # Populations
-    input_pop = Population(
-        SpikeInput(max_spikes=INPUT_H * INPUT_W * INPUT_C * WAIT_INC // 2),
-        (INPUT_H, INPUT_W, INPUT_C)
-    )
-    hidden_layers["E"] = Population(
-        AdaptiveLeakyIntegrateFire(
-            v_thresh=0.61,
-            tau_mem=10.0,
-            tau_refrac=3.0,
-            tau_adapt=300
-        ),
-        HIDDEN1_SHAPE
-    )
-    hidden_layers["I"] = Population(
-        AdaptiveLeakyIntegrateFire(
-            v_thresh=0.61,
-            tau_mem=10.0,
-            tau_refrac=3.0,
-            tau_adapt=300
-        ),
-        HIDDEN2_SHAPE
-    )
-    policy = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
-                        NUM_OUTPUT)
 
-    value = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
-                        1)
-    
-    # Connections
-    deep_r_conns["Inp-E"] = Connection(input_pop,  hidden_layers["E"], 
-        FixedProbability(CONN_P['I-H'], Normal(
-            mean=+0.1 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
-            sd=+0.05 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
-        )),
-        exc_inh_sign=1,)
+def make_connectivity(
+    connectivity_type,
+    src_size,
+    desired_fan_in=None,
+    p=None,
+    sigma=None,
+    sign=1.0,
+    mean_scale=0.1,
+    sd_scale=0.05
+):
     """
-        ToroidalGaussian2D(
-            sigma=SIGMA_IN,
-            p_max=p_max_in,
-            weight=Normal(
-                mean=+0.1 / np.sqrt(DESIRED_FAN_IN_IN), 
-                sd=+0.05 / np.sqrt(DESIRED_FAN_IN_IN), 
-        )),
-        exc_inh_sign=1,)"""
-    
-    deep_r_conns["Inp-I"] = Connection(input_pop,  hidden_layers["I"], 
-        FixedProbability(CONN_P['I-H'], Normal(
-            mean=+0.1 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
-            sd=+0.05 / np.sqrt(CONN_P['I-H'] * INPUT_SIZE), 
-        )),
-        exc_inh_sign=1,)
+    Automatically builds connectivity with properly scaled initialization.
+
+    Parameters
+    ----------
+    connectivity_type : "fixed" or "toroidal"
+    src_size : int
+        Number of presynaptic neurons
+    dst_size : int
+        Number of postsynaptic neurons
+    desired_fan_in : float or None
+        Target fan-in (required for toroidal, optional for fixed)
+    p : float
+        Connection probability (required for fixed)
+    sigma : float
+        Gaussian sigma (required for toroidal)
+    sign : +1 or -1
+        Excitatory or inhibitory
+    mean_scale : float
+    sd_scale : float
     """
-        ToroidalGaussian2D(
-            sigma=SIGMA_IN,
-            p_max=p_max_in,
-            weight=Normal(
-                mean=+0.1 / np.sqrt(DESIRED_FAN_IN_IN), 
-                sd=+0.05 / np.sqrt(DESIRED_FAN_IN_IN), 
-        )),
-        exc_inh_sign=1,)"""
-    
-    ############ EXCITATORY ############
 
-    deep_r_conns["E-I"] = Connection(hidden_layers["E"], hidden_layers["I"], 
-        FixedProbability(
-            CONN_P['H-H'], 
-            Normal(
-                mean=+0.1 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
-                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
-            )
-        ),
-        exc_inh_sign=1,)
-    
-    deep_r_conns["E-E"] = Connection(hidden_layers["E"], hidden_layers["E"], 
-        FixedProbability(
-            CONN_P['H-H'], 
-            Normal(
-                mean=+0.1 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
-                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_1), 
-            )
-        ),
-        exc_inh_sign=1,)
-    """
-        ToroidalGaussian2D(
-            sigma=SIGMA_H,
-            p_max=p_max_h1,
-            weight=Normal(sd=std_h1)
-        ))"""
-    
-    deep_r_conns["E-V"] = Connection(hidden_layers["E"], value, 
-        FixedProbability(
-            CONN_P['H-V'], 
-            Normal(
-                mean=+0.1 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_1), 
-                sd=+0.05 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_1), 
-            )
-        ),
-        exc_inh_sign=1,)
+    if connectivity_type == "fixed":
 
-    deep_r_conns["E-P"] = Connection(hidden_layers["E"], policy, 
-        FixedProbability(
-            CONN_P['H-P'], 
-            Normal(
-                mean=+0.1 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_1), 
-                sd=+0.05 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_1), 
-            )
-        ),
-        exc_inh_sign=1,)
-    
-    ############ INHIBITORY ############
+        if p is None:
+            raise ValueError("Fixed connectivity requires p")
+        
+        if sign is None:
+            sd_scale = 1.0
+        
+        fan_in = p * src_size
 
-    deep_r_conns["I-E"] = Connection(hidden_layers["I"], hidden_layers["E"], 
-        FixedProbability(
-            CONN_P['H-H'], 
-            Normal(
-                mean=-0.3 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
-                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
-            )
-        ),
-        exc_inh_sign=-1,)
-    
-    deep_r_conns["I-I"] = Connection(hidden_layers["I"], hidden_layers["I"], 
-        FixedProbability(
-            CONN_P['H-H'], 
-            Normal(
-                mean=-0.3 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
-                sd=+0.05 / np.sqrt(CONN_P['H-H'] * NUM_HIDDEN_2), 
-            )
-        ),
-        exc_inh_sign=-1,)
- 
-    deep_r_conns["I-V"] = Connection(hidden_layers["I"], value, 
-        FixedProbability(
-            CONN_P['H-V'], 
-            Normal(
-                mean=-0.3 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_2), 
-                sd=+0.05 / np.sqrt(CONN_P['H-V'] * NUM_HIDDEN_2), 
-            )
-        ),
-        exc_inh_sign=-1,)
-    
-    deep_r_conns["I-P"] = Connection(hidden_layers["I"], policy, 
-        FixedProbability(
-            CONN_P['H-P'], 
-            Normal(
-                mean=-0.3 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_2), 
-                sd=+0.05 / np.sqrt(CONN_P['H-P'] * NUM_HIDDEN_2), 
-            )
-        ),
-        exc_inh_sign=-1,)
-    
-    #######################################
-    
-    for hidden_layer in list(hidden_layers.values()):
-        Connection(hidden_layer, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_feedback")
-        Connection(hidden_layer, policy, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="policy_regularisation")
-        Connection(hidden_layer, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_feedback")
-        Connection(hidden_layer, value, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="value_regularisation")
+        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
+        sd = sd_scale / np.sqrt(fan_in)
+
+        return FixedProbability(
+            p,
+            Normal(mean=mean, sd=sd)
+        )
+
+    elif connectivity_type == "toroidal":
+
+        if sigma is None:
+            raise ValueError("Toroidal connectivity requires sigma")
+
+        if desired_fan_in is None:
+            raise ValueError("Toroidal connectivity requires desired_fan_in")
+
+        # compute p_max automatically
+        p_max = desired_fan_in / (src_size * 2.0 * np.pi * sigma**2)
+
+        fan_in = desired_fan_in
+
+        if sign == -1:
+            mean_scale *= 3
+        elif sign is None:
+            sd_scale = 1.0
+
+        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
+            
+        sd = sd_scale / np.sqrt(fan_in)
+
+        return ToroidalGaussian2D(
+            sigma=sigma,
+            p_max=p_max,
+            weight=Normal(mean=mean, sd=sd)
+        )
+
+    else:
+        raise ValueError(f"Unknown connectivity_type: {connectivity_type}")
 
 
-if CHECKPOINT_BOARD_SIZE is not None:
-    network.load((CHECKPOINT_BOARD_SIZE,), serialiser)
+def build_compiled_network(connectivity_type="fixed"):
+    network = Network(default_params)
+    hidden_layers = {}
 
-max_example_timesteps = 1 
-compiler = EPropCompiler(
-    example_timesteps=max_example_timesteps,
-    losses={policy: "sparse_categorical_crossentropy",
-            value: "mean_square_error"},
-    optimiser=Adam(1e-4),
-    batch_size=1,
-    kernel_profiling=KERNEL_PROFILING,
-    feedback_type="random",
-    # deep_r_conns=list(deep_r_conns.values()), 
-    # deep_r_l1_strength=0,
-    gamma=gamma, 
-    td_lambda=td_lambda, 
-    train_output_bias=False,
-    reset_time_between_batches=False,
-    entropy_coeff=entropy_coeff,
-    entropy_coeff_decay=entropy_decay,
-    entropy_coeff_min=entropy_coeff_min
-)
+    with network:
 
-compiled_net = compiler.compile(network)
+        # ================= POPULATIONS =================
+
+        input_pop = Population(
+            SpikeInput(max_spikes=INPUT_H * INPUT_W * INPUT_C * WAIT_INC // 2),
+            (INPUT_H, INPUT_W, INPUT_C)
+        )
+
+        """
+        hidden_layers["downsample"] = Population(
+            AdaptiveLeakyIntegrateFire(
+                v_thresh=0.61,
+                tau_mem=10.0,
+                tau_refrac=3.0,
+                tau_adapt=300,
+                beta=0.0
+            ),
+            DOWNSAMPLE_SHAPE
+        )
+        """
+
+        hidden_layers["E"] = Population(
+            AdaptiveLeakyIntegrateFire(
+                v_thresh=0.61,
+                tau_mem=10.0,
+                tau_refrac=3.0,
+                tau_adapt=300
+            ),
+            HIDDEN_E_SHAPE
+        )
+
+        hidden_layers["I"] = Population(
+            AdaptiveLeakyIntegrateFire(
+                v_thresh=0.61,
+                tau_mem=10.0,
+                tau_refrac=3.0,
+                tau_adapt=300
+            ),
+            HIDDEN_I_SHAPE
+        )
+
+        policy = Population(
+            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
+            NUM_OUTPUT
+        )
+
+        value = Population(
+            LeakyIntegrate(tau_mem=20.0, bias=0.0, readout="var"),
+            1
+        )
+
+        # ================= INPUT → HIDDEN =================
+        """
+        Connection(
+            input_pop,
+            hidden_layers["downsample"],
+            make_connectivity(
+                connectivity_type=connectivity_type,
+                src_size=INPUT_SIZE,
+                p=CONN_P["I-H"], 
+                sigma=SIGMA_IN, 
+                desired_fan_in=DESIRED_FAN_IN_IN,
+                sign=None
+            ),
+            exc_inh_sign=None
+        )
+        """
+        for layer, prob, c_type in [
+            (hidden_layers["I"], CONN_P["I-H"], connectivity_type),
+            (hidden_layers["E"], CONN_P["I-H"], connectivity_type),
+            # (policy, CONN_P["D-O"], "fixed"),
+            # (value, CONN_P["D-O"], "fixed"),
+        ]:
+            Connection(
+                input_pop,
+                layer,
+                make_connectivity(
+                    connectivity_type=c_type,
+                    src_size=NUM_HIDDEN_E,
+                    p=prob,
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_IN,
+                    sign=None
+                ),
+                exc_inh_sign=None
+            )
+
+        # ================= EXCITATORY =================
+        for layer, prob, c_type, conn_sign in [
+            (hidden_layers["I"], CONN_P["H-H"], connectivity_type, 1),
+            (hidden_layers["E"], CONN_P["H-H"], connectivity_type, 1),
+            (policy, CONN_P["H-P"], "fixed", None),
+            (value, CONN_P["H-V"], "fixed", None),
+        ]:
+            Connection(
+                hidden_layers["E"],
+                layer,
+                make_connectivity(
+                    connectivity_type=c_type,
+                    src_size=NUM_HIDDEN_E,
+                    p=prob,
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H1,
+                    sign=conn_sign
+                ),
+                exc_inh_sign=conn_sign
+            )
+
+        # ================= INHIBITORY =================
+        for layer, prob, c_type in [
+            (hidden_layers["I"], CONN_P["H-H"], connectivity_type),
+            (hidden_layers["E"], CONN_P["H-H"], connectivity_type),
+            # (policy, CONN_P["H-P"], "fixed"),
+            # (value, CONN_P["H-V"], "fixed"),
+        ]:
+            Connection(
+                hidden_layers["I"],
+                layer,
+                make_connectivity(
+                    connectivity_type=c_type,
+                    src_size=NUM_HIDDEN_I,
+                    p=prob,
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H2,
+                    sign=-1
+                ),
+                exc_inh_sign=-1
+            )
+
+        # ================= FEEDBACK CONNECTIONS =================
+        for hidden_layer in hidden_layers.values():
+            Connection(
+                hidden_layer, policy,
+                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                feedback_name="policy_feedback"
+            )
+            Connection(
+                hidden_layer, policy,
+                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                feedback_name="policy_regularisation"
+            )
+            Connection(
+                hidden_layer, value,
+                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                feedback_name="value_feedback"
+            )
+            Connection(
+                hidden_layer, value,
+                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                feedback_name="value_regularisation"
+            )
+            
+
+    # ================= COMPILER =================
+
+    compiler = EPropCompiler(
+        example_timesteps=1,
+        losses={
+            policy: "sparse_categorical_crossentropy",
+            value: "mean_square_error"
+        },
+        optimiser=Adam(3e-4),
+        batch_size=1,
+        kernel_profiling=KERNEL_PROFILING,
+        feedback_type="random",
+        gamma=gamma,
+        td_lambda=td_lambda,
+        train_output_bias=False,
+        reset_time_between_batches=False,
+        entropy_coeff=entropy_coeff,
+        entropy_coeff_decay=entropy_decay,
+        entropy_coeff_min=entropy_coeff_min
+    )
+
+    if CHECKPOINT_BOARD_SIZE is not None:
+        network.load((CHECKPOINT_BOARD_SIZE,), serialiser)
+
+    compiled_net = compiler.compile(network)
+
+    return compiled_net, network, input_pop, hidden_layers, policy, value
+
+compiled_net, network, input_pop, hidden_layers, policy, value = \
+    build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
 
 # Build metrics for training
 policy_train_metrics = get_object_mapping(
@@ -877,6 +1066,21 @@ def train_snake_agent_with_ipc(episodes=100000,
                 BOARD_SIZE += 1
                 print(f"WON! Increasing board size to {BOARD_SIZE}")
                 env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC)
+            if (ep) % 1000 == 0:
+                print("/////////////////////////////")
+                connections_sum = 0
+                print("Actual instantiated connections:")
+                for k, v in extract_actual_sparse_connections(compiled_net).items():
+                    connections_sum += v
+                    print(f"- {k}: {v}")
+                print("Total    connections:", connections_sum)
+                print("Expected connections:", int(expected_conns))
+                print("Difference          :", int(connections_sum-expected_conns))
+                print("")
+                print("Fanin statistics:")
+                for k, v in extract_fanin_statistics(compiled_net).items():
+                    print(f"- {k}: {v}")
+                print("/////////////////////////////")
             if (ep+1) % 1000 == 0:
                 best_reward = -np.inf
                 compiled_net.save_connectivity((f"{BOARD_SIZE}_mid_completion",), serialiser)
@@ -988,8 +1192,17 @@ def train_snake_agent_with_ipc(episodes=100000,
                 td_error_trace = 0
 
                 frame += 1
-            
-            for i in range(WAIT_INC*3):
+    
+            indices = obs.nonzero()[0]
+            spikes = make_repeated_spikes(
+                indices,
+                compiled_net.genn_model.timestep,
+                INPUT_SIZE,
+                K=WAIT_INC,
+                period=1
+            )
+            compiled_net.set_input({input_pop: [spikes]})
+            for i in range(WAIT_INC):
                 if i % WAIT_INC == 0:
                     probs = compiled_net.get_readout(policy).flatten()
                     current_probs.append(probs)
@@ -1100,15 +1313,16 @@ def train_snake_agent_with_ipc(episodes=100000,
                     print("Metrics enqueue error:", e)
 
             # logging
-            print(
-                f"Episode {ep+1} - "
-                f"Total reward: {' ' if total_reward >= 0 else ''}{total_reward:.2f} "
-                f"- Best reward: {best_reward:.2f} "
-                f"- Snake len: {len(env.snake)-1:2d} "
-                f"- Snake len avg (last 100): {np.mean(snake_len_history):.2f} "
-                f"- Frame death: {frame} "
-                f"- Alpha: {compiled_net.optimisers[0][0].alpha:.8f}"
-            )
+            if ep %10 == 0:
+                print(
+                    f"Episode {ep+1} - "
+                    f"Total reward: {' ' if total_reward >= 0 else ''}{total_reward:.2f} "
+                    f"- Best reward: {best_reward:.2f} "
+                    f"- Snake len: {len(env.snake)-1:2d} "
+                    f"- Snake len avg (last 100): {np.mean(snake_len_history):.2f} "
+                    f"- Frame death: {frame} "
+                    f"- Alpha: {compiled_net.optimisers[0][0].alpha:.8f}"
+                )
 
             # optional checkpoint / early stop etc.
 

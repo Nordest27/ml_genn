@@ -425,12 +425,7 @@ output_random_feedback_model = {
     addToPre(g * E_post);
     """}
 
-output_adaptative_random_feedback_model = deepcopy(output_learning_model)
-del output_adaptative_random_feedback_model["pre_spike_syn_code"]
-output_adaptative_random_feedback_model["synapse_dynamics_code"] = """
-    DeltaG += ZFilter * E_post;
-    addToPre(g * E_post);
-"""
+    
 output_random_model = {
     "params": [("g", "scalar")],
     "post_neuron_var_refs": [("E_post", "scalar")],
@@ -640,8 +635,9 @@ class EPropCompiler(Compiler):
                         f"""
                         E = tdError;
                         ValReg = (
-                            0.05 * ({model_copy.output_var_name} - PrevVal)
-                            + 0.01 * ({model_copy.output_var_name})
+                            0.01 * ({model_copy.output_var_name})
+                            + 0.1 * ({model_copy.output_var_name} - PrevVal)
+                            + 0.01 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
                         );
                         PrevVal = {model_copy.output_var_name};
                         tdError = 0;
