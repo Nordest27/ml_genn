@@ -13,7 +13,9 @@ class MeanSquareError(Loss):
         egp_size = (example_timesteps * batch_size * flat_shape)
         model.add_egp("YTrue", "scalar*",
                       np.empty(egp_size, dtype=np.float32))
-        model.add_var("tdError", "scalar", 1.0)
+        model.add_var("tdError", "scalar", 0.0)
+        model.add_var("reward", "scalar", 0.0)
+        model.add_var("actionTaken", "scalar", 0.0)
 
         # Add sim-code to read out correct yTrue value 
         model.append_sim_code(

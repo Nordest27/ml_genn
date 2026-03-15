@@ -4,7 +4,7 @@ import mnist
 from ml_genn import Network, Population, Connection
 from ml_genn.callbacks import Checkpoint
 from ml_genn.compilers import EPropCompiler
-from ml_genn.connectivity import Dense, ToroidalGaussian2D
+from ml_genn.connectivity import Dense, ToroidalGaussian2D, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, SpikeInput
 from ml_genn.serialisers import Numpy
@@ -80,7 +80,7 @@ std_h3 = 1.0 / np.sqrt(DESIRED_FAN_IN_H3)
 # Training parameters
 # =========================
 
-BATCH_SIZE = 1
+BATCH_SIZE = 8
 NUM_EPOCHS = 10
 TRAIN = True
 
@@ -93,7 +93,7 @@ spikes = log_latency_encode_data(
 )
 
 serialiser = Numpy("latency_mnist_toroidal")
-
+deep_r_conns = {}
 network = Network(default_params)
 
 with network:
@@ -127,7 +127,7 @@ with network:
     # Sparse toroidal connections
     # -------------------------
 
-    Connection(
+    deep_r_conns["I-H"] = Connection(
         input_pop,
         hidden_1,
         ToroidalGaussian2D(
@@ -137,7 +137,7 @@ with network:
         )
     )
 
-    Connection(
+    deep_r_conns["H1-H2"] = Connection(
         hidden_1,
         hidden_2,
         ToroidalGaussian2D(
@@ -147,7 +147,7 @@ with network:
         )
     )
 
-    Connection(
+    deep_r_conns["H2-H3"] = Connection(
         hidden_2,
         hidden_3,
         ToroidalGaussian2D(
@@ -157,7 +157,7 @@ with network:
         )
     )
 
-    Connection(
+    deep_r_conns["H3-H3"] = Connection(
         hidden_3,
         hidden_3,
         ToroidalGaussian2D(
@@ -167,31 +167,31 @@ with network:
         )
     )
 
-    Connection(
+    deep_r_conns["H3-O"] = Connection(
         hidden_3,
         output,
-        Dense(Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2)))
+        FixedProbability(0.5, Normal(sd=1.0 / np.sqrt(NUM_HIDDEN_2)))
     )
 
     # Random feedback for eProp
-    Connection(
+    deep_r_conns["F1"] = Connection(
         hidden_1,
         output,
-        Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+        FixedProbability(0.5, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
         feedback_name="f1"
     )
 
-    Connection(
+    deep_r_conns["F2"]=Connection(
         hidden_2,
         output,
-        Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+        FixedProbability(0.5, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
         feedback_name="f2"
     )    
 
-    Connection(
+    deep_r_conns["F3"]=Connection(
         hidden_3,
         output,
-        Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+        FixedProbability(0.5, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
         feedback_name="f3"
     )
 
@@ -208,6 +208,8 @@ compiler = EPropCompiler(
     losses="sparse_categorical_crossentropy",
     optimiser=Adam(1e-4),
     batch_size=BATCH_SIZE,
+    deep_r_conns=list(deep_r_conns.values()),
+    deep_r_l1_strength=0.001,
     feedback_type="random"
 )
 

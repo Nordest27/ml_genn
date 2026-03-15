@@ -35,6 +35,7 @@ from ..utils.value import is_value_constant
 
 from ml_genn.optimisers import default_optimisers
 from ml_genn.losses import default_losses
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,11 @@ default_params = {
     LeakyIntegrateFireInput: {"relative_reset": True, 
                               "integrate_during_refrac": True,
                               "scale_i": False}}
+
+class PolicyTypes(Enum):
+    CATEGORICAL = "categorical"
+    GAUSSIAN = "gaussian"
+    GAUSSIAN_LOG_SIGMA = "gaussian_log_sigma"
 
 def _has_connection_to_output(pop):
     # Loop through population's outgoing connections
@@ -77,6 +83,7 @@ class CompileState:
         self._tau_adapt = None
         self.feedback_connections = []
         
+        self.tde_transport_connections = []
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
         self.value_regularisation_connections = []
@@ -263,12 +270,14 @@ output_random_learning_model = deepcopy(output_learning_model)
 output_random_learning_model["synapse_dynamics_code"] =  """
     DeltaG += ZFilter * E_post;
 """
-
+output_adaptive_feedback_learning_model = deepcopy(output_learning_model)
+del output_adaptive_feedback_learning_model["pre_spike_syn_code"] 
+ 
 eprop_alif_td_model = {
     "params": [("CReg", "scalar"), ("Alpha", "scalar"), ("Rho", "scalar"),
                ("FTarget", "scalar"),("AlphaFAv", "scalar"),
                ("Vthresh_post", "scalar"), ("Beta_post", "scalar"),
-               ("GammaLambda", "scalar")],
+               ("Lambda", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY),
              ("eFiltered", "scalar"),
              ("epsilonA", "scalar"),
@@ -321,22 +330,23 @@ eprop_alif_td_model = {
     const scalar psiZFilter = Psi * ZFilter;
     const scalar psiBetaEpsilonA = Psi * Beta_post * epsA;
 
-    const scalar e = psiZFilter  - psiBetaEpsilonA;
+    const scalar e = psiZFilter - psiBetaEpsilonA;
     epsilonA = psiZFilter + ((Rho * epsA) - psiBetaEpsilonA);
 
     // Firing-rate regularisation term
     const scalar fireReg = (FAvg - FTarget) * CReg * e;
     DeltaG += fireReg;
 
-    RLTrace = GammaLambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
     eFiltered = (eFiltered * Alpha) + e;
+    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 1.0 * VE_post);
     """
 }
 
 output_value_learning_model = {
     "params": [
         ("Alpha", "scalar"),
-        ("GammaLambda", "scalar")
+        ("GammaLambda", "scalar"),
+        ("RetE", "scalar")
     ],
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY), 
@@ -363,8 +373,11 @@ output_value_learning_model = {
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
     RLTrace = GammaLambda * RLTrace - ZFilter;
     
-    // addToPre(g * E_post);
-    addToPre(g);
+    if (RetE == 0) 
+        addToPre(g);
+    else 
+        addToPre(g * E_post);
+
     """}
 
 output_value_random_learning_model = deepcopy(output_value_learning_model)
@@ -372,13 +385,24 @@ output_value_random_learning_model["synapse_dynamics_code"] =  """
     DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
     RLTrace = GammaLambda * RLTrace - ZFilter;
 """
-
+output_value_adaptive_feedback_learning_model = deepcopy(output_value_learning_model)
+del output_value_adaptive_feedback_learning_model["pre_spike_syn_code"]
+output_value_adaptive_feedback_learning_model["post_neuron_var_refs"] += [("F_post", "scalar")]
+output_value_adaptive_feedback_learning_model["synapse_dynamics_code"] =  """
+    DeltaG += RLTrace * E_post + ZFilter * ValReg_post;
+    RLTrace = GammaLambda * RLTrace - ZFilter;
+    
+    if (RetE == 0) 
+        addToPre(g);
+    else 
+        addToPre(g * F_post);
+"""
 
 # --- NEW: TD(λ) versions for policy head ---
 output_policy_learning_model = {
     "params": [
         ("Alpha", "scalar"),       
-        ("GammaLambda", "scalar")
+        ("Lambda", "scalar")
     ],
     "vars": [
         ("g", "scalar", VarAccess.READ_ONLY),
@@ -404,7 +428,7 @@ output_policy_learning_model = {
     """,
     "synapse_dynamics_code": """
     DeltaG += TdE_post * RLTrace + ZFilter * E_post;
-    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
+    RLTrace = Lambda * RLTrace + ZFilter * PG_post;
     
     addToPre(g * PG_post);
     """
@@ -413,12 +437,20 @@ output_policy_learning_model = {
 output_policy_random_learning_model = deepcopy(output_policy_learning_model)
 output_policy_random_learning_model["synapse_dynamics_code"] = """
     DeltaG += TdE_post * RLTrace + ZFilter * E_post;
-    RLTrace = GammaLambda * RLTrace + ZFilter * PG_post;
+    RLTrace = Lambda * RLTrace + ZFilter * PG_post;
+"""
+output_policy_adaptive_feedback_learning_model = deepcopy(output_policy_learning_model)
+del output_policy_adaptive_feedback_learning_model["pre_spike_syn_code"]
+output_policy_adaptive_feedback_learning_model["post_neuron_var_refs"] += [("F_post", "scalar")]
+output_policy_adaptive_feedback_learning_model["synapse_dynamics_code"] = """
+    DeltaG += TdE_post * RLTrace + ZFilter * E_post;
+    RLTrace = Lambda * RLTrace + ZFilter * PG_post;
+    
+    addToPre(g * F_post);
 """
 
-
 output_random_feedback_model = {
-    "params": [("g", "scalar")],
+    "vars": [("g", "scalar", VarAccess.READ_ONLY)],
     "post_neuron_var_refs": [("E_post", "scalar")],
     
     "synapse_dynamics_code": """
@@ -427,7 +459,7 @@ output_random_feedback_model = {
 
     
 output_random_model = {
-    "params": [("g", "scalar")],
+    "vars": [("g", "scalar", VarAccess.READ_ONLY)],
     "post_neuron_var_refs": [("E_post", "scalar")],
     
     "synapse_dynamics_code": """
@@ -502,6 +534,7 @@ class EPropCompiler(Compiler):
                  deep_r_conns: Sequence = [],
                  deep_r_l1_strength: float = 0.01,
                  deep_r_record_rewirings = {},
+                 dale_rewiring_l1_strength: float = 0,
                  feedback_type: str = "symmetric",
                  # --- NEW ---
                  gamma: float = None,
@@ -509,6 +542,8 @@ class EPropCompiler(Compiler):
                  entropy_coeff: float = 1e-4,
                  entropy_coeff_decay: float = 0.99,
                  entropy_coeff_min: float = 1e-6,
+                 policy_heads: Population = None,
+                 value_head: Population = None,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -530,6 +565,9 @@ class EPropCompiler(Compiler):
         self.deep_r_l1_strength = deep_r_l1_strength
         self.deep_r_record_rewirings = {get_underlying_conn(c): k
                                         for c, k in deep_r_record_rewirings.items()}
+        
+        self.dale_rewiring_l1_strength = dale_rewiring_l1_strength
+
         self.feedback_type = feedback_type
         # --- NEW: RL / TD(λ) parameters ---
         self.gamma = gamma
@@ -540,6 +578,12 @@ class EPropCompiler(Compiler):
         self.entropy_coeff_min = entropy_coeff_min
         if (gamma is not None) and (td_lambda is not None):
             self.gamma_lambda = gamma * td_lambda
+            if policy_heads is None or value_head is None:
+                raise ValueError("Policy and value heads must be specified when activating the RL Eprop variant")
+            self.policy_heads = policy_heads
+            self.value_head = value_head
+        elif policy_heads is not None or value_head is not None:
+            raise ValueError("Neither policy nor value heads must be specified when not running the RL Eprop variant")
 
     def pre_compile(self, network: Network, 
                     genn_model, **kwargs) -> CompileState:
@@ -596,7 +640,9 @@ class EPropCompiler(Compiler):
 
             # Add sim-code to calculate error
             if self.gamma_lambda is not None:
-                if isinstance(loss, SparseCategoricalCrossentropy):
+                if self.policy_heads.get(pop) == PolicyTypes.CATEGORICAL:
+                    model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+                    
                     model_copy.add_var("PG", "scalar", 0.0)
                     model_copy.add_var("pre_PG", "scalar", 0.0)
                     model_copy.add_var("TdE", "scalar", 0.0)
@@ -605,14 +651,15 @@ class EPropCompiler(Compiler):
                     model_copy.append_sim_code(
                         # const scalar p = {model_copy.output_var_name};
                         f"""
-                        TdE = tdError;
-                        
+                        TdE = ISynTdE;
+                        // TdE = tdError;
+
                         const scalar p = {model_copy.output_var_name};
                         const scalar logp = log(fmax(p, (scalar)1e-8));
                         const scalar entropyGrad = p * (logp + 1.0);
 
                         E = entropyCoeff * entropyGrad;
-                        entropyCoeff = fmax(
+                        entropyCoeff = 0*fmax(
                             {self.entropy_coeff_decay} * entropyCoeff,
                             {self.entropy_coeff_min}
                         );
@@ -623,8 +670,56 @@ class EPropCompiler(Compiler):
                         else {{
                             PG = 0;
                         }}
-
+                        actionTaken = 0;
                         tdError = 0;
+                        """
+                    )
+                elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN: 
+                    model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+                    
+                    model_copy.add_var("TdE", "scalar", 0.0)
+                    model_copy.add_var("Action", "scalar", 0.0)
+                    model_copy.add_var("LogSigma", "scalar", 0.0)
+                    model_copy.add_var("PG", "scalar", 0.0)
+                    model_copy.append_sim_code(
+                        f"""         
+                        TdE = ISynTdE;
+                        const scalar mu = {model_copy.output_var_name};
+                        const scalar sigma = exp(LogSigma);
+
+                        if (actionTaken != 0) {{
+                            PG = (Action - mu) / (sigma * sigma);
+                        }}
+                        else {{
+                            PG = 0;
+                        }}
+
+                        actionTaken = 0;
+                    """)
+                elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN_LOG_SIGMA:
+                    model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+
+                    model_copy.add_var("TdE", "scalar", 0.0)
+                    model_copy.add_var("Mu", "scalar", 0.0)
+                    model_copy.add_var("Action", "scalar", 0.0)
+                    model_copy.add_var("PG", "scalar", 0.0)
+
+                    model_copy.append_sim_code(
+                        f"""
+                        TdE = ISynTdE;
+
+                        const scalar Sigma = exp({model_copy.output_var_name});
+
+                        if (actionTaken != 0) {{
+                            const scalar diff = Action - Mu;
+                            const scalar var = Sigma * Sigma;
+
+                            PG = (diff * diff / var) - 1.0;
+                        }}
+                        else {{
+                            PG = 0;
+                        }}
+
                         actionTaken = 0;
                         """
                     )
@@ -633,13 +728,16 @@ class EPropCompiler(Compiler):
                     model_copy.add_var("PrevVal", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""
-                        E = tdError;
+                        E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
+                        // E = tdError;
+
                         ValReg = (
-                            0.01 * ({model_copy.output_var_name})
-                            + 0.1 * ({model_copy.output_var_name} - PrevVal)
-                            + 0.01 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
+                            0.000 * ({model_copy.output_var_name})
+                            + 0.00 * ({model_copy.output_var_name} - PrevVal)
+                            + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
                         );
                         PrevVal = {model_copy.output_var_name};
+                        reward *= 0.9261;
                         tdError = 0;
                         """
                     )
@@ -698,6 +796,7 @@ class EPropCompiler(Compiler):
                 model_copy.add_additional_input_var("ISynValueError", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynPolicyRegularisation", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynValueRegularisation", "scalar", 0.0)
+                model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
                 
                 model_copy.add_var("PG", "scalar", 0.0)
                 model_copy.add_var("TdE", "scalar", 0.0)
@@ -711,7 +810,7 @@ class EPropCompiler(Compiler):
                     VE = ISynValueError;
                     PR = ISynPolicyRegularisation;
                     VR = ISynValueRegularisation;
-                    TdE = 0;
+                    TdE = ISynTdE;
                     """
                 )
 
@@ -761,50 +860,87 @@ class EPropCompiler(Compiler):
         # If target neuron is LIF, create weight update model with eProp LIF
         target_pop = conn.target()
         target_neuron = target_pop.neuron
-        # Decide whether this is the policy head (SparseCategoricalCrossentropy)
-        loss = compile_state.losses.get(target_pop, None)
-        is_policy_head = (
-            self.gamma_lambda is not None and
-            isinstance(loss, SparseCategoricalCrossentropy)
-        )
 
         # Check if conn are feedback
         if conn.is_feedback:
             if self.feedback_type != "random":
                 raise ValueError("Feedback type must be 'random' when using random feedback connections")
 
-            post_var_name = "E"
             # Add connection to list of feedback connections
             if self.gamma_lambda is not None:
-                if is_policy_head:
+                if conn.name.endswith("tde_transport"):
                     feedback_model = output_random_feedback_model
+                    compile_state.tde_transport_connections.append(conn)
+                    post_var_name = "E" 
+                    wum = WeightUpdateModel(
+                        model=feedback_model,
+                        var_vals={"g": connect_snippet.weight},
+                        post_neuron_var_refs={"E_post": post_var_name}
+                    )
+                elif target_pop in self.policy_heads:
+                    feedback_model = output_policy_adaptive_feedback_learning_model # output_random_feedback_model
                     if conn.name.endswith("policy_feedback"):
                         compile_state.policy_feedback_connections.append(conn)
                         post_var_name = "PG"
                     elif conn.name.endswith("policy_regularisation"):
                         compile_state.policy_regularisation_connections.append(conn)
+                        post_var_name = "E"
+                    wum = WeightUpdateModel(
+                        model=feedback_model,
+                        param_vals={
+                            "Alpha": alpha,
+                            "Lambda": self.td_lambda
+                        },
+                        var_vals={
+                            "g": connect_snippet.weight,
+                            "DeltaG": 0.0,
+                            "RLTrace": 0.0,
+                        },
+                        pre_var_vals={"ZFilter": 0.0},
+                        post_neuron_var_refs={
+                            "E_post": "E", "PG_post": "PG",
+                            "TdE_post": "TdE", "F_post": post_var_name})
                 else:
-                    feedback_model = output_random_model
+                    feedback_model = output_value_adaptive_feedback_learning_model
                     if conn.name.endswith("value_feedback"):
                         compile_state.value_feedback_connections.append(conn)
+                        post_var_name = "E"
                     elif conn.name.endswith("value_regularisation"):
                         compile_state.value_regularisation_connections.append(conn)
                         post_var_name = "ValReg"
+                    wum = WeightUpdateModel(
+                        model=feedback_model,
+                        param_vals={
+                            "RetE": 1.0,
+                            "Alpha": alpha,
+                            "GammaLambda": self.gamma_lambda
+                        },
+                        var_vals={
+                            "g": connect_snippet.weight, 
+                            "DeltaG": 0.0,
+                            "RLTrace": 0.0,
+                        },
+                        pre_var_vals={"ZFilter": 0.0},
+                        post_neuron_var_refs={
+                            "E_post": "E", 
+                            "ValReg_post": "ValReg",
+                            "F_post": post_var_name})
             else:
-                feedback_model = output_random_feedback_model #output_adaptative_random_feedback_model
+                feedback_model = output_adaptive_feedback_learning_model
                 compile_state.feedback_connections.append(conn)
-            # wum = WeightUpdateModel(
-            #     model=feedback_model,
-            #     param_vals={"Alpha": alpha/10},
-            #     var_vals={"g": connect_snippet.weight, "DeltaG": 0.0},
-            #     pre_var_vals={"ZFilter": 0.0},
-            #     post_neuron_var_refs={"E_post": post_var_name})
-
+                post_var_name = "E"
+                wum = WeightUpdateModel(
+                    model=feedback_model,
+                    param_vals={"Alpha": alpha},
+                    var_vals={"g": connect_snippet.weight, "DeltaG": 0.0},
+                    pre_var_vals={"ZFilter": 0.0},
+                    post_neuron_var_refs={"E_post": post_var_name})
+            """
             wum = WeightUpdateModel(
-                model=feedback_model,
-                param_vals={"g": connect_snippet.weight},
-                post_neuron_var_refs={"E_post": post_var_name}
-            )
+                   model=feedback_model,
+                   var_vals={"g": connect_snippet.weight},
+                   post_neuron_var_refs={"E_post": post_var_name}
+            )"""
 
         elif isinstance(target_neuron, LeakyIntegrateFire):
             wum = WeightUpdateModel(
@@ -852,7 +988,7 @@ class EPropCompiler(Compiler):
                         "AlphaFAv": np.exp(-self.dt / self.tau_reg),
                         "Vthresh_post": target_neuron.v_thresh,
                         "Beta_post": target_neuron.beta,
-                        "GammaLambda": self.gamma_lambda
+                        "Lambda": self.td_lambda
                     },
                     var_vals={"g": connect_snippet.weight,
                               "eFiltered": 0.0,
@@ -874,7 +1010,7 @@ class EPropCompiler(Compiler):
         elif target_neuron.readout is not None:
 
             if self.gamma_lambda is not None:
-                if is_policy_head:
+                if target_pop in self.policy_heads:
                     # --- TD(λ) rule for policy head ---
                     model = (output_policy_learning_model
                             if self.feedback_type == "symmetric"
@@ -884,7 +1020,7 @@ class EPropCompiler(Compiler):
                         model=model,
                         param_vals={
                             "Alpha": alpha,
-                            "GammaLambda": self.gamma_lambda
+                            "Lambda": self.td_lambda
                         },
                         var_vals={
                             "g": connect_snippet.weight,
@@ -903,6 +1039,7 @@ class EPropCompiler(Compiler):
                     wum = WeightUpdateModel(
                         model=model,
                         param_vals={
+                            "RetE": 0.0,
                             "Alpha": alpha,
                             "GammaLambda": self.gamma_lambda
                         },
@@ -931,9 +1068,8 @@ class EPropCompiler(Compiler):
 
         # Add weights to list of checkpoint vars
         compile_state.checkpoint_connection_vars.append((conn, "g"))
- 
-        # Add connection to list of connections to optimise
         if not conn.is_feedback:
+            # Add connection to list of connections to optimise
             compile_state.weight_optimiser_connections.append(conn)
 
         # Return weight update model
@@ -949,7 +1085,9 @@ class EPropCompiler(Compiler):
         # Correctly target feedback
         for c in compile_state.feedback_connections:
             connection_populations[c].pre_target_var = "ISynFeedback"
-        if self.gamma_lambda:
+        if self.gamma_lambda is not None:
+            for c in compile_state.tde_transport_connections:
+                connection_populations[c].pre_target_var = "ISynTdE"
             for c in compile_state.policy_feedback_connections:
                 connection_populations[c].pre_target_var = "ISynPolicyGradient"
             for c in compile_state.policy_regularisation_connections:
@@ -987,6 +1125,7 @@ class EPropCompiler(Compiler):
                     synapse_group=genn_pop,
                     genn_model=genn_model,
                     compiler=self,
+                    l1_strength=self.dale_rewiring_l1_strength,
                     sign=dale_sign,
                     weight_var_ref=weight_var_ref
                 )
@@ -1025,6 +1164,8 @@ class EPropCompiler(Compiler):
         # If Deep-R and L1 regularisation are required, add callback
         if deep_r_required and self.deep_r_l1_strength > 0.0:
             base_train_callbacks.append(CustomUpdateOnBatchEnd("DeepRL1"))
+        if dale_rewiring_required and self.dale_rewiring_l1_strength > 0.0:
+            base_train_callbacks.append(CustomUpdateOnBatchEnd("DaleRL1"))
 
         if len(optimiser_custom_updates) > 0:
             if self.full_batch_size > 1:
@@ -1056,6 +1197,8 @@ class EPropCompiler(Compiler):
             base_validate_callbacks.append(CustomUpdateOnTimestepEnd("Softmax3"))
         
         if dale_rewiring_required:
+            base_train_callbacks.append(CustomUpdateOnEpochBegin("DaleInit",
+                                                        lambda e: e == 0))
             base_train_callbacks.append(CustomUpdateOnBatchEnd("DalePrune"))
             base_train_callbacks.append(CustomUpdateOnBatchEnd("DaleRewire"))
         
