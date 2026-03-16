@@ -373,21 +373,21 @@ CONNECTIVITY_TYPE = "toroidal"
 WINDOW_EPISODES = 100
 BOARD_SIZE = 2
 
-VISIBLE_RANGE = 15
+VISIBLE_RANGE = 5
 SCALE = 1
 
 WAIT_INC = 30
 
 INPUT_C = 3
 
-INPUT_SHAPE = (60, 60, INPUT_C)
+INPUT_SHAPE = (15, 15, INPUT_C)
 # DOWNSAMPLE_SHAPE = (100, 100, INPUT_C)
-HIDDEN_E_SHAPE = (60, 60, INPUT_C)
-HIDDEN_I_SHAPE = (45, 45, INPUT_C)
+HIDDEN_E_SHAPE = (20, 20, INPUT_C)
+HIDDEN_I_SHAPE = (15, 15, INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
 NUM_HIDDEN_E = np.prod(HIDDEN_E_SHAPE)
 NUM_HIDDEN_I = np.prod(HIDDEN_I_SHAPE)
-GAUSSAIN_POLICY = True
+GAUSSAIN_TRACE_POLICY = True
 
 SIGMA_IN = 0.1
 SIGMA_H = 0.05
@@ -441,7 +441,7 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 
 
 NUM_OUTPUT = 4
-if GAUSSAIN_POLICY:
+if GAUSSAIN_TRACE_POLICY:
     NUM_OUTPUT = 4
 
 CONN_P = {
@@ -487,7 +487,7 @@ expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
 
 TRAIN = True
 
-CHECKPOINT_BOARD_SIZE = "7_mid_completion"
+CHECKPOINT_BOARD_SIZE = None # "5_mid_completion"
 if CHECKPOINT_BOARD_SIZE is not None:
     CONNECTIVITY_TYPE = "fixed"
 KERNEL_PROFILING = False
@@ -773,12 +773,12 @@ def build_compiled_network(connectivity_type="fixed"):
         example_timesteps=1,
         losses={
             policy: "sparse_categorical_crossentropy" 
-                if not GAUSSAIN_POLICY else 
+                if not GAUSSAIN_TRACE_POLICY else 
                 "mean_square_error",
             policy_log_s: "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=Adam(1e-5),
+        optimiser=Adam(1e-4),
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
@@ -791,8 +791,8 @@ def build_compiled_network(connectivity_type="fixed"):
         entropy_coeff_min=entropy_coeff_min,
         dale_rewiring_l1_strength=dale_l1_reg,
         policy_heads={
-            policy: PolicyTypes.CATEGORICAL if not GAUSSAIN_POLICY else PolicyTypes.GAUSSIAN, 
-            policy_log_s: PolicyTypes.GAUSSIAN_LOG_SIGMA
+            policy: PolicyTypes.CATEGORICAL if not GAUSSAIN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
+            policy_log_s: PolicyTypes.GAUSSIAN_TRACE
         },
         value_head=value
     )
@@ -1157,7 +1157,7 @@ def train_snake_agent_with_ipc(episodes=100000,
         train_callback_list.on_epoch_begin(0)
         train_callback_list.on_batch_begin(0)
 
-        action_trace = np.zeros(NUM_OUTPUT)
+        action = np.zeros(NUM_OUTPUT)
         for ep in range(episodes):
             if env.won:
                 compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
@@ -1227,32 +1227,14 @@ def train_snake_agent_with_ipc(episodes=100000,
                 action_label = 0
                 current_values.append(compiled_net.get_readout(value)[0][0])
                 current_reward_traces.append(reward_trace)
-                
+        
                 if env.wait_count == 0:
-                    policy_output = compiled_net.get_readout(policy).flatten()
-                    if GAUSSAIN_POLICY:
-                        policy_log_s_output = compiled_net.get_readout(policy_log_s).flatten() 
-                        action = policy_output + policy_log_s_output * np.random.randn(NUM_OUTPUT)
+                    if GAUSSAIN_TRACE_POLICY:
+                        action = compiled_net.get_readout(policy).flatten()
                         probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
-                        # action_label = np.random.choice(4, p=probs)
-                        action_label = np.argmax(action)
-
-                        compiled_net.neuron_populations[policy].vars["Action"].view[:] = action
-                        compiled_net.neuron_populations[policy].vars["Action"].push_to_device()
-                        compiled_net.neuron_populations[policy_log_s].vars["Action"].view[:] = action
-                        compiled_net.neuron_populations[policy_log_s].vars["Action"].push_to_device()
-                        compiled_net.neuron_populations[policy].vars["LogSigma"].view[:] = policy_log_s_output
-                        compiled_net.neuron_populations[policy].vars["LogSigma"].push_to_device()
-                        compiled_net.neuron_populations[policy_log_s].vars["Mu"].view[:] = policy_output
-                        compiled_net.neuron_populations[policy_log_s].vars["Mu"].push_to_device()
-                        compiled_net.losses[policy].set_var(
-                            compiled_net.neuron_populations[policy], "actionTaken", 1.0
-                        )
-                        compiled_net.losses[policy_log_s].set_var(
-                            compiled_net.neuron_populations[policy_log_s], "actionTaken", 1.0
-                        )
+                        action_label = np.random.choice(4, p=probs)
                     else:
-                        probs = policy_output
+                        probs = compiled_net.get_readout(policy).flatten()
                         if abs(sum(probs) - 1.0) > 0.0001:
                             raise ValueError(f"BAD PROBS {probs}")
                         action_label = np.random.choice(4, p=probs)
@@ -1271,7 +1253,7 @@ def train_snake_agent_with_ipc(episodes=100000,
 
                 obs, reward, done = env.step(action_label)
                 total_reward += reward
-                reward_trace = reward_trace* 0.9261 + reward * 1.0
+                reward_trace = reward_trace * 0.9261 + reward * 1.0
                 if reward != 0:
                     compiled_net.losses[value].set_var(
                         compiled_net.neuron_populations[value], "reward", reward * 1.0
@@ -1376,15 +1358,16 @@ def train_snake_agent_with_ipc(episodes=100000,
             compiled_net.set_input({input_pop: [spikes]})
             for i in range(WAIT_INC):
                 if i % WAIT_INC == 0:
-                    policy_output = compiled_net.get_readout(policy).flatten()
-                    if GAUSSAIN_POLICY:
-                        policy_log_s_output = compiled_net.get_readout(policy_log_s).flatten() 
-                        action = policy_output + policy_log_s_output * np.random.randn(NUM_OUTPUT)
+                    if GAUSSAIN_TRACE_POLICY:
+                        action = compiled_net.get_readout(policy).flatten()
+                        probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
+                    else:
+                        probs = compiled_net.get_readout(policy).flatten()
                     current_probs.append(probs)
                 current_values.append(compiled_net.get_readout(value)[0][0])
                 current_reward_traces.append(reward_trace)
                 
-                reward_trace = reward_trace*0.9261
+                reward_trace = reward_trace * 0.9261
                 compiled_net.step_time(train_callback_list)
                 
                 # compiled_net.genn_model.custom_update("GradientLearn")
@@ -1417,11 +1400,10 @@ def train_snake_agent_with_ipc(episodes=100000,
                 # td_error_trace = 0
                 """
 
-            # train_callback_list.on_batch_end(0, all_metrics)
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
-                for c in custom_updates:
-                    o.set_step(c, opt_updt := opt_updt+1)
+               for c in custom_updates:
+                   o.set_step(c, opt_updt := opt_updt+1)
             if dale_l1_reg > 0:
                 compiled_net.genn_model.custom_update("DaleRL1")
 

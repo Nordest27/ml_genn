@@ -52,8 +52,7 @@ default_params = {
 
 class PolicyTypes(Enum):
     CATEGORICAL = "categorical"
-    GAUSSIAN = "gaussian"
-    GAUSSIAN_LOG_SIGMA = "gaussian_log_sigma"
+    GAUSSIAN_TRACE = "gaussian_trace"
 
 def _has_connection_to_output(pop):
     # Loop through population's outgoing connections
@@ -338,7 +337,7 @@ eprop_alif_td_model = {
     DeltaG += fireReg;
 
     eFiltered = (eFiltered * Alpha) + e;
-    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 1.0 * VE_post);
+    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
     """
 }
 
@@ -674,55 +673,22 @@ class EPropCompiler(Compiler):
                         tdError = 0;
                         """
                     )
-                elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN: 
+                elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN_TRACE: 
                     model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
-                    
+
                     model_copy.add_var("TdE", "scalar", 0.0)
-                    model_copy.add_var("Action", "scalar", 0.0)
-                    model_copy.add_var("LogSigma", "scalar", 0.0)
+                    model_copy.add_var("LogSigma", "scalar", np.log(0.1))
                     model_copy.add_var("PG", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""         
                         TdE = ISynTdE;
                         const scalar mu = {model_copy.output_var_name};
+
                         const scalar sigma = exp(LogSigma);
+                        {model_copy.output_var_name} += sigma * gennrand_normal();
 
-                        if (actionTaken != 0) {{
-                            PG = (Action - mu) / (sigma * sigma);
-                        }}
-                        else {{
-                            PG = 0;
-                        }}
-
-                        actionTaken = 0;
+                        PG = 0*({model_copy.output_var_name} - mu) / (sigma * sigma);
                     """)
-                elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN_LOG_SIGMA:
-                    model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
-
-                    model_copy.add_var("TdE", "scalar", 0.0)
-                    model_copy.add_var("Mu", "scalar", 0.0)
-                    model_copy.add_var("Action", "scalar", 0.0)
-                    model_copy.add_var("PG", "scalar", 0.0)
-
-                    model_copy.append_sim_code(
-                        f"""
-                        TdE = ISynTdE;
-
-                        const scalar Sigma = exp({model_copy.output_var_name});
-
-                        if (actionTaken != 0) {{
-                            const scalar diff = Action - Mu;
-                            const scalar var = Sigma * Sigma;
-
-                            PG = (diff * diff / var) - 1.0;
-                        }}
-                        else {{
-                            PG = 0;
-                        }}
-
-                        actionTaken = 0;
-                        """
-                    )
                 else:
                     model_copy.add_var("ValReg", "scalar", 0.0)
                     model_copy.add_var("PrevVal", "scalar", 0.0)
