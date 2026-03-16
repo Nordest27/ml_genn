@@ -293,8 +293,9 @@ eprop_alif_td_model = {
         ("PG_post", "scalar"),
         ("VE_post", "scalar"),
         ("PR_post", "scalar"),
-        ("VR_post", "scalar"),
-        ("TdE_post", "scalar")
+        ("VR_post", "scalar"),  
+        ("TdE_post", "scalar"),
+        ("PertEps_post", "scalar")
     ],
 
     "pre_spike_code": """
@@ -337,7 +338,7 @@ eprop_alif_td_model = {
     DeltaG += fireReg;
 
     eFiltered = (eFiltered * Alpha) + e;
-    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
+    RLTrace = Lambda * RLTrace + eFiltered * ((PG_post + PertEps_post) - 0.1 * VE_post);
     """
 }
 
@@ -969,7 +970,8 @@ class EPropCompiler(Compiler):
                         "V_post": "V", "A_post": "A",
                         "E_post": "E", "PG_post": "PG",
                         "VE_post": "VE", "TdE_post": "TdE",
-                        "PR_post": "PR", "VR_post": "VR"
+                        "PR_post": "PR", "VR_post": "VR",
+                        "PertEps_post": "PertEps"
                     })
         # Otherwise, if target neuron is readout, create 
         # weight update model with simple output learning rule

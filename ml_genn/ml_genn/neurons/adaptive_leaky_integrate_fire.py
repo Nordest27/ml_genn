@@ -45,13 +45,15 @@ class AdaptiveLeakyIntegrateFire(Neuron):
     tau_mem = ValueDescriptor(("Alpha", lambda val, dt: np.exp(-dt / val)))
     tau_refrac = ValueDescriptor("TauRefrac")
     tau_adapt = ValueDescriptor(("Rho", lambda val, dt: np.exp(-dt / val)))
-    
+    perturbation_eps = ValueDescriptor("PertEps")
+
     @network_default_params
     def __init__(self, v_thresh: InitValue = 1.0, v_reset: InitValue = 0.0,
                  v: InitValue = 0.0, a: InitValue = 0.0, beta: InitValue = 0.0174,
                  tau_mem: InitValue = 20.0, tau_refrac: InitValue = None,
                  tau_adapt: InitValue = 2000.0, relative_reset: bool = True,
-                 integrate_during_refrac: bool = True, readout=None):
+                 integrate_during_refrac: bool = True, perturbation_eps_std: float = 0.0,
+                 readout=None):
         super(AdaptiveLeakyIntegrateFire, self).__init__(readout)
 
         self.v_thresh = v_thresh
@@ -64,12 +66,14 @@ class AdaptiveLeakyIntegrateFire(Neuron):
         self.tau_adapt = tau_adapt
         self.relative_reset = relative_reset
         self.integrate_during_refrac = integrate_during_refrac
+        self.perturbation_eps_std = perturbation_eps_std
+        self.perturbation_eps = 0.0
 
     def get_model(self, population: Population,
                   dt: float, batch_size: int) -> NeuronModel:
         # Build basic model
         genn_model = {
-            "vars": [("V", "scalar"), ("A", "scalar")],
+            "vars": [("V", "scalar"), ("A", "scalar"), ("PertEps", "scalar")],
             "params": [("Vthresh", "scalar"), ("Vreset", "scalar"),
                        ("Alpha", "scalar"), ("Beta", "scalar"), 
                        ("Rho", "scalar")],
@@ -100,23 +104,25 @@ class AdaptiveLeakyIntegrateFire(Neuron):
             # we should integrate during refractory period
             if self.integrate_during_refrac:
                 genn_model["sim_code"] =\
-                    """
-                    V = (Alpha * V) + Isyn;
+                    f"""
+                    PertEps = {self.perturbation_eps_std} * gennrand_normal();
+                    V = (Alpha * V) + Isyn + PertEps;
                     A *= Rho;
-                    if (RefracTime > 0.0) {
+                    if (RefracTime > 0.0) {{
                         RefracTime -= dt;
-                    }
+                    }}
                     """
             else:
                 genn_model["sim_code"] =\
-                    """
+                    f"""
                     A *= Rho;
-                    if (RefracTime > 0.0) {
+                    if (RefracTime > 0.0) {{
                         RefracTime -= dt;
-                    }
-                    else {
-                        V = (Alpha * V) + Isyn;
-                    }
+                    }}
+                    else {{
+                        PertEps = {self.perturbation_eps_std} * gennrand_normal();
+                        V = (Alpha * V) + Isyn + PertEps;
+                    }}
                     """
 
             # Add refractory period initialisation to reset code
@@ -131,12 +137,14 @@ class AdaptiveLeakyIntegrateFire(Neuron):
         # Otherwise, build non-refractory sim-code
         else:
             genn_model["sim_code"] =\
-                """
-                V = (Alpha * V) + Isyn;
+                f"""
+                PertEps = {self.perturbation_eps_std} * gennrand_normal();
+                V = (Alpha * V) + Isyn + PertEps;
                 A *= Rho;
                 """
 
         # Return model
         var_vals = {} if self.tau_refrac is None else {"RefracTime": 0.0}
+        var_vals["PertEps"] = 0.0
         return NeuronModel.from_val_descriptors(genn_model, "V", self, dt,
                                                 var_vals=var_vals)

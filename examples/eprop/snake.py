@@ -380,14 +380,14 @@ WAIT_INC = 30
 
 INPUT_C = 3
 
-INPUT_SHAPE = (15, 15, INPUT_C)
+INPUT_SHAPE = (10, 10, INPUT_C)
 # DOWNSAMPLE_SHAPE = (100, 100, INPUT_C)
 HIDDEN_E_SHAPE = (20, 20, INPUT_C)
 HIDDEN_I_SHAPE = (15, 15, INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
 NUM_HIDDEN_E = np.prod(HIDDEN_E_SHAPE)
 NUM_HIDDEN_I = np.prod(HIDDEN_I_SHAPE)
-GAUSSAIN_TRACE_POLICY = True
+GAUSSAIN_TRACE_POLICY = False
 
 SIGMA_IN = 0.1
 SIGMA_H = 0.05
@@ -600,7 +600,8 @@ def build_compiled_network(connectivity_type="fixed"):
                 v_thresh=0.61,
                 tau_mem=10.0,
                 tau_refrac=3.0,
-                tau_adapt=300
+                tau_adapt=300,
+                perturbation_eps_std=0.01
             ),
             HIDDEN_E_SHAPE
         )
@@ -610,7 +611,8 @@ def build_compiled_network(connectivity_type="fixed"):
                 v_thresh=0.61,
                 tau_mem=10.0,
                 tau_refrac=3.0,
-                tau_adapt=300
+                tau_adapt=300,
+                perturbation_eps_std=0.01
             ),
             HIDDEN_I_SHAPE
         )
@@ -1271,10 +1273,10 @@ def train_snake_agent_with_ipc(episodes=100000,
                         current_run.append(frame_img.copy())
                     
                     # train_callback_list.on_batch_end(0, all_metrics)
-                    # compiled_net.genn_model.custom_update("GradientLearn")
-                    # for o, custom_updates in compiled_net.optimisers:
-                    #     for c in custom_updates:
-                    #         o.set_step(c, opt_updt := opt_updt+1)
+                    compiled_net.genn_model.custom_update("GradientLearn")
+                    for o, custom_updates in compiled_net.optimisers:
+                        for c in custom_updates:
+                            o.set_step(c, opt_updt := opt_updt+1)
                     
                     """
                     indices = obs.nonzero()[0]
