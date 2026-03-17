@@ -387,7 +387,7 @@ HIDDEN_I_SHAPE = (15, 15, INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
 NUM_HIDDEN_E = np.prod(HIDDEN_E_SHAPE)
 NUM_HIDDEN_I = np.prod(HIDDEN_I_SHAPE)
-GAUSSAIN_TRACE_POLICY = False
+GAUSSIAN_TRACE_POLICY = False
 
 SIGMA_IN = 0.1
 SIGMA_H = 0.05
@@ -441,7 +441,7 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 
 
 NUM_OUTPUT = 4
-if GAUSSAIN_TRACE_POLICY:
+if GAUSSIAN_TRACE_POLICY:
     NUM_OUTPUT = 4
 
 CONN_P = {
@@ -497,9 +497,9 @@ gamma = 0.5** (1/WAIT_INC)
 td_lambda = 0.8 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-3
+entropy_coeff = 1e-7
 entropy_decay = 0.99999 ** (1/WAIT_INC)
-entropy_coeff_min = 1e-5
+entropy_coeff_min = 1e-10
 
 dale_l1_reg = 0.0
 
@@ -775,7 +775,7 @@ def build_compiled_network(connectivity_type="fixed"):
         example_timesteps=1,
         losses={
             policy: "sparse_categorical_crossentropy" 
-                if not GAUSSAIN_TRACE_POLICY else 
+                if not GAUSSIAN_TRACE_POLICY else 
                 "mean_square_error",
             policy_log_s: "mean_square_error",
             value: "mean_square_error"
@@ -793,7 +793,7 @@ def build_compiled_network(connectivity_type="fixed"):
         entropy_coeff_min=entropy_coeff_min,
         dale_rewiring_l1_strength=dale_l1_reg,
         policy_heads={
-            policy: PolicyTypes.CATEGORICAL if not GAUSSAIN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
+            policy: PolicyTypes.CATEGORICAL if not GAUSSIAN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
             policy_log_s: PolicyTypes.GAUSSIAN_TRACE
         },
         value_head=value
@@ -1231,7 +1231,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                 current_reward_traces.append(reward_trace)
         
                 if env.wait_count == 0:
-                    if GAUSSAIN_TRACE_POLICY:
+                    if GAUSSIAN_TRACE_POLICY:
                         action = compiled_net.get_readout(policy).flatten()
                         probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
                         action_label = np.random.choice(4, p=probs)
@@ -1272,7 +1272,6 @@ def train_snake_agent_with_ipc(episodes=100000,
                     else:
                         current_run.append(frame_img.copy())
                     
-                    # train_callback_list.on_batch_end(0, all_metrics)
                     compiled_net.genn_model.custom_update("GradientLearn")
                     for o, custom_updates in compiled_net.optimisers:
                         for c in custom_updates:
@@ -1360,7 +1359,7 @@ def train_snake_agent_with_ipc(episodes=100000,
             compiled_net.set_input({input_pop: [spikes]})
             for i in range(WAIT_INC):
                 if i % WAIT_INC == 0:
-                    if GAUSSAIN_TRACE_POLICY:
+                    if GAUSSIAN_TRACE_POLICY:
                         action = compiled_net.get_readout(policy).flatten()
                         probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
                     else:

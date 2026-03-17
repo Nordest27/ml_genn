@@ -293,9 +293,8 @@ eprop_alif_td_model = {
         ("PG_post", "scalar"),
         ("VE_post", "scalar"),
         ("PR_post", "scalar"),
-        ("VR_post", "scalar"),  
-        ("TdE_post", "scalar"),
-        ("PertEps_post", "scalar")
+        ("VR_post", "scalar"),
+        ("TdE_post", "scalar")
     ],
 
     "pre_spike_code": """
@@ -338,7 +337,7 @@ eprop_alif_td_model = {
     DeltaG += fireReg;
 
     eFiltered = (eFiltered * Alpha) + e;
-    RLTrace = Lambda * RLTrace + eFiltered * ((PG_post + PertEps_post) - 0.1 * VE_post);
+    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
     """
 }
 
@@ -659,7 +658,7 @@ class EPropCompiler(Compiler):
                         const scalar entropyGrad = p * (logp + 1.0);
 
                         E = entropyCoeff * entropyGrad;
-                        entropyCoeff = 0*fmax(
+                        entropyCoeff = fmax(
                             {self.entropy_coeff_decay} * entropyCoeff,
                             {self.entropy_coeff_min}
                         );
@@ -688,7 +687,7 @@ class EPropCompiler(Compiler):
                         const scalar sigma = exp(LogSigma);
                         {model_copy.output_var_name} += sigma * gennrand_normal();
 
-                        PG = 0*({model_copy.output_var_name} - mu) / (sigma * sigma);
+                        PG = ({model_copy.output_var_name} - mu) / (sigma * sigma);
                     """)
                 else:
                     model_copy.add_var("ValReg", "scalar", 0.0)
@@ -970,8 +969,7 @@ class EPropCompiler(Compiler):
                         "V_post": "V", "A_post": "A",
                         "E_post": "E", "PG_post": "PG",
                         "VE_post": "VE", "TdE_post": "TdE",
-                        "PR_post": "PR", "VR_post": "VR",
-                        "PertEps_post": "PertEps"
+                        "PR_post": "PR", "VR_post": "VR"
                     })
         # Otherwise, if target neuron is readout, create 
         # weight update model with simple output learning rule
