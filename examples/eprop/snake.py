@@ -133,8 +133,7 @@ class SnakeEnv:
         # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
         
-        # reward = - 90/self.size * ((self.steps_since_last_apple+1) % self.size == 0)
-        reward = -5
+        reward = - 90/self.size * ((self.steps_since_last_apple+1) % self.size == 0)
 
         if (self.direction == 'up' and new_dir == 'down') or \
            (self.direction == 'down' and new_dir == 'up') or \
@@ -487,7 +486,7 @@ expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
 
 TRAIN = True
 
-CHECKPOINT_BOARD_SIZE = None # "5_mid_completion"
+CHECKPOINT_BOARD_SIZE = None # "8_mid_completion"
 if CHECKPOINT_BOARD_SIZE is not None:
     CONNECTIVITY_TYPE = "fixed"
 KERNEL_PROFILING = False
@@ -497,9 +496,9 @@ gamma = 0.5** (1/WAIT_INC)
 td_lambda = 0.8 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-7
+entropy_coeff = 0.0 #1e-4
 entropy_decay = 0.99999 ** (1/WAIT_INC)
-entropy_coeff_min = 1e-10
+entropy_coeff_min = 0.0 #1e-6
 
 dale_l1_reg = 0.0
 
@@ -1263,7 +1262,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                     
                 if env.wait_count == env.wait_inc:
                     # capture frame scaled down for IPC
-                    frame_img = env.img(scale=8)  # smaller scale to reduce size
+                    frame_img = env.img(scale=25)  # smaller scale to reduce size
                     # frame_img = (obs*255).astype(int)
                     # frame_img = obs
                     if compress_frames:

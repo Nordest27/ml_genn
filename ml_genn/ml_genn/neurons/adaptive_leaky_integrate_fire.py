@@ -106,7 +106,7 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 genn_model["sim_code"] =\
                     f"""
                     if (gennrand_uniform() < {self.perturbation_eps_std})
-                        PertEps = gennrand_normal();
+                        PertEps = max(min(Vthresh, gennrand_normal()), -Vthresh);
                     else
                         PertEps = 0;
                     V = (Alpha * V) + Isyn + PertEps;
@@ -124,7 +124,7 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                     }}
                     else {{
                         if (gennrand_uniform() < {self.perturbation_eps_std})
-                            PertEps = gennrand_normal();                    
+                            PertEps = max(min(Vthresh, gennrand_normal()), -Vthresh);                    
                         else
                             PertEps = 0;
                         V = (Alpha * V) + Isyn + PertEps;
@@ -145,7 +145,7 @@ class AdaptiveLeakyIntegrateFire(Neuron):
             genn_model["sim_code"] =\
                 f"""
                 if (gennrand_uniform() < {self.perturbation_eps_std})
-                    PertEps = gennrand_normaL();
+                    PertEps = max(min(Vthresh, gennrand_normal()), -Vthresh);
                 else
                     PertEps = 0;
                 V = (Alpha * V) + Isyn + PertEps;

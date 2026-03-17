@@ -677,17 +677,27 @@ class EPropCompiler(Compiler):
                     model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
 
                     model_copy.add_var("TdE", "scalar", 0.0)
-                    model_copy.add_var("LogSigma", "scalar", np.log(0.1))
+                    model_copy.add_var("LogSigma", "scalar", np.log(1.0))
                     model_copy.add_var("PG", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""         
                         TdE = ISynTdE;
                         const scalar mu = {model_copy.output_var_name};
 
-                        const scalar sigma = exp(LogSigma);
-                        {model_copy.output_var_name} += sigma * gennrand_normal();
-
-                        PG = ({model_copy.output_var_name} - mu) / (sigma * sigma);
+                        if (gennrand_uniform() < 1.0/100.0) {{
+                            const scalar sigma = exp(LogSigma);
+                            fmax(
+                                fmin(
+                                    {model_copy.output_var_name} += sigma * gennrand_normal(), 5.0
+                                ), -5.0
+                            );
+                            PG = ({model_copy.output_var_name} - mu) / (sigma * sigma);
+                        }}
+                        else {{
+                            PG = 0;
+                        }}
+                        
+                        
                     """)
                 else:
                     model_copy.add_var("ValReg", "scalar", 0.0)
