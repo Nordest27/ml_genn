@@ -46,7 +46,8 @@ class Connection:
                  max_delay_steps: Optional[int] = None,
                  add_to_model: bool = True,
                  feedback_name: Optional[str] = None,
-                 exc_inh_sign: Optional[int] = None):
+                 exc_inh_sign: Optional[int] = None, 
+                 target_var: Optional[str] = None):
         # Store weak references to source and target in class
         self._source = ref(source)
         self._target = ref(target)
@@ -62,6 +63,11 @@ class Connection:
         # Generate unique name if required
         self.name = (f"Conn_{source.name}_{target.name}" if name is None
                      else name)
+        
+        if target_var is not None:
+            self.post_target_var = target_var
+            self.name += f"_to_{target_var}"
+
         # Store feedback flag
         self.is_feedback = feedback_name is not None
         if self.is_feedback:

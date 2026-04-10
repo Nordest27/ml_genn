@@ -45,11 +45,17 @@ class Adam(Optimiser):
     epsilon = ConstantValueDescriptor()
 
     def __init__(self, alpha: float = 0.001, beta1 : float = 0.9,
-                 beta2: float = 0.999, epsilon: float = 1e-8):
+                 beta2: float = 0.999, epsilon: float = 1e-8, 
+                 clamp_var: Optional[Tuple[float, float]] = None,
+                 clamp_grad: Optional[Tuple[float, float]] = None, 
+                 soft_grad_clip: Optional[float] = None):
         self.alpha = alpha
         self.beta1 = beta1
         self.beta2 = beta2
         self.epsilon = epsilon
+        self.clamp_var = clamp_var
+        self.clamp_grad = clamp_grad
+        self.soft_grad_clip = soft_grad_clip
 
     def set_step(self, genn_cu, step):
         assert step >= 0
@@ -61,9 +67,33 @@ class Adam(Optimiser):
         genn_cu.set_dynamic_param_value("MomentScale2", moment_scale_2)
 
     def get_model(self, gradient_ref, var_ref, zero_gradient: bool,
-                  clamp_var: Optional[Tuple[float, float]] = None) -> CustomUpdateModel:
+                  clamp_var: Optional[Tuple[float, float]] = None,
+                  clamp_grad: Optional[Tuple[float, float]] = None,
+                  soft_grad_clip: Optional[float] = None) -> CustomUpdateModel:
+        
+        if clamp_var is None:
+            clamp_var = self.clamp_var
+        if clamp_grad is None:
+            clamp_grad = self.clamp_grad
+        if soft_grad_clip is None:
+            soft_grad_clip = self.soft_grad_clip
+
+        _genn_model = deepcopy(genn_model)
+         
+        if clamp_grad is not None:
+            _genn_model["update_code"] = f"""
+            Gradient = fmax({clamp_grad[0]}, fmin({clamp_grad[1]}, Gradient));
+            {_genn_model["update_code"]}
+            """
+        
+        if soft_grad_clip is not None:
+            _genn_model["update_code"] = f"""
+            Gradient = Gradient / (1.0 + fabs(Gradient) * {1.0/soft_grad_clip});
+            {_genn_model["update_code"]}
+            """
+
         model = CustomUpdateModel(
-            deepcopy(genn_model),
+            _genn_model,
             {"Beta1": self.beta1, "Beta2": self.beta2,
              "Epsilon": self.epsilon, "Alpha": self.alpha, 
              "MomentScale1": 0.0, "MomentScale2": 0.0},

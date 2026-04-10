@@ -82,7 +82,10 @@ class CompileState:
         self._tau_adapt = None
         self.feedback_connections = []
         
+        self.sigma_eps_connections = []
+
         self.tde_transport_connections = []
+        self.pert_eps_transport_connections = []
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
         self.value_regularisation_connections = []
@@ -232,7 +235,7 @@ eprop_alif_model = {
     const scalar psiBetaEpsilonA = Psi * Beta_post * epsA;
 
     // Calculate e and episilonA
-    const scalar e = psiZFilter  - psiBetaEpsilonA;
+    const scalar e = psiZFilter - psiBetaEpsilonA;
     epsilonA = psiZFilter + ((Rho * epsA) - psiBetaEpsilonA);
 
     // Calculate filtered version of eligibility trace
@@ -275,26 +278,31 @@ del output_adaptive_feedback_learning_model["pre_spike_syn_code"]
 eprop_alif_td_model = {
     "params": [("CReg", "scalar"), ("Alpha", "scalar"), ("Rho", "scalar"),
                ("FTarget", "scalar"),("AlphaFAv", "scalar"),
-               ("Vthresh_post", "scalar"), ("Beta_post", "scalar"),
+               ("Vthresh_post", "scalar"),
                ("Lambda", "scalar")],
     "vars": [("g", "scalar", VarAccess.READ_ONLY),
              ("eFiltered", "scalar"),
              ("epsilonA", "scalar"),
              ("DeltaG", "scalar"),
-             # extra per-synapse RL trace Fγ(·)
-             ("RLTrace", "scalar")],
+             ("RLTrace", "scalar"),
+             ("RLEpsTrace", "scalar"),],
     "pre_vars": [("ZFilter", "scalar")],
     "post_vars": [("Psi", "scalar"), ("FAvg", "scalar")],
     "post_neuron_var_refs": [
         ("RefracTime_post", "scalar"), 
         ("V_post", "scalar"),
+        ("Beta_post", "scalar"),    
         ("A_post", "scalar"), 
         ("E_post", "scalar"),
         ("PG_post", "scalar"),
         ("VE_post", "scalar"),
         ("PR_post", "scalar"),
         ("VR_post", "scalar"),
-        ("TdE_post", "scalar")
+        ("TdE_post", "scalar"),
+        ("PertEps_post", "scalar"),
+        ("PertEpsTrace_post", "scalar"),
+        ("PGEps_post", "scalar"),
+        ("Noise", "scalar")
     ],
 
     "pre_spike_code": """
@@ -322,7 +330,8 @@ eprop_alif_td_model = {
     """,
 
     "synapse_dynamics_code": """
-    DeltaG += TdE_post * RLTrace + CReg * (0.1*PR_post + 0.01*VR_post) * eFiltered;
+    DeltaG += TdE_post * (RLTrace + RLEpsTrace)
+        + CReg * (PR_post + VR_post) * eFiltered;
     
     // --- Standard ALIF e-prop eligibility update ---
     scalar epsA = epsilonA;
@@ -333,11 +342,22 @@ eprop_alif_td_model = {
     epsilonA = psiZFilter + ((Rho * epsA) - psiBetaEpsilonA);
 
     // Firing-rate regularisation term
-    const scalar fireReg = (FAvg - FTarget) * CReg * e;
-    DeltaG += fireReg;
+    const scalar fireReg = (FAvg - FTarget) * e;
+    DeltaG += CReg * fireReg;
+
+    // Voltage Regularization
+    const scalar VReg = (
+        (fmax(0.0, V_post - (Vthresh_post + (Beta_post * A_post))) +  
+         fmax(0.0, -V_post - (Vthresh_post + (Beta_post * A_post)))
+        ) * e // (ZFilter - epsA)
+    );
+    DeltaG += 0.0*VReg + 0.0*e * Noise;
 
     eFiltered = (eFiltered * Alpha) + e;
-    RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);
+    RLTrace = Lambda * RLTrace + eFiltered * ( 0.0*PG_post + 0.1*VE_post + 0.0*PGEps_post );
+    RLEpsTrace = Lambda * RLEpsTrace + e * PertEpsTrace_post;
+    // RLEpsTrace = Lambda * RLEpsTrace + e * PertEpsTrace_post;
+    // addToPre( PertEpsTrace_post);
     """
 }
 
@@ -677,39 +697,55 @@ class EPropCompiler(Compiler):
                     model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
 
                     model_copy.add_var("TdE", "scalar", 0.0)
-                    model_copy.add_var("LogSigma", "scalar", np.log(1.0))
+                    model_copy.add_var("LogSigma", "scalar", np.log(0.1))
+                    model_copy.add_var("Action", "scalar", 0.0)
+                    model_copy.add_var("SigmaTrace", "scalar", 0.0)
+                    model_copy.add_var("SigmaLR", "scalar", 1e-4)
                     model_copy.add_var("PG", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""         
                         TdE = ISynTdE;
+
                         const scalar mu = {model_copy.output_var_name};
 
-                        if (gennrand_uniform() < 1.0/100.0) {{
-                            const scalar sigma = exp(LogSigma);
-                            fmax(
-                                fmin(
-                                    {model_copy.output_var_name} += sigma * gennrand_normal(), 5.0
-                                ), -5.0
-                            );
-                            PG = ({model_copy.output_var_name} - mu) / (sigma * sigma);
+                        // Learned sigma
+                        const scalar sigma = exp(LogSigma);
+
+                        // Sample noise (IMPORTANT: keep eps explicitly)
+                        const scalar eps = sigma * gennrand_normal();
+
+                        // Apply perturbation (same as before)
+                        if(gennrand_uniform() > 0.0/30.0) {{
+                            {model_copy.output_var_name} += fmax(-1.0, fmin(1.0, eps));
                         }}
-                        else {{
-                            PG = 0;
-                        }}
-                        
-                        
+
+                        // ---- MEAN TRACE (unchanged) ----
+                        PG = PG * Alpha + ({model_copy.output_var_name} - mu) / (sigma * sigma);
+
+                        // ---- NEW: SIGMA TRACE (ALIF-style but WITH trace) ----
+                        // instantaneous gradient
+                        const scalar grad_log_sigma = (eps * eps) / (sigma * sigma) - 1.0;
+
+                        // accumulate trace for sigma (NEW variable needed!)
+                        SigmaTrace = SigmaTrace * Alpha + grad_log_sigma;
+
+                        // update log sigma using TD error and trace
+                        LogSigma += SigmaLR * TdE * SigmaTrace;
                     """)
                 else:
                     model_copy.add_var("ValReg", "scalar", 0.0)
                     model_copy.add_var("PrevVal", "scalar", 0.0)
+                    model_copy.add_var("ValTrace", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""
-                        E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
+                        ValTrace = ValTrace*0.5 + PrevVal*0.5;
+                        E = {model_copy.output_var_name} * {self.gamma} + reward - ValTrace;
+                        // E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
                         // E = tdError;
 
                         ValReg = (
                             0.000 * ({model_copy.output_var_name})
-                            + 0.00 * ({model_copy.output_var_name} - PrevVal)
+                            + 0.1 * ({model_copy.output_var_name} - PrevVal)
                             + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
                         );
                         PrevVal = {model_copy.output_var_name};
@@ -768,17 +804,21 @@ class EPropCompiler(Compiler):
 
             # Add sim-code to calculate error
             if self.gamma_lambda is not None:
+                model_copy.add_additional_input_var("ISynSigmaEps", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynPolicyGradient", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynValueError", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynPolicyRegularisation", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynValueRegularisation", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+                model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
                 
                 model_copy.add_var("PG", "scalar", 0.0)
-                model_copy.add_var("TdE", "scalar", 0.0)
+                # model_copy.add_var("TdE", "scalar", 0.0)
                 model_copy.add_var("VE", "scalar", 0.0)
                 model_copy.add_var("PR", "scalar", 0.0)
                 model_copy.add_var("VR", "scalar", 0.0)
+                model_copy.add_var("PGEps", "scalar", 0.0)
+                model_copy.add_var("Noise", "scalar", 0.0)
                 # Reward-based policy gradient + entropy reg:
                 model_copy.append_sim_code(
                     """
@@ -787,6 +827,8 @@ class EPropCompiler(Compiler):
                     PR = ISynPolicyRegularisation;
                     VR = ISynValueRegularisation;
                     TdE = ISynTdE;
+                    PGEps = ISynPertEps;
+                    Noise = gennrand_uniform() - 0.5;
                     """
                 )
 
@@ -810,6 +852,8 @@ class EPropCompiler(Compiler):
                 raise NotImplementedError(f"E-prop compiler doesn't support "
                                           f"{type(pop.neuron).__name__} "
                                           f"neurons")
+        else:
+            model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
 
         # Build neuron model and return
         return model_copy
@@ -853,6 +897,16 @@ class EPropCompiler(Compiler):
                         var_vals={"g": connect_snippet.weight},
                         post_neuron_var_refs={"E_post": post_var_name}
                     )
+                elif conn.name.endswith("pert_eps_feedback"):
+                    feedback_model = output_random_feedback_model
+                    compile_state.pert_eps_transport_connections.append(conn)
+                    post_var_name = "PertEpsTrace"
+                    wum = WeightUpdateModel(
+                        model=feedback_model,
+                        var_vals={"g": connect_snippet.weight},
+                        post_neuron_var_refs={"E_post": post_var_name}
+                    )
+
                 elif target_pop in self.policy_heads:
                     feedback_model = output_policy_adaptive_feedback_learning_model # output_random_feedback_model
                     if conn.name.endswith("policy_feedback"):
@@ -933,6 +987,7 @@ class EPropCompiler(Compiler):
                                       "V_post": "V", "E_post": "E"})
         # Otherise, if it's ALIF, create weight update model with eProp ALIF
         elif isinstance(target_neuron, AdaptiveLeakyIntegrateFire):
+            compile_state.pert_eps_transport_connections.append(conn)
             # Calculate adaptation variable persistence
             rho = np.exp(-self.dt / compile_state.tau_adapt)
 
@@ -963,7 +1018,6 @@ class EPropCompiler(Compiler):
                         "FTarget": (self.f_target * self.dt) / 1000.0,
                         "AlphaFAv": np.exp(-self.dt / self.tau_reg),
                         "Vthresh_post": target_neuron.v_thresh,
-                        "Beta_post": target_neuron.beta,
                         "Lambda": self.td_lambda
                     },
                     var_vals={"g": connect_snippet.weight,
@@ -971,15 +1025,21 @@ class EPropCompiler(Compiler):
                               "DeltaG": 0.0,
                               "epsilonA": 0.0,
                               "RLTrace": 0.0,
+                              "RLEpsTrace": 0.0,
                     },
                     pre_var_vals={"ZFilter": 0.0},
                     post_var_vals={"Psi": 0.0, "FAvg": 0.0},
                     post_neuron_var_refs={
                         "RefracTime_post": "RefracTime",
+                        "Beta_post": "Beta",
                         "V_post": "V", "A_post": "A",
                         "E_post": "E", "PG_post": "PG",
                         "VE_post": "VE", "TdE_post": "TdE",
-                        "PR_post": "PR", "VR_post": "VR"
+                        "PR_post": "PR", "VR_post": "VR",
+                        "PertEpsTrace_post": "PertEpsTrace", 
+                        "PertEps_post": "PertEps",
+                        "PGEps_post": "PGEps",
+                        "Noise": "Noise"
                     })
         # Otherwise, if target neuron is readout, create 
         # weight update model with simple output learning rule
@@ -1061,9 +1121,15 @@ class EPropCompiler(Compiler):
         # Correctly target feedback
         for c in compile_state.feedback_connections:
             connection_populations[c].pre_target_var = "ISynFeedback"
+
         if self.gamma_lambda is not None:
+            for c in compile_state.sigma_eps_connections:
+                connection_populations[c].post_target_var = "ISynSigmaEps"
+                connection_populations[c].pre_target_var = "ISynPertEps"
             for c in compile_state.tde_transport_connections:
                 connection_populations[c].pre_target_var = "ISynTdE"
+            for c in compile_state.pert_eps_transport_connections:
+                connection_populations[c].pre_target_var = "ISynPertEps"
             for c in compile_state.policy_feedback_connections:
                 connection_populations[c].pre_target_var = "ISynPolicyGradient"
             for c in compile_state.policy_regularisation_connections:

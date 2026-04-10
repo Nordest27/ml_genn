@@ -370,17 +370,17 @@ def expected_toroidal_connections(
 
 CONNECTIVITY_TYPE = "toroidal"
 WINDOW_EPISODES = 100
-BOARD_SIZE = 2
+BOARD_SIZE = 4
 
 VISIBLE_RANGE = 5
-SCALE = 1
+SCALE = 2
 
 WAIT_INC = 30
 
 INPUT_C = 3
 
 INPUT_SHAPE = (10, 10, INPUT_C)
-# DOWNSAMPLE_SHAPE = (100, 100, INPUT_C)
+# DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
 HIDDEN_E_SHAPE = (20, 20, INPUT_C)
 HIDDEN_I_SHAPE = (15, 15, INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
@@ -450,7 +450,7 @@ CONN_P = {
     #"H-H": np.log(NUM_HIDDEN_1+NUM_HIDDEN_2)/(NUM_HIDDEN_1 + NUM_HIDDEN_2),
     "H-P": 0.1,
     "H-V": 0.1,
-    "F": 0.1
+    "F": 0.5
 }
 
 
@@ -486,7 +486,7 @@ expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
 
 TRAIN = True
 
-CHECKPOINT_BOARD_SIZE = None # "8_mid_completion"
+CHECKPOINT_BOARD_SIZE = None # "6"
 if CHECKPOINT_BOARD_SIZE is not None:
     CONNECTIVITY_TYPE = "fixed"
 KERNEL_PROFILING = False
@@ -496,20 +496,19 @@ gamma = 0.5** (1/WAIT_INC)
 td_lambda = 0.8 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 0.0 #1e-4
+entropy_coeff = 0.0*1e-3
 entropy_decay = 0.99999 ** (1/WAIT_INC)
-entropy_coeff_min = 0.0 #1e-6
+entropy_coeff_min = 0.0*1e-7
 
 dale_l1_reg = 0.0
 
-serialiser = Numpy("snake_checkpoints")
+serialiser = Numpy("snake_checkpoints_downsample")
 network = Network(default_params)
 hidden_layers = {}
 
 def make_connectivity(
     connectivity_type,
     src_shape,
-    dst_shape=None,
     desired_fan_in=None,
     fan_in_scale=None,
     p=None,
@@ -581,18 +580,16 @@ def build_compiled_network(connectivity_type="fixed"):
             SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE
         )
 
-        """
-        hidden_layers["downsample"] = Population(
-            AdaptiveLeakyIntegrateFire(
-                v_thresh=0.61,
-                tau_mem=10.0,
-                tau_refrac=3.0,
-                tau_adapt=300,
-                beta=0.0
-            ),
-            DOWNSAMPLE_SHAPE
-        )
-        """
+        # hidden_layers["downsample"] = Population(
+        #     AdaptiveLeakyIntegrateFire(
+        #         v_thresh=0.61,
+        #         tau_mem=10.0,
+        #         tau_refrac=3.0,
+        #         tau_adapt=300,
+        #         beta=0.0
+        #     ),
+        #     DOWNSAMPLE_SHAPE
+        # )
 
         hidden_layers["E"] = Population(
             AdaptiveLeakyIntegrateFire(
@@ -600,7 +597,6 @@ def build_compiled_network(connectivity_type="fixed"):
                 tau_mem=10.0,
                 tau_refrac=3.0,
                 tau_adapt=300,
-                perturbation_eps_std=0.01
             ),
             HIDDEN_E_SHAPE
         )
@@ -611,56 +607,69 @@ def build_compiled_network(connectivity_type="fixed"):
                 tau_mem=10.0,
                 tau_refrac=3.0,
                 tau_adapt=300,
-                perturbation_eps_std=0.01
             ),
             HIDDEN_I_SHAPE
         )
 
+        
+        hidden_layers["policy_field"] = Population(
+            AdaptiveLeakyIntegrateFire(
+                v_thresh=0.61,
+                tau_mem=10.0,
+                tau_refrac=3.0,
+                tau_adapt=300,
+            ),
+            HIDDEN_I_SHAPE
+        )
         policy = Population(
             LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
             NUM_OUTPUT
         )
-        
-        policy_log_s = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
-            NUM_OUTPUT
-        )
 
+
+        hidden_layers["value_field"] = Population(
+            AdaptiveLeakyIntegrateFire(
+                v_thresh=0.61,
+                tau_mem=10.0,
+                tau_refrac=3.0,
+                tau_adapt=300,
+            ),
+            HIDDEN_I_SHAPE
+        )
         value = Population(
-            LeakyIntegrate(tau_mem=20.0, bias=0.0, readout="var"),
+            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
             1
         )
 
         # ================= INPUT → HIDDEN =================
-        """
-        Connection(
-            input_pop,
-            hidden_layers["downsample"],
-            make_connectivity(
-                connectivity_type=connectivity_type,
-                src_shape=INPUT_SHAPE,
-                dst_shape=DOWNSAMPLE_SHAPE,
-                p=CONN_P["I-H"], 
-                sigma=SIGMA_IN, 
-                desired_fan_in=DESIRED_FAN_IN_IN,
-                sign=None
-            ),
-            exc_inh_sign=None
-        )
-        """
-        for layer, dst_shape, prob, c_type in [
-            (hidden_layers["I"], HIDDEN_I_SHAPE, CONN_P["I-H"], connectivity_type),
-            (hidden_layers["E"], HIDDEN_E_SHAPE, CONN_P["I-H"], connectivity_type),
+        # Connection(
+        #     input_pop,
+        #     hidden_layers["downsample"],
+        #     make_connectivity(
+        #         connectivity_type=connectivity_type,
+        #         src_shape=INPUT_SHAPE,
+        #         p=CONN_P["I-H"], 
+        #         sigma=SIGMA_IN, 
+        #         desired_fan_in=DESIRED_FAN_IN_IN,
+        #         sign=1
+        #     ),
+        #     exc_inh_sign=1
+        # )
+
+        for layer, prob, c_type in [
+            (hidden_layers["I"], CONN_P["I-H"], connectivity_type),
+            (hidden_layers["E"], CONN_P["I-H"], connectivity_type),
             # (policy, CONN_P["D-O"], "fixed"),
             # (value, CONN_P["D-O"], "fixed"),
         ]:
             Connection(
+                # hidden_layers["downsample"],
                 input_pop,
                 layer,
                 make_connectivity(
                     connectivity_type=c_type,
+                    # src_shape=DOWNSAMPLE_SHAPE,
                     src_shape=INPUT_SHAPE,
-                    dst_shape=dst_shape,
                     p=prob,
                     sigma=SIGMA_IN,
                     desired_fan_in=DESIRED_FAN_IN_IN,
@@ -671,12 +680,13 @@ def build_compiled_network(connectivity_type="fixed"):
             )
 
         # ================= EXCITATORY =================
-        for layer, dst_shape, prob, c_type, sign in [
-            (hidden_layers["I"], HIDDEN_I_SHAPE, CONN_P["H-H"], connectivity_type, 1),
-            (hidden_layers["E"], HIDDEN_E_SHAPE, CONN_P["H-H"], connectivity_type, 1),
-            (policy, None, CONN_P["H-P"], "fixed", 1),
-            (policy_log_s, None, CONN_P["H-P"], "fixed", 1),
-            (value, None, CONN_P["H-V"], "fixed", 1),
+        for layer, prob, c_type, sign in [
+            (hidden_layers["I"], CONN_P["H-H"], connectivity_type, 1),
+            (hidden_layers["E"], CONN_P["H-H"], connectivity_type, 1),
+            (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, 1),
+            (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, 1),
+            # (policy, CONN_P["H-P"], "fixed", 1),
+            # (value, CONN_P["H-V"], "fixed", 1),
         ]:
             Connection(
                 hidden_layers["E"],
@@ -684,7 +694,6 @@ def build_compiled_network(connectivity_type="fixed"):
                 make_connectivity(
                     connectivity_type=c_type,
                     src_shape=HIDDEN_E_SHAPE,
-                    dst_shape=dst_shape,
                     p=prob,
                     sigma=SIGMA_H,
                     desired_fan_in=DESIRED_FAN_IN_H1,
@@ -693,13 +702,64 @@ def build_compiled_network(connectivity_type="fixed"):
                 exc_inh_sign=sign
             )
 
+        """
+        for layer in [
+            hidden_layers["I"],
+            hidden_layers["E"],
+            hidden_layers["downsample"],
+        ]:
+            Connection(
+                hidden_layers["E"],
+                layer,
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_E_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H1,
+                    sign=None
+                ),
+                target_var="ISynSigmaEps",
+                exc_inh_sign=None
+            )
+
+            Connection(
+                layer,
+                hidden_layers["E"],
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_E_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H1,
+                    sign=1
+                ),
+                feedback_name="pert_eps_feedback",
+                exc_inh_sign=1
+            )
+            Connection(
+                layer,
+                hidden_layers["E"],
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_E_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H1,
+                    sign=1
+                ),
+                feedback_name="pert_sigma_feedback",
+                exc_inh_sign=1
+            )"""
+
         # ================= INHIBITORY =================
-        for layer, dst_shape, prob, c_type, sign in [
-            (hidden_layers["I"], HIDDEN_I_SHAPE, CONN_P["H-H"], connectivity_type, -1),
-            (hidden_layers["E"], HIDDEN_E_SHAPE, CONN_P["H-H"], connectivity_type, -1),
-            (policy, None, CONN_P["H-P"], "fixed", -1),
-            (policy_log_s, None, CONN_P["H-P"], "fixed", 1),
-            (value, None, CONN_P["H-V"], "fixed", -1),
+        for layer, prob, c_type, sign in [
+            (hidden_layers["I"], CONN_P["H-H"], connectivity_type, -1),
+            (hidden_layers["E"], CONN_P["H-H"], connectivity_type, -1),
+            (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, -1),
+            (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, -1),
+            # (policy, CONN_P["H-P"], "fixed", -1),
+            # (value, CONN_P["H-V"], "fixed", -1),
         ]:
             Connection(
                 hidden_layers["I"],
@@ -707,7 +767,6 @@ def build_compiled_network(connectivity_type="fixed"):
                 make_connectivity(
                     connectivity_type=c_type,
                     src_shape=HIDDEN_I_SHAPE,
-                    dst_shape=dst_shape,
                     p=prob,
                     sigma=SIGMA_H,
                     desired_fan_in=DESIRED_FAN_IN_H2,
@@ -715,6 +774,83 @@ def build_compiled_network(connectivity_type="fixed"):
                 ),
                 exc_inh_sign=sign
             )
+
+        """
+        for layer in [
+            hidden_layers["I"],
+            hidden_layers["E"],
+            hidden_layers["downsample"]
+        ]:
+            Connection(
+                hidden_layers["I"],
+                layer,
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_I_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H2,
+                    sign=None
+                ),
+                target_var="ISynSigmaEps",
+                exc_inh_sign=None
+            )
+            Connection(
+                layer,
+                hidden_layers["I"],
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_I_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H2,
+                    sign=-1
+                ),
+                feedback_name="pert_eps_feedback",
+                exc_inh_sign=-1
+            )
+            Connection(
+                layer,
+                hidden_layers["I"],
+                make_connectivity(
+                    connectivity_type=connectivity_type,
+                    src_shape=HIDDEN_I_SHAPE,
+                    p=CONN_P["H-H"],
+                    sigma=SIGMA_H,
+                    desired_fan_in=DESIRED_FAN_IN_H2,
+                    sign=-1
+                ),
+                feedback_name="pert_sigma_feedback",
+                exc_inh_sign=-1
+            )"""
+
+        # ================= OUTPUT CONNECTIONS =================
+        Connection(
+            hidden_layers["policy_field"],
+            policy,
+            make_connectivity(
+                connectivity_type="fixed",
+                src_shape=HIDDEN_I_SHAPE,
+                p=0.5,
+                sigma=SIGMA_H,
+                desired_fan_in=DESIRED_FAN_IN_H2,
+                sign=None
+            ),
+            exc_inh_sign=None
+        )
+        Connection(
+            hidden_layers["value_field"],
+            value,
+            make_connectivity(
+                connectivity_type="fixed",
+                src_shape=HIDDEN_I_SHAPE,
+                p=0.99999,
+                sigma=SIGMA_H,
+                desired_fan_in=DESIRED_FAN_IN_H2,
+                sign=None
+            ),
+            exc_inh_sign=None
+        )
 
         # ================= FEEDBACK CONNECTIONS =================
         Connection(
@@ -745,12 +881,6 @@ def build_compiled_network(connectivity_type="fixed"):
                 exc_inh_sign=sign
             )
             Connection(
-                hidden_layer, policy_log_s,
-                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name="policy_feedback",
-                exc_inh_sign=sign
-            )
-            Connection(
                 hidden_layer, value,
                 FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
                 feedback_name="value_feedback",
@@ -776,10 +906,10 @@ def build_compiled_network(connectivity_type="fixed"):
             policy: "sparse_categorical_crossentropy" 
                 if not GAUSSIAN_TRACE_POLICY else 
                 "mean_square_error",
-            policy_log_s: "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=Adam(1e-4),
+        optimiser=Adam(1e-4), #, soft_grad_clip=10), 
+        # optimiser=Adam(1e-4, clamp_grad=(-5.0, 5.0)),
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
@@ -793,7 +923,6 @@ def build_compiled_network(connectivity_type="fixed"):
         dale_rewiring_l1_strength=dale_l1_reg,
         policy_heads={
             policy: PolicyTypes.CATEGORICAL if not GAUSSIAN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
-            policy_log_s: PolicyTypes.GAUSSIAN_TRACE
         },
         value_head=value
     )
@@ -803,9 +932,9 @@ def build_compiled_network(connectivity_type="fixed"):
 
     compiled_net = compiler.compile(network)
 
-    return compiled_net, network, input_pop, hidden_layers, policy, policy_log_s, value
+    return compiled_net, network, input_pop, hidden_layers, policy, value
 
-compiled_net, network, input_pop, hidden_layers, policy, policy_log_s, value = \
+compiled_net, network, input_pop, hidden_layers, policy, value = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
 
 train_callback_list = CallbackList(
@@ -871,9 +1000,10 @@ def make_rate_coded_spikes(
     values,    
     base_timestep,
     input_size,
-    K             
+    K,
+    bg_noise=0.0   
 ):
-    values = np.clip(values, 0.0, 1.0)
+    values = np.clip(values + bg_noise, 0.0, 1.0)
 
     times = []
     idxs = []
@@ -1110,28 +1240,122 @@ def viz_runs_loop(best_run_q: Queue, random_run_q: Queue, stop_event: mp.Event, 
     cv2.destroyWindow(window_best)
     cv2.destroyWindow(window_random)
 
+
+def viz_sigma_loop(sigma_q: Queue, stop_event: mp.Event, shape_e, shape_i):
+    plt.ion()
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+    plt.subplots_adjust(hspace=0.4, wspace=0.3)
+
+    # 1 — Mean log sigma over time
+    sigma_mean_e_line, = ax1.plot([], [], label='E layer', color='orange')
+    sigma_mean_i_line, = ax1.plot([], [], label='I layer', color='blue')
+    ax1.set_title('mean log sigma over training\nlog(-1)→σ=0.37  log(-2)→σ=0.14  log(-7)→σ=0.001')
+    ax1.set_ylabel('log sigma')
+    ax1.legend(fontsize=8)
+
+    # 2 — Current sigma distribution histogram
+    ax2.set_title('sigma distribution — current')
+    ax2.set_xlabel('sigma')
+
+    # 3 — Log sigma heatmap over neurons and time (E layer)
+    sigma_hist_img_e = ax3.imshow(np.zeros((shape_e[0]*shape_e[1], 1)), 
+                                   aspect='auto', cmap='RdBu_r', vmin=-8, vmax=1)
+    ax3.set_title('log sigma per neuron over time — E')
+    ax3.set_xlabel('episode sample')
+    ax3.set_ylabel('neuron index')
+    fig.colorbar(sigma_hist_img_e, ax=ax3, fraction=0.02, pad=0.04)
+
+    # 4 — 2D spatial heatmap of current sigma (E layer only, I layer smaller)
+    heatmap_img = ax4.imshow(np.zeros(shape_e[:2]), aspect='auto',
+                          cmap='RdBu_r', vmin=-8, vmax=0)
+    
+    ax4.set_title('log sigma spatial map — E (current)')
+    fig.colorbar(heatmap_img, ax=ax4, fraction=0.02, pad=0.04)
+
+    # local buffers
+    sigma_mean_e_history = []
+    sigma_mean_i_history = []
+    sigma_dist_e_history = []
+
+    while not stop_event.is_set():
+        try:
+            while True:
+                data = sigma_q.get_nowait()
+                log_sigma_e = data['E']
+                log_sigma_i = data['I']
+
+                # update buffers
+                sigma_mean_e_history.append(log_sigma_e.mean())
+                sigma_mean_i_history.append(log_sigma_i.mean())
+                sigma_dist_e_history.append(log_sigma_e.copy())
+
+                # 1 — mean over time
+                sigma_mean_e_line.set_data(range(len(sigma_mean_e_history)), sigma_mean_e_history)
+                sigma_mean_i_line.set_data(range(len(sigma_mean_i_history)), sigma_mean_i_history)
+                ax1.relim(); ax1.autoscale_view()
+
+                # 2 — current distribution
+                ax2.cla()
+                ax2.hist(np.exp(log_sigma_e), bins=40, alpha=0.6, 
+                         color='orange', label=f'E mean={np.exp(log_sigma_e).mean():.3f}')
+                ax2.hist(np.exp(log_sigma_i), bins=40, alpha=0.6,
+                         color='blue', label=f'I mean={np.exp(log_sigma_i).mean():.3f}')
+                ax2.set_title('sigma distribution — current')
+                ax2.set_xlabel('sigma')
+                ax2.legend(fontsize=8)
+
+                # 3 — heatmap over neurons and time
+                e_arr = np.array(sigma_dist_e_history).T  # (N_e, T)
+                sigma_hist_img_e.set_data(e_arr)
+                sigma_hist_img_e.set_extent([0, e_arr.shape[1], 0, e_arr.shape[0]])
+                ax3.set_xlim(0, e_arr.shape[1])
+                ax3.set_ylim(0, e_arr.shape[0])
+
+                # 4 — spatial map
+                heatmap_img.set_data(log_sigma_e.reshape(shape_e).mean(axis=2))
+                # After set_data:
+                vmin = log_sigma_e.min()
+                vmax = log_sigma_e.max()
+                heatmap_img.set_clim(vmin, vmax)
+                sigma_hist_img_e.set_clim(vmin, vmax)
+                ax4.set_title(f'log sigma spatial map — E  mean={log_sigma_e.mean():.3f}  std={log_sigma_e.std():.3f}')
+                ax4.set_title(f'log sigma spatial map — E  std={log_sigma_e.std():.3f}')
+
+        except Exception:
+            pass
+
+        plt.pause(0.03)
+        time.sleep(0.03)
+
+    plt.close(fig)
+
+
 # --- Wiring: start processes and pass queues to trainer ---
 def start_visualizers():
     manager = Manager()
     metrics_q = manager.Queue(maxsize=10)
     best_run_q = manager.Queue(maxsize=2)
     random_run_q = manager.Queue(maxsize=2)
+    sigma_q = manager.Queue(maxsize=2)
     stop_event = manager.Event()
 
     p_plots = mp.Process(target=viz_plots_loop, args=(metrics_q, stop_event), daemon=True)
     p_runs = mp.Process(target=viz_runs_loop, args=(best_run_q, random_run_q, stop_event), daemon=True)
+    p_sigma = mp.Process(target=viz_sigma_loop, args=(sigma_q, stop_event, HIDDEN_E_SHAPE, HIDDEN_I_SHAPE), daemon=True)
 
     p_plots.start()
     p_runs.start()
-    return manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs
+    p_sigma.start()
+    return manager, metrics_q, best_run_q, random_run_q, sigma_q, stop_event, p_plots, p_runs, p_sigma
 
 # --- Modify your train_snake_agent to send updates instead of internal plotting ---
 # Replace plt.ion() + figure creation in train_snake_agent with nothing and send updates to queues.
 # I will show a skeleton wrapper around your train loop:
-def train_snake_agent_with_ipc(episodes=100000,
+def train_snake_agent_with_ipc(episodes=1e10,
                                metrics_q: Queue=None,
                                best_run_q: Queue=None,
                                random_run_q: Queue=None,
+                               sigma_q: Queue=None,
                                compress_frames=True,
                                compress_quality=80):
     """
@@ -1159,6 +1383,15 @@ def train_snake_agent_with_ipc(episodes=100000,
         train_callback_list.on_batch_begin(0)
 
         action = np.zeros(NUM_OUTPUT)
+        
+        for hidden_layer in hidden_layers.values():
+            compiled_net.neuron_populations[hidden_layer].vars["Beta"].pull_from_device()
+            betas = compiled_net.neuron_populations[hidden_layer].vars["Beta"].view
+            compiled_net.neuron_populations[hidden_layer].vars["Beta"].view[:] = betas * (0.2 > np.random.uniform(0.0, 1.0, betas.shape))
+            compiled_net.neuron_populations[hidden_layer].vars["Beta"].push_to_device()
+        
+        v_avg = 0
+        v_reg_loss_avg = 0
         for ep in range(episodes):
             if env.won:
                 compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
@@ -1186,6 +1419,22 @@ def train_snake_agent_with_ipc(episodes=100000,
                 best_reward = -np.inf
                 compiled_net.save_connectivity((f"{BOARD_SIZE}_mid_completion",), serialiser)
                 compiled_net.save((f"{BOARD_SIZE}_mid_completion",), serialiser)
+                # print("Sleeping...")
+                # for _ in range(1000):
+                #     spikes = make_rate_coded_spikes(
+                #         np.zeros(INPUT_SIZE),
+                #         compiled_net.genn_model.timestep,
+                #         INPUT_SIZE,
+                #         K=WAIT_INC,
+                #         bg_noise=0.01                  
+                #     )
+                #     compiled_net.set_input({input_pop: [spikes]})
+                #     for _ in range(WAIT_INC):
+                #         compiled_net.step_time(train_callback_list)
+                #     compiled_net.genn_model.custom_update("GradientLearn")
+                #     for o, custom_updates in compiled_net.optimisers:
+                #         for c in custom_updates:
+                #             o.set_step(c, opt_updt := opt_updt+1)
 
             for m in all_metrics.values():
                 m.reset()
@@ -1212,7 +1461,7 @@ def train_snake_agent_with_ipc(episodes=100000,
             )
             """
             spikes = make_rate_coded_spikes(
-                obs.reshape(-1),
+                obs.reshape(-1) / 255,
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
                 K=WAIT_INC                       # tune this
@@ -1226,10 +1475,13 @@ def train_snake_agent_with_ipc(episodes=100000,
 
             while not done:
                 action_label = 0
-                current_values.append(compiled_net.get_readout(value)[0][0])
+                current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)
         
                 if env.wait_count == 0:
+                    # compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].pull_from_device()
+                    # print(sum(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view), sum(np.exp(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view)) )
+                    # print("----------------")
                     if GAUSSIAN_TRACE_POLICY:
                         action = compiled_net.get_readout(policy).flatten()
                         probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
@@ -1249,7 +1501,6 @@ def train_snake_agent_with_ipc(episodes=100000,
                         compiled_net.losses[policy].set_var(
                             compiled_net.neuron_populations[policy], "actionTaken", 1.0
                         )
-
                     current_probs.append(probs)
 
                 obs, reward, done = env.step(action_label)
@@ -1270,23 +1521,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                         current_run.append(encoded)
                     else:
                         current_run.append(frame_img.copy())
-                    
-                    compiled_net.genn_model.custom_update("GradientLearn")
-                    for o, custom_updates in compiled_net.optimisers:
-                        for c in custom_updates:
-                            o.set_step(c, opt_updt := opt_updt+1)
-                    
-                    """
-                    indices = obs.nonzero()[0]
-                    spikes = make_repeated_spikes(
-                        indices,
-                        compiled_net.genn_model.timestep,
-                        INPUT_SIZE,
-                        K=WAIT_INC,
-                        period=1
-                    )"""
                     spikes = make_rate_coded_spikes(
-                        obs.reshape(-1),
+                        obs.reshape(-1) / 255,
                         compiled_net.genn_model.timestep,
                         INPUT_SIZE,
                         K=WAIT_INC                   # tune this
@@ -1295,11 +1531,30 @@ def train_snake_agent_with_ipc(episodes=100000,
 
                 compiled_net.step_time(train_callback_list)
 
+                compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].pull_from_device()
+                compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].pull_from_device()
+                compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].pull_from_device()
+                v = compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].view
+                A = compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].view
+                beta = compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].view
+
+                v_avg = v_avg*0.999 + 0.0001*sum(abs(v))
+                v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.0001*sum(abs(
+                    np.maximum( v - (0.61 + beta * A), 0.0) +
+                    np.maximum(-v - (0.61 + beta * A), 0.0)
+                ))
+
+                if env.wait_count == env.wait_inc:
+                    compiled_net.genn_model.custom_update("GradientLearn")
+                    for o, custom_updates in compiled_net.optimisers:
+                        for c in custom_updates:
+                            o.set_step(c, opt_updt := opt_updt+1)
+                
                 # compiled_net.genn_model.custom_update("GradientLearn")
                 # for o, custom_updates in compiled_net.optimisers:
                 #     for c in custom_updates:
                 #         o.set_step(c, opt_updt := opt_updt+1)
-                    
+                
                 """
                 value_estimate = compiled_net.get_readout(value)[0][0]
                 value_target = reward_trace + gamma * value_estimate
@@ -1350,7 +1605,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                 frame += 1
 
             spikes = make_rate_coded_spikes(
-                obs.reshape(-1),                                 # flattened RGB values
+                obs.reshape(-1) / 255,                                 # flattened RGB values
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
                 K=WAIT_INC                   # tune this
@@ -1364,7 +1619,7 @@ def train_snake_agent_with_ipc(episodes=100000,
                     else:
                         probs = compiled_net.get_readout(policy).flatten()
                     current_probs.append(probs)
-                current_values.append(compiled_net.get_readout(value)[0][0])
+                current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)
                 
                 reward_trace = reward_trace * 0.9261
@@ -1374,8 +1629,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                 # for o, custom_updates in compiled_net.optimisers:
                 #     for c in custom_updates:
                 #         o.set_step(c, opt_updt := opt_updt+1)
-                    
-                """
+                
+                """    
                 value_estimate = compiled_net.get_readout(value)[0][0]
                 value_target = reward_trace + gamma * value_estimate
                 
@@ -1399,20 +1654,16 @@ def train_snake_agent_with_ipc(episodes=100000,
                 #         o.set_step(c, ep)
                 # td_error_trace = 0
                 """
-
+            
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
-               for c in custom_updates:
-                   o.set_step(c, opt_updt := opt_updt+1)
+                for c in custom_updates:
+                    o.set_step(c, opt_updt := opt_updt+1)
             if dale_l1_reg > 0:
                 compiled_net.genn_model.custom_update("DaleRL1")
 
             compiled_net.genn_model.custom_update("DalePrune")
             compiled_net.genn_model.custom_update("DaleRewire")
-
-
-            # if compiled_net.optimisers[0][0].alpha > 1e-5 and np.mean(snake_len_history) > 2:
-            #     compiled_net.optimisers[0][0].alpha = 1e-5
 
             # Update if new best run (send best run to viz process)
             if total_reward >= best_reward and len(current_probs) > 0:
@@ -1439,18 +1690,20 @@ def train_snake_agent_with_ipc(episodes=100000,
                 except Exception as e:
                     print("Best-run enqueue error:", e)
 
-            # occasional random visualization sample (send a few frames)
-            if random_run_q is not None and (ep % 100 == 0):
-                # sample a short random chunk from current_run
+            if sigma_q is not None and (ep % 100 == 0):
                 try:
-                    if random_run_q.full():
-                        try:
-                            _ = random_run_q.get_nowait()
-                        except:
-                            pass
-                    random_run_q.put_nowait(current_run)
+                    compiled_net.neuron_populations[hidden_layers["E"]].vars["LogSigma"].pull_from_device()
+                    compiled_net.neuron_populations[hidden_layers["I"]].vars["LogSigma"].pull_from_device()
+                    sigma_data = {
+                        'E': compiled_net.neuron_populations[hidden_layers["E"]].vars["LogSigma"].view.copy(),
+                        'I': compiled_net.neuron_populations[hidden_layers["I"]].vars["LogSigma"].view.copy(),
+                    }
+                    if sigma_q.full():
+                        try: sigma_q.get_nowait()
+                        except: pass
+                    sigma_q.put_nowait(sigma_data)
                 except Exception as e:
-                    print("Random-run enqueue error:", e)
+                    print("Sigma enqueue error:", e)
 
             snake_len_history.append(len(env.snake)-1)
             if len(snake_len_history) > 100:
@@ -1494,6 +1747,8 @@ def train_snake_agent_with_ipc(episodes=100000,
                     f"- Best reward: {best_reward:.2f} "
                     f"- Snake len: {len(env.snake)-1:2d} "
                     f"- Snake len avg (last 100): {np.mean(snake_len_history):.2f} "
+                    f"- Voltage running avg: {v_avg:.2f} "
+                    f"- Voltage reg loss running avg: {v_reg_loss_avg:.2f}"
                     f"- Frame death: {frame} "
                     f"- Alpha: {compiled_net.optimisers[0][0].alpha:.8f}"
                 )
@@ -1512,26 +1767,22 @@ def train_snake_agent_with_ipc(episodes=100000,
             except:
                 pass
 
-# --- Example of launching everything in __main__ ---
 if __name__ == "__main__":
-    # start visualizers
-    manager, metrics_q, best_run_q, random_run_q, stop_event, p_plots, p_runs = start_visualizers()
+    manager, metrics_q, best_run_q, random_run_q, sigma_q, stop_event, p_plots, p_runs, p_sigma = start_visualizers()
 
-    # run trainer in main process (keeps compiled_net / GPU access local)
     try:
         train_snake_agent_with_ipc(
             episodes=int(1e10),
             metrics_q=metrics_q,
             best_run_q=best_run_q,
             random_run_q=random_run_q,
+            sigma_q=sigma_q,
             compress_frames=True,
             compress_quality=80
         )
     finally:
-        # signal visualizers to stop
         stop_event.set()
         time.sleep(0.2)
-        if p_plots.is_alive():
-            p_plots.terminate()
-        if p_runs.is_alive():
-            p_runs.terminate()
+        if p_plots.is_alive(): p_plots.terminate()
+        if p_runs.is_alive(): p_runs.terminate()
+        if p_sigma.is_alive(): p_sigma.terminate()
