@@ -355,7 +355,7 @@ eprop_alif_td_model = {
 
     eFiltered = (eFiltered * Alpha) + e;
     RLTrace = Lambda * RLTrace + eFiltered * ( 0.0*PG_post + 0.1*VE_post + 0.0*PGEps_post );
-    RLEpsTrace = Lambda * RLEpsTrace + e * PertEpsTrace_post;
+    RLEpsTrace = Lambda * RLEpsTrace + eFiltered * PertEpsTrace_post;
     // RLEpsTrace = Lambda * RLEpsTrace + e * PertEpsTrace_post;
     // addToPre( PertEpsTrace_post);
     """
@@ -739,8 +739,8 @@ class EPropCompiler(Compiler):
                     model_copy.append_sim_code(
                         f"""
                         ValTrace = ValTrace*0.5 + PrevVal*0.5;
-                        E = {model_copy.output_var_name} * {self.gamma} + reward - ValTrace;
-                        // E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
+                        // E = {model_copy.output_var_name} * {self.gamma} + reward - ValTrace;
+                        E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
                         // E = tdError;
 
                         ValReg = (

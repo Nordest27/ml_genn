@@ -79,7 +79,7 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 A += 1.0;
                 """
 
-        sim_code_perturbation = f"""
+        sim_code_perturbation = """
                 // State-independent learned sigma
                 Sigma = exp(LogSigma);
                 PertEps = sqrt(1.0 - Alpha*Alpha) * Sigma * gennrand_normal();

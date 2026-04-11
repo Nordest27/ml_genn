@@ -76,7 +76,7 @@ def extract_fanin_statistics(compiled_net):
     return stats
 
 class SnakeEnv:
-    def __init__(self, size=28, visible_range=5, scale=1, wait_inc=5, inp_shape=(5,5,3)):
+    def __init__(self, size=28, visible_range=5, scale=2, wait_inc=5, inp_shape=(5,5,3)):
         assert visible_range % 2 == 1, "visible_range must be odd"
         self.size = size
         self.visible_range = visible_range
@@ -249,7 +249,7 @@ class SnakeEnv:
     
     def get_local_img_observation(self):
         img = self.local_img(scale=self.scale)
-        return cv2.resize(img, (self.inp_shape[0], self.inp_shape[1]), interpolation=cv2.INTER_NEAREST)
+        return cv2.resize(img, (self.inp_shape[0], self.inp_shape[1]), interpolation=cv2.INTER_NEAREST) / 255
 
     def img(self, scale=10):
         img = np.zeros((self.size, self.size, 3), dtype=np.uint8) + 100
@@ -334,7 +334,7 @@ class SnakeEnv:
                 if (y, x) == (head_y, head_x):
                     img[local_y, local_x] = [0, 155, 0]
 
-                # apple
+                # appleobs
                 for apple in self.apples:
                     if (y, x) == apple:
                         img[local_y, local_x] = [0, 0, 255]
@@ -612,30 +612,30 @@ def build_compiled_network(connectivity_type="fixed"):
         )
 
         
-        hidden_layers["policy_field"] = Population(
-            AdaptiveLeakyIntegrateFire(
-                v_thresh=0.61,
-                tau_mem=10.0,
-                tau_refrac=3.0,
-                tau_adapt=300,
-            ),
-            HIDDEN_I_SHAPE
-        )
+        # hidden_layers["policy_field"] = Population(
+        #     AdaptiveLeakyIntegrateFire(
+        #         v_thresh=0.61,
+        #         tau_mem=10.0,
+        #         tau_refrac=3.0,
+        #         tau_adapt=300,
+        #     ),
+        #     HIDDEN_I_SHAPE
+        # )
         policy = Population(
             LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
             NUM_OUTPUT
         )
 
 
-        hidden_layers["value_field"] = Population(
-            AdaptiveLeakyIntegrateFire(
-                v_thresh=0.61,
-                tau_mem=10.0,
-                tau_refrac=3.0,
-                tau_adapt=300,
-            ),
-            HIDDEN_I_SHAPE
-        )
+        # hidden_layers["value_field"] = Population(
+        #     AdaptiveLeakyIntegrateFire(
+        #         v_thresh=0.61,
+        #         tau_mem=10.0,
+        #         tau_refrac=3.0,
+        #         tau_adapt=300,
+        #     ),
+        #     HIDDEN_I_SHAPE
+        # )
         value = Population(
             LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
             1
@@ -683,10 +683,10 @@ def build_compiled_network(connectivity_type="fixed"):
         for layer, prob, c_type, sign in [
             (hidden_layers["I"], CONN_P["H-H"], connectivity_type, 1),
             (hidden_layers["E"], CONN_P["H-H"], connectivity_type, 1),
-            (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, 1),
-            (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, 1),
-            # (policy, CONN_P["H-P"], "fixed", 1),
-            # (value, CONN_P["H-V"], "fixed", 1),
+            # (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, 1),
+            # (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, 1),
+            (policy, CONN_P["H-P"], "fixed", 1),
+            (value, CONN_P["H-V"], "fixed", 1),
         ]:
             Connection(
                 hidden_layers["E"],
@@ -756,10 +756,10 @@ def build_compiled_network(connectivity_type="fixed"):
         for layer, prob, c_type, sign in [
             (hidden_layers["I"], CONN_P["H-H"], connectivity_type, -1),
             (hidden_layers["E"], CONN_P["H-H"], connectivity_type, -1),
-            (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, -1),
-            (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, -1),
-            # (policy, CONN_P["H-P"], "fixed", -1),
-            # (value, CONN_P["H-V"], "fixed", -1),
+            # (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, -1),
+            # (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, -1),
+            (policy, CONN_P["H-P"], "fixed", -1),
+            (value, CONN_P["H-V"], "fixed", -1),
         ]:
             Connection(
                 hidden_layers["I"],
@@ -825,32 +825,32 @@ def build_compiled_network(connectivity_type="fixed"):
             )"""
 
         # ================= OUTPUT CONNECTIONS =================
-        Connection(
-            hidden_layers["policy_field"],
-            policy,
-            make_connectivity(
-                connectivity_type="fixed",
-                src_shape=HIDDEN_I_SHAPE,
-                p=0.5,
-                sigma=SIGMA_H,
-                desired_fan_in=DESIRED_FAN_IN_H2,
-                sign=None
-            ),
-            exc_inh_sign=None
-        )
-        Connection(
-            hidden_layers["value_field"],
-            value,
-            make_connectivity(
-                connectivity_type="fixed",
-                src_shape=HIDDEN_I_SHAPE,
-                p=0.99999,
-                sigma=SIGMA_H,
-                desired_fan_in=DESIRED_FAN_IN_H2,
-                sign=None
-            ),
-            exc_inh_sign=None
-        )
+        # Connection(
+        #     hidden_layers["policy_field"],
+        #     policy,
+        #     make_connectivity(
+        #         connectivity_type="fixed",
+        #         src_shape=HIDDEN_I_SHAPE,
+        #         p=0.5,
+        #         sigma=SIGMA_H,
+        #         desired_fan_in=DESIRED_FAN_IN_H2,
+        #         sign=None
+        #     ),
+        #     exc_inh_sign=None
+        # )
+        # Connection(
+        #     hidden_layers["value_field"],
+        #     value,
+        #     make_connectivity(
+        #         connectivity_type="fixed",
+        #         src_shape=HIDDEN_I_SHAPE,
+        #         p=0.99999,
+        #         sigma=SIGMA_H,
+        #         desired_fan_in=DESIRED_FAN_IN_H2,
+        #         sign=None
+        #     ),
+        #     exc_inh_sign=None
+        # )
 
         # ================= FEEDBACK CONNECTIONS =================
         Connection(
@@ -1004,6 +1004,27 @@ def make_rate_coded_spikes(
     bg_noise=0.0   
 ):
     values = np.clip(values + bg_noise, 0.0, 1.0)
+    # print(values)
+    # for i in range(INPUT_SHAPE[0]):
+    #     print()
+    #     for _ in range(3):
+    #         for j in range(INPUT_SHAPE[1]):
+    #                 symbol = ""
+    #                 if values[i*INPUT_SHAPE[1]*INPUT_SHAPE[2] + j* INPUT_SHAPE[2] + 0] > 0.1:
+    #                     symbol += "r"
+    #                 else:
+    #                     symbol += "-"
+    #                 if values[i*INPUT_SHAPE[1]*INPUT_SHAPE[2] + j* INPUT_SHAPE[2] + 1] > 0.1:
+    #                     symbol += "g"
+    #                 else:
+    #                     symbol += "-"
+    #                 if values[i*INPUT_SHAPE[1]*INPUT_SHAPE[2] + j* INPUT_SHAPE[2] + 2] > 0.1:
+    #                     symbol += "b"
+    #                 else:
+    #                     symbol += "-"
+    #                 print(symbol, end="  ")
+    #         print()
+    # print()
 
     times = []
     idxs = []
@@ -1384,11 +1405,11 @@ def train_snake_agent_with_ipc(episodes=1e10,
 
         action = np.zeros(NUM_OUTPUT)
         
-        for hidden_layer in hidden_layers.values():
-            compiled_net.neuron_populations[hidden_layer].vars["Beta"].pull_from_device()
-            betas = compiled_net.neuron_populations[hidden_layer].vars["Beta"].view
-            compiled_net.neuron_populations[hidden_layer].vars["Beta"].view[:] = betas * (0.2 > np.random.uniform(0.0, 1.0, betas.shape))
-            compiled_net.neuron_populations[hidden_layer].vars["Beta"].push_to_device()
+        # for hidden_layer in hidden_layers.values():
+        #     compiled_net.neuron_populations[hidden_layer].vars["Beta"].pull_from_device()
+        #     betas = compiled_net.neuron_populations[hidden_layer].vars["Beta"].view
+        #     compiled_net.neuron_populations[hidden_layer].vars["Beta"].view[:] = betas * (0.2 > np.random.uniform(0.0, 1.0, betas.shape))
+        #     compiled_net.neuron_populations[hidden_layer].vars["Beta"].push_to_device()
         
         v_avg = 0
         v_reg_loss_avg = 0
@@ -1461,7 +1482,7 @@ def train_snake_agent_with_ipc(episodes=1e10,
             )
             """
             spikes = make_rate_coded_spikes(
-                obs.reshape(-1) / 255,
+                obs.reshape(-1),
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
                 K=WAIT_INC                       # tune this
@@ -1513,16 +1534,16 @@ def train_snake_agent_with_ipc(episodes=1e10,
                     
                 if env.wait_count == env.wait_inc:
                     # capture frame scaled down for IPC
-                    frame_img = env.img(scale=25)  # smaller scale to reduce size
-                    # frame_img = (obs*255).astype(int)
-                    # frame_img = obs
+                    # frame_img = env.img(scale=25)  # smaller scale to reduce size
+                    frame_img = (obs*255).astype(int)
+                    # frame_img = env.get_local_img_observation() *
                     if compress_frames:
                         encoded = encode_frame(frame_img, compress=True, quality=compress_quality)
                         current_run.append(encoded)
                     else:
                         current_run.append(frame_img.copy())
                     spikes = make_rate_coded_spikes(
-                        obs.reshape(-1) / 255,
+                        obs.reshape(-1),
                         compiled_net.genn_model.timestep,
                         INPUT_SIZE,
                         K=WAIT_INC                   # tune this
@@ -1531,18 +1552,18 @@ def train_snake_agent_with_ipc(episodes=1e10,
 
                 compiled_net.step_time(train_callback_list)
 
-                compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].pull_from_device()
-                compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].pull_from_device()
-                compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].pull_from_device()
-                v = compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].view
-                A = compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].view
-                beta = compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].view
+                # compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].pull_from_device()
+                # compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].pull_from_device()
+                # compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].pull_from_device()
+                # v = compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].view
+                # A = compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].view
+                # beta = compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].view
 
-                v_avg = v_avg*0.999 + 0.0001*sum(abs(v))
-                v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.0001*sum(abs(
-                    np.maximum( v - (0.61 + beta * A), 0.0) +
-                    np.maximum(-v - (0.61 + beta * A), 0.0)
-                ))
+                # v_avg = v_avg*0.999 + 0.0001*sum(abs(v))
+                # v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.0001*sum(abs(
+                #     np.maximum( v - (0.61 + beta * A), 0.0) +
+                #     np.maximum(-v - (0.61 + beta * A), 0.0)
+                # ))
 
                 if env.wait_count == env.wait_inc:
                     compiled_net.genn_model.custom_update("GradientLearn")
@@ -1605,7 +1626,7 @@ def train_snake_agent_with_ipc(episodes=1e10,
                 frame += 1
 
             spikes = make_rate_coded_spikes(
-                obs.reshape(-1) / 255,                                 # flattened RGB values
+                obs.reshape(-1),                                 # flattened RGB values
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
                 K=WAIT_INC                   # tune this
