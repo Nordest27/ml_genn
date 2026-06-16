@@ -7,7 +7,7 @@ from ml_genn.callbacks import (OptimiserParamSchedule, SpikeRecorder,
 from ml_genn.compilers import EPropCompiler
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
-from ml_genn.neurons import LeakyIntegrate, SpikeInput, AdaptiveLeakyIntegrateFire
+from ml_genn.neurons import LeakyIntegrate, SpikeInput, LeakyIntegrateFire
 from ml_genn.optimisers import Adam
 
 from time import perf_counter
@@ -69,7 +69,7 @@ with network:
     # Populations
     input = Population(SpikeInput(max_spikes=len(in_spike_ids)),
                                   NUM_INPUT, record_spikes=True)
-    hidden = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
+    hidden = Population(LeakyIntegrateFire(v_thresh=0.61, tau_mem=20.0,
                                            tau_refrac=5.0),
                         NUM_HIDDEN, record_spikes=True)
     output = Population(LeakyIntegrate(tau_mem=20.0, readout="var"),
@@ -80,7 +80,7 @@ with network:
     Connection(hidden, hidden, FixedProbability(0.1, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
     Connection(hidden, output, FixedProbability(0.2, (Normal(sd=1.0 / np.sqrt(NUM_HIDDEN)))))
     # Random feedback matrix
-    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), is_feedback=True)
+    Connection(hidden, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f")
 
 compiler = EPropCompiler(example_timesteps=1000, losses="mean_square_error", feedback_type="random",
                          optimiser=Adam(0.003), c_reg=1.0)

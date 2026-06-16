@@ -28,19 +28,19 @@ import multiprocessing as mp
 from multiprocessing import Manager, Queue
 
 # ---------------- CONFIG ----------------
-GRID_SIZE = 4
+GRID_SIZE = 10
 CELL_SIZE = 60
 
 AGENT_COLOR = (50, 200, 50)
 DOOR_COLOR_LOCKED = (120, 120, 120)
-DOOR_COLOR_OPEN = (0, 200, 0)
-REVEAL_COLOR = (200, 200, 50)
+DOOR_COLOR_OPEN = (200, 50, 50)
+REVEAL_COLOR = (200, 50, 50)
 BG_COLOR = (50, 50, 50)
 
 TRAIN = True
 mnist.datasets_url = "https://storage.googleapis.com/cvdf-datasets/mnist/"
-labels = mnist.train_labels() if TRAIN else mnist.test_labels()
-images = mnist.train_images() if TRAIN else mnist.test_images()
+labels = (mnist.train_labels() if TRAIN else mnist.test_labels())
+images = (mnist.train_images() if TRAIN else mnist.test_images())
 
 #####################################################################
 #                         ENVIRONMENT                               #
@@ -90,6 +90,8 @@ class DoorKeyMNISTMemoryEnv:
         self.no_move_count = 0
         self.digit_visualizations = 0
 
+        self.sample_digit()
+
         return self.get_observation()
 
     # ------------------------------------------------------------ #
@@ -99,34 +101,37 @@ class DoorKeyMNISTMemoryEnv:
         if self.done:
             raise RuntimeError("Episode done. Call reset().")
 
+        # self.visualizing_digit = True
         # Handle wait period (no movement during wait)
         if self.wait_count > 0:
             self.wait_count -= 1
             return self.get_observation(), 0.0, False
+        
+        return self.get_observation(), 1.0 if self.current_digit == action else -1.0, True
 
         reward = 0.0
         dy, dx = [(0,-1),(-1,0),(0,1),(1,0),(0,0)][action]
-        if (dy, dx) == (0, 0):
-            self.no_move_count += 1
-            reward -= 0.05
-            if self.no_move_count > 20:
-                reward -= 1.0
-                self.done = True
+        # if (dy, dx) == (0, 0):
+        #     self.no_move_count += 1
+        #     reward -= 0.05
+        #     if self.no_move_count > 20:
+        #         reward -= 1.0
+        #         self.done = True
 
         ny = self.agent_pos[0] + dy
         nx = self.agent_pos[1] + dx
 
         self.steps_since_reveal += 1
         # Timeout penalty (too many steps after seeing digit)
-        if self.steps_since_reveal > 15:
-            # reward -= 1.0
+        if self.steps_since_reveal > 25:
+            reward -= 1.0
             self.done = True
             return self.get_observation(), reward, self.done
 
         # out of bounds
         if ny < 0 or ny >= GRID_SIZE or nx < 0 or nx >= GRID_SIZE:
-            # reward -= 1.0
-            # self.done = True
+            reward -= 1.0
+            self.done = True
             return self.get_observation(), reward, self.done
 
         if (ny, nx) in self.doors and self.doors_locked:
@@ -139,7 +144,7 @@ class DoorKeyMNISTMemoryEnv:
         # reveal zone
         if (ny, nx) == self.reveal_pos:
             if self.doors_locked:
-                reward += 0.5
+                reward += 1.0
                 self.steps_since_reveal = 0
                 self.doors_locked = False
             if self.digit_visualizations < 3:
@@ -176,8 +181,8 @@ class DoorKeyMNISTMemoryEnv:
         self.current_mnist = self.get_mnist_image(door_idx)
     
     def get_mnist_image(self, digit):
-        #idx = np.random.choice(np.where(labels == digit)[0])
-        idx = np.where(labels == digit)[0][0]
+        idx = np.random.choice(np.where(labels == digit)[0])
+        # idx = np.where(labels == digit)[0][0]
         return images[idx].copy()
 
     # ------------------------------------------------------------ #
@@ -211,11 +216,13 @@ class DoorKeyMNISTMemoryEnv:
 
                 # Doors
                 if y == 0:
-                    if self.doors_locked or x != self.correct_door:
-                        obs[local_y, local_x] = DOOR_COLOR_LOCKED
-                    else:
-                        obs[local_y, local_x] = DOOR_COLOR_OPEN
-
+                    obs[local_y, local_x] = DOOR_COLOR_LOCKED
+                    if not self.doors_locked:
+                        if x != self.correct_door:
+                            #obs[local_y, local_x] = DOOR_COLOR_OPEN
+                            pass
+                        else:
+                            obs[local_y, local_x] = (255, 0, 0)
 
         mnist_channel = self.current_mnist.astype(np.float32)
 
@@ -233,7 +240,7 @@ class DoorKeyMNISTMemoryEnv:
                 img[y, x] = DOOR_COLOR_LOCKED
             else:
                 if x == self.correct_door:
-                    img[y, x] = (0, 255, 0)
+                    img[y, x] = (255, 0, 0)
                 else:
                     img[y, x] = DOOR_COLOR_OPEN
 
@@ -281,7 +288,8 @@ class DoorKeyMNISTMemoryEnv:
 
 ################### DEFINE MODEL ####################
 #####################################################
-CHECKPOINT_BOARD_SIZE = None
+CHECKPOINT_BOARD_SIZE = GRID_SIZE
+CHECKPOINT_BOARD_SIZE_SAVE = None
 
 CONNECTIVITY_TYPE = "toroidal"
 WINDOW_EPISODES = 100
@@ -360,7 +368,7 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 # p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, SIGMA_H, HIDDEN_I_SHAPE)
 
 
-NUM_OUTPUT = 4
+NUM_OUTPUT = 10
 if GAUSSIAN_TRACE_POLICY:
     NUM_OUTPUT = 4
 
@@ -375,11 +383,11 @@ CONN_P = {
 }
 
 gamma                  = 0.1  ** (1 / WAIT_INC)
-td_lambda              = 0.8   ** (1 / WAIT_INC)
+td_lambda              = 0.1  ** (1 / WAIT_INC)
 
-entropy_coeff     = 0.0*1e-4
+entropy_coeff     = 0.0 * 1e-2
 entropy_decay     = 0.9999 ** (1 / WAIT_INC)
-entropy_coeff_min = 0.0*1e-5
+entropy_coeff_min = 0.0 * 1e-5
 
 dale_l1_reg = 0.0 
 
@@ -617,7 +625,7 @@ def build_compiled_network(connectivity_type="toroidal"):
             make_connectivity(
                 connectivity_type="fixed",
                 src_shape=HIDDEN_E_SHAPE,
-                p=0.5,
+                p=0.99999,
                 sign=None
             ),
             exc_inh_sign=None
@@ -675,7 +683,7 @@ def build_compiled_network(connectivity_type="toroidal"):
             policy: "sparse_categorical_crossentropy",
             value: "mean_square_error",
         },
-        optimiser=Adam(1e-5, soft_grad_clip=10),
+        optimiser=Adam(1e-4),#, soft_grad_clip=10),
         batch_size=1,
         feedback_type="random",
         gamma=gamma,
@@ -985,8 +993,8 @@ def train_door_key_agent(episodes=100000,
             reward_trace = 0.0
 
             if ep % 10000 == 0:
-                compiled_net.save_connectivity((CHECKPOINT_BOARD_SIZE,), serialiser)
-                compiled_net.save((CHECKPOINT_BOARD_SIZE,), serialiser)
+                compiled_net.save_connectivity((CHECKPOINT_BOARD_SIZE_SAVE,), serialiser)
+                compiled_net.save((CHECKPOINT_BOARD_SIZE_SAVE,), serialiser)
 
             # ---- Initial spike encoding ----
             spikes_env = make_rate_coded_spikes(
@@ -1014,6 +1022,10 @@ def train_door_key_agent(episodes=100000,
                     if abs(sum(probs) - 1.0) > 0.0001:
                         print("BAD PROBS", sum(probs))
                     action_label = np.random.choice(NUM_OUTPUT, p=probs)
+                    if probs[env.current_digit] > 1/10:
+                        action_label = env.current_digit
+                    # action_label = np.random.choice(4, p=(probs[:4]+0.01)/(sum(probs[:4]+0.01)))
+                    
                     current_probs.append(probs)
 
                     compiled_net.losses[policy].set_target(
@@ -1039,10 +1051,10 @@ def train_door_key_agent(episodes=100000,
                         compiled_net.neuron_populations[value], "reward", reward
                     )
 
-                if env.wait_count == env.wait_inc:
+                if env.wait_count == env.wait_inc-1:
                     # Capture frame
                     frame_img = env.img(scale=8)
-                    # frame_img = obs[0]
+                    frame_img = obs[1]
                     current_run.append(frame_img.copy())
 
                     # Encode next observation
@@ -1063,13 +1075,16 @@ def train_door_key_agent(episodes=100000,
 
                 compiled_net.step_time(train_callback_list)
 
-                # if env.wait_count == env.wait_inc:
-                compiled_net.genn_model.custom_update("GradientLearn")
-                for o, custom_updates in compiled_net.optimisers:
-                    for c in custom_updates:
-                        o.set_step(c, opt_updt := opt_updt + 1)
+                if env.wait_count == env.wait_inc:
+                    compiled_net.genn_model.custom_update("GradientLearn")
+                    for o, custom_updates in compiled_net.optimisers:
+                        for c in custom_updates:
+                            o.set_step(c, opt_updt := opt_updt + 1)
 
                 frame += 1
+
+            probs = compiled_net.get_readout(policy).flatten()
+            current_probs.append(probs)
 
             # ---- Episode tail: drain reward trace ----
             spikes_env = make_rate_coded_spikes(
@@ -1078,37 +1093,40 @@ def train_door_key_agent(episodes=100000,
                 ENV_INPUT_SIZE,
                 K=WAIT_INC
             )
-            spikes_mnist = make_rate_coded_spikes(
-                obs[1].reshape(-1),
-                compiled_net.genn_model.timestep,
-                MNIST_INPUT_SIZE,
-                K=WAIT_INC
-            )
+            # spikes_mnist = make_rate_coded_spikes(
+            #     obs[1].reshape(-1),
+            #     compiled_net.genn_model.timestep,
+            #     MNIST_INPUT_SIZE,
+            #     K=WAIT_INC
+            # )
             compiled_net.set_input({input_pop_env: [spikes_env],
                                     input_pop_mnist:  [spikes_mnist]})
+            
 
-            for _ in range(WAIT_INC):
+            for _ in range(3 * WAIT_INC):
                 reward_trace = reward_trace * 0.9261
                 current_values.append(compiled_net.get_readout(value)[0][0])
 
                 compiled_net.step_time(train_callback_list)
 
-                compiled_net.genn_model.custom_update("GradientLearn")
-                for o, custom_updates in compiled_net.optimisers:
-                    for c in custom_updates:
-                        o.set_step(c, opt_updt := opt_updt + 1)
-            """
+                # compiled_net.genn_model.custom_update("GradientLearn")
+                # for o, custom_updates in compiled_net.optimisers:
+                #     for c in custom_updates:
+                #         o.set_step(c, opt_updt := opt_updt + 1)
+
+            probs = compiled_net.get_readout(policy).flatten()
+            current_probs.append(probs)
+
             compiled_net.step_time(train_callback_list)
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
                 for c in custom_updates:
                     o.set_step(c, opt_updt := opt_updt + 1)
-            """
             # Dale's law rewiring (no-op when dale_l1_reg == 0)
-            if dale_l1_reg > 0:
-                compiled_net.genn_model.custom_update("DaleRL1")
-            compiled_net.genn_model.custom_update("DalePrune")
-            compiled_net.genn_model.custom_update("DaleRewire")
+            # if dale_l1_reg > 0:
+            #     compiled_net.genn_model.custom_update("DaleRL1")
+            # compiled_net.genn_model.custom_update("DalePrune")
+            # compiled_net.genn_model.custom_update("DaleRewire")
 
             # ---- Update best run ----
             time_since_last_best += 1

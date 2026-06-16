@@ -29,6 +29,11 @@ from scipy.ndimage import gaussian_filter
 from ml_genn.compilers.eprop_compiler import default_params
 from collections import defaultdict
 
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Union
+import os 
+import csv
+
 def extract_actual_sparse_connections(compiled_net):
     """
     Extract the actual number of instantiated connections per connection group.
@@ -99,6 +104,10 @@ class SnakeEnv:
         ]
 
         self.dir_idx = 1
+    
+        self.target_angle = self.dir_idx * 90
+        self.current_angle = self.target_angle
+
         self.direction = 'up'
 
         self.apples = []
@@ -133,7 +142,7 @@ class SnakeEnv:
         # new_dir = dirs[self.dir_idx]
         new_dir = dirs[action]
         
-        reward = - 90/self.size * ((self.steps_since_last_apple+1) % self.size == 0)
+        reward = - 0.0*90/self.size * ((self.steps_since_last_apple+1) % self.size == 0)
 
         if (self.direction == 'up' and new_dir == 'down') or \
            (self.direction == 'down' and new_dir == 'up') or \
@@ -146,6 +155,10 @@ class SnakeEnv:
             # return self.get_observation(), reward/100, True 
 
         self.direction = new_dir
+        self.dir_idx = dirs.index(self.direction)
+        self.target_angle = ((self.dir_idx-1)%4) * 90
+        # self.current_angle += (self.target_angle - self.current_angle) / self.wait_inc
+        self.current_angle = self.target_angle
 
         head_y, head_x = self.snake[0]
         if self.direction == 'up':
@@ -200,7 +213,7 @@ class SnakeEnv:
         
         if self.steps_since_last_apple > self.size**2:
             self.done = True
-            # reward -= 50.0
+            reward -= 100.0
             return self.get_local_img_observation(), reward/100, self.done
 
         self.wait_count = self.wait_inc
@@ -250,6 +263,26 @@ class SnakeEnv:
     def get_local_img_observation(self):
         img = self.local_img(scale=self.scale)
         return cv2.resize(img, (self.inp_shape[0], self.inp_shape[1]), interpolation=cv2.INTER_NEAREST) / 255
+
+    # def get_local_img_observation(self):
+    #     img = self.local_img(scale=self.scale)
+
+    #     # center = (img.shape[1] // 2, img.shape[0] // 2)
+    #     # M = cv2.getRotationMatrix2D(center, self.current_angle, 1.0)
+    #     # img = cv2.warpAffine(img, M, (img.shape[1], img.shape[0]))
+        
+    #     if self.dir_idx == 0:      # facing left → rotate 90° CW
+    #         img = np.rot90(img, k=3)
+    #     elif self.dir_idx == 2:    # facing right → rotate 90° CCW
+    #         img = np.rot90(img, k=1)
+    #     elif self.dir_idx == 3:    # facing down → rotate 180°
+    #         img = np.rot90(img, k=2)
+
+    #     return cv2.resize(
+    #         img,
+    #         (self.inp_shape[0], self.inp_shape[1]),
+    #         interpolation=cv2.INTER_NEAREST
+    #     ) / 255.0
 
     def img(self, scale=10):
         img = np.zeros((self.size, self.size, 3), dtype=np.uint8) + 100
@@ -370,17 +403,18 @@ def expected_toroidal_connections(
 
 CONNECTIVITY_TYPE = "toroidal"
 WINDOW_EPISODES = 100
-BOARD_SIZE = 4
+BOARD_SIZE = 5
 
 VISIBLE_RANGE = 5
-SCALE = 2
+SCALE = 4
 
 WAIT_INC = 30
 
 INPUT_C = 3
 
-INPUT_SHAPE = (10, 10, INPUT_C)
-# DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
+INPUT_SHAPE = (20, 20, INPUT_C)
+DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
+UNIFIED_SHAPE = (30, 30, INPUT_C)
 HIDDEN_E_SHAPE = (20, 20, INPUT_C)
 HIDDEN_I_SHAPE = (15, 15, INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
@@ -391,11 +425,11 @@ GAUSSIAN_TRACE_POLICY = False
 SIGMA_IN = 0.1
 SIGMA_H = 0.05
 
-DESIRED_FAN_IN_IN = 100
-DESIRED_FAN_IN_H1 = 100
-DESIRED_FAN_IN_H2 = 100
+DESIRED_FAN_IN_IN = 300
+DESIRED_FAN_IN_H1 = 300
+DESIRED_FAN_IN_H2 = 300
 
-FAN_IN_SCALE_IN = 0.25
+# FAN_IN_SCALE_IN = 0.25
 
 def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
     src_h, src_w, src_c = src_shape
@@ -440,8 +474,10 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 
 
 NUM_OUTPUT = 4
+NUM_OUTPUT_CHART = NUM_OUTPUT
 if GAUSSIAN_TRACE_POLICY:
-    NUM_OUTPUT = 4
+    NUM_OUTPUT = 1
+    NUM_OUTPUT_CHART = 3
 
 CONN_P = {
     "I-H": 0.001,
@@ -450,7 +486,7 @@ CONN_P = {
     #"H-H": np.log(NUM_HIDDEN_1+NUM_HIDDEN_2)/(NUM_HIDDEN_1 + NUM_HIDDEN_2),
     "H-P": 0.1,
     "H-V": 0.1,
-    "F": 0.5
+    "F": 1.0
 }
 
 
@@ -486,23 +522,24 @@ expected_conns += aux_conns * int(CONNECTIVITY_TYPE=="toroidal")
 
 TRAIN = True
 
-CHECKPOINT_BOARD_SIZE = None # "6"
+CHECKPOINT_BOARD_SIZE = None # "7"
 if CHECKPOINT_BOARD_SIZE is not None:
     CONNECTIVITY_TYPE = "fixed"
 KERNEL_PROFILING = False
 
 
-gamma = 0.5** (1/WAIT_INC)
+reward_decay = 0.1 ** (1/WAIT_INC)
+gamma = 0.5 ** (1/WAIT_INC)
 td_lambda = 0.8 ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 0.0*1e-3
+entropy_coeff = 1e-0
 entropy_decay = 0.99999 ** (1/WAIT_INC)
-entropy_coeff_min = 0.0*1e-7
+entropy_coeff_min = 0.0 * 1e-7
 
 dale_l1_reg = 0.0
 
-serialiser = Numpy("snake_checkpoints_downsample")
+serialiser = Numpy("snake_checkpoints_unified")
 network = Network(default_params)
 hidden_layers = {}
 
@@ -566,333 +603,346 @@ def make_connectivity(
     else:
         raise ValueError(f"Unknown connectivity_type: {connectivity_type}")
 
+@dataclass
+class EILayerConfig:
+    """Configuration for a single EI layer."""
+    e_shape: Tuple[int, ...]
+    i_shape: Tuple[int, ...]
+    
+    # Neuron params
+    v_thresh: float = 0.61
+    tau_mem: float = 10.0
+    tau_refrac: float = 3.0
+    tau_adapt: float = 300.0
+    beta: float = 0.0174
+    
+    # Connectivity
+    connectivity_type: str = "toroidal"   # "toroidal" | "fixed"
+    sigma: float = 0.05
+    desired_fan_in_ee: int = 100
+    desired_fan_in_ei: int = 100
+    desired_fan_in_ie: int = 100
+    desired_fan_in_ii: int = 100
+    p_ee: float = 0.005  # used only if connectivity_type == "fixed"
+    p_ei: float = 0.005
+    p_ie: float = 0.005
+    p_ii: float = 0.005
+
+    # Weight init scales
+    mean_scale: float = 0.1
+    sd_scale: float = 0.05
+
+
+class EILayer:
+    """
+    A single Excitatory-Inhibitory layer.
+    
+    Creates E and I populations and wires all four internal
+    connections (E→E, E→I, I→E, I→I) using Dale's law signs.
+    
+    External connections (input→layer, layer→output) are handled
+    by connect_input() / connect_output(), keeping the EI layer
+    self-contained but composable.
+    """
+
+    def __init__(self, cfg: EILayerConfig, name: str = ""):
+        self.cfg = cfg
+        self.name = name
+        self.e: Optional[Population] = None
+        self.i: Optional[Population] = None
+        self._internal_connections: list = []
+
+    # ------------------------------------------------------------------
+    # Build populations + internal wiring (call inside `with network:`)
+    # ------------------------------------------------------------------
+    def build(self):
+        cfg = self.cfg
+        suffix = f"_{self.name}" if self.name else ""
+
+        neuron_kwargs = dict(
+            v_thresh=cfg.v_thresh,
+            tau_mem=cfg.tau_mem,
+            tau_refrac=cfg.tau_refrac,
+            tau_adapt=cfg.tau_adapt,
+            beta=cfg.beta,
+        )
+
+        self.e = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.e_shape)
+        self.i = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.i_shape)
+
+        # Wire all four internal connections
+        internal = [
+            # (pre,    post,   src_shape,    fan_in,              p,          sign)
+            (self.e, self.e, cfg.e_shape, cfg.desired_fan_in_ee, cfg.p_ee,  +1),
+            (self.e, self.i, cfg.e_shape, cfg.desired_fan_in_ei, cfg.p_ei,  +1),
+            (self.i, self.e, cfg.i_shape, cfg.desired_fan_in_ie, cfg.p_ie,  -1),
+            (self.i, self.i, cfg.i_shape, cfg.desired_fan_in_ii, cfg.p_ii,  -1),
+        ]
+
+        for pre, post, src_shape, fan_in, p, sign in internal:
+            conn = Connection(
+                pre, post,
+                make_connectivity(
+                    connectivity_type=cfg.connectivity_type,
+                    src_shape=src_shape,
+                    p=p,
+                    sigma=cfg.sigma,
+                    desired_fan_in=fan_in,
+                    sign=sign,
+                    mean_scale=cfg.mean_scale,
+                    sd_scale=cfg.sd_scale,
+                ),
+                exc_inh_sign=sign,
+            )
+            self._internal_connections.append(conn)
+
+        return self  # allow chaining: layer = EILayer(cfg).build()
+
+    # ------------------------------------------------------------------
+    # External connectivity helpers
+    # ------------------------------------------------------------------
+    def connect_from(
+        self,
+        source: Population,
+        src_shape: Tuple,
+        connectivity_type: str = None,
+        desired_fan_in: int = 100,
+        p: float = 0.01,
+        sigma: float = None,
+        fan_in_scale: float = None,
+    ):
+        """
+        Connect an external source population into both E and I
+        populations of this layer (always excitatory input).
+        """
+        cfg = self.cfg
+        c_type = connectivity_type or cfg.connectivity_type
+        sig    = sigma or cfg.sigma
+
+        for target in (self.e, self.i):
+            Connection(
+                source, target,
+                make_connectivity(
+                    connectivity_type=c_type,
+                    src_shape=src_shape,
+                    p=p,
+                    sigma=sig,
+                    desired_fan_in=desired_fan_in,
+                    fan_in_scale=fan_in_scale,
+                    sign=+1,
+                    mean_scale=cfg.mean_scale,
+                    sd_scale=cfg.sd_scale,
+                ),
+                exc_inh_sign=+1,
+            )
+
+    def connect_to_next(
+        self,
+        next_layer: "EILayer",
+        p: float = 0.01,
+        sigma: float = None,
+        fan_in_scale: float = None,
+    ):
+        cfg = self.cfg
+        sig = sigma or cfg.sigma
+
+        for target in (next_layer.e, next_layer.i):
+            Connection(
+                self.e, target,
+                make_connectivity(
+                    connectivity_type=cfg.connectivity_type,
+                    src_shape=cfg.e_shape,
+                    p=p,
+                    sigma=sig,
+                    desired_fan_in=cfg.desired_fan_in_ee,
+                    fan_in_scale=fan_in_scale,
+                    sign=+1,
+                    mean_scale=cfg.mean_scale,
+                    sd_scale=cfg.sd_scale,
+                ),
+                exc_inh_sign=+1,
+            )
+
+        for target in (next_layer.e, next_layer.i):
+            Connection(
+                self.i, target,
+                make_connectivity(
+                    connectivity_type=cfg.connectivity_type,
+                    src_shape=cfg.i_shape,
+                    p=p,
+                    sigma=sig,
+                    desired_fan_in=cfg.desired_fan_in_ie,
+                    fan_in_scale=fan_in_scale,
+                    sign=-1,
+                    mean_scale=cfg.mean_scale,
+                    sd_scale=cfg.sd_scale,
+                ),
+                exc_inh_sign=-1,
+            )
+
+    def connect_to_field(
+        self,
+        field: Population,
+        p: float = 0.5,
+        sigma: float = None,
+        fan_in_scale: float = None,
+    ):
+        cfg = self.cfg
+        sig = sigma or cfg.sigma
+
+        for src, sign, src_shape, fan_in in (
+            (self.e, +1, cfg.e_shape, cfg.desired_fan_in_ee),
+            (self.i, -1, cfg.i_shape, cfg.desired_fan_in_ie),
+        ):
+            Connection(
+                src, field,
+                make_connectivity(
+                    connectivity_type=cfg.connectivity_type,
+                    src_shape=src_shape,
+                    p=p,
+                    sigma=sig,
+                    desired_fan_in=fan_in,
+                    fan_in_scale=fan_in_scale,
+                    sign=sign,
+                    mean_scale=cfg.mean_scale,
+                    sd_scale=cfg.sd_scale,
+                ),
+                exc_inh_sign=sign,
+            )
+
+    def connect_feedback(
+        self,
+        output_pop: Population,
+        feedback_name: str,
+        p: float = 0.5,
+        n_output: int = 4,
+    ):
+        """
+        Wire both E and I populations as feedback sources to an
+        output head, respecting Dale's law.
+        """
+        for hidden, sign in ((self.e, +1), (self.i, -1)):
+            Connection(
+                hidden, output_pop,
+                FixedProbability(p, Normal(sd=1.0 / np.sqrt(n_output))),
+                feedback_name=feedback_name,
+                exc_inh_sign=sign,
+            )
+    
+    def populations(self):
+        """Return (e, i) tuple — useful for iterating over all hidden pops."""
+        return self.e, self.i
+
 
 def build_compiled_network(connectivity_type="fixed"):
     global dale_l1_reg
     network = Network(default_params)
     hidden_layers = {}
 
+    ei_cfg = EILayerConfig(
+        e_shape=HIDDEN_E_SHAPE,
+        i_shape=HIDDEN_I_SHAPE,
+        connectivity_type=connectivity_type,
+        sigma=SIGMA_H,
+        desired_fan_in_ee=DESIRED_FAN_IN_H1,
+        desired_fan_in_ei=DESIRED_FAN_IN_H1,
+        desired_fan_in_ie=DESIRED_FAN_IN_H2,
+        desired_fan_in_ii=DESIRED_FAN_IN_H2,
+    )
+
     with network:
+        input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE)
 
-        # ================= POPULATIONS =================
+        ei_layers = []
+        for i in range(1):  # increase to stack more layers
+            ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
 
-        input_pop = Population(
-            SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE
+        policy_field = Population(
+            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300),
+            HIDDEN_I_SHAPE
         )
-
-        # hidden_layers["downsample"] = Population(
-        #     AdaptiveLeakyIntegrateFire(
-        #         v_thresh=0.61,
-        #         tau_mem=10.0,
-        #         tau_refrac=3.0,
-        #         tau_adapt=300,
-        #         beta=0.0
-        #     ),
-        #     DOWNSAMPLE_SHAPE
-        # )
-
-        hidden_layers["E"] = Population(
-            AdaptiveLeakyIntegrateFire(
-                v_thresh=0.61,
-                tau_mem=10.0,
-                tau_refrac=3.0,
-                tau_adapt=300,
-            ),
-            HIDDEN_E_SHAPE
-        )
-
-        hidden_layers["I"] = Population(
-            AdaptiveLeakyIntegrateFire(
-                v_thresh=0.61,
-                tau_mem=10.0,
-                tau_refrac=3.0,
-                tau_adapt=300,
-            ),
+        value_field = Population(
+            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300),
             HIDDEN_I_SHAPE
         )
 
-        
-        # hidden_layers["policy_field"] = Population(
-        #     AdaptiveLeakyIntegrateFire(
-        #         v_thresh=0.61,
-        #         tau_mem=10.0,
-        #         tau_refrac=3.0,
-        #         tau_adapt=300,
-        #     ),
-        #     HIDDEN_I_SHAPE
-        # )
-        policy = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
-            NUM_OUTPUT
+        # policy_field = EILayer(ei_cfg, name=f"policy_field").build()
+        # value_field = EILayer(ei_cfg, name=f"value_field").build()
+
+        policy = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), NUM_OUTPUT)
+        value  = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+
+        # Input → first EI layer (excitatory only, using full connectivity_type)
+        ei_layers[0].connect_from(
+            input_pop, INPUT_SHAPE,
+            connectivity_type=connectivity_type,
+            desired_fan_in=DESIRED_FAN_IN_IN,
+            sigma=SIGMA_IN,
+            # fan_in_scale=FAN_IN_SCALE_IN,
         )
 
+        # Stack EI layers
+        for i in range(len(ei_layers) - 1):
+            ei_layers[i].connect_to_next(ei_layers[i+1])
 
-        # hidden_layers["value_field"] = Population(
-        #     AdaptiveLeakyIntegrateFire(
-        #         v_thresh=0.61,
-        #         tau_mem=10.0,
-        #         tau_refrac=3.0,
-        #         tau_adapt=300,
-        #     ),
-        #     HIDDEN_I_SHAPE
-        # )
-        value = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
-            1
-        )
+        # Last EI layer → field layers
+        ei_layers[-1].connect_to_field(policy_field, p=CONN_P["H-H"])
+        ei_layers[-1].connect_to_field(value_field,  p=CONN_P["H-H"])
 
-        # ================= INPUT → HIDDEN =================
-        # Connection(
-        #     input_pop,
-        #     hidden_layers["downsample"],
-        #     make_connectivity(
-        #         connectivity_type=connectivity_type,
-        #         src_shape=INPUT_SHAPE,
-        #         p=CONN_P["I-H"], 
-        #         sigma=SIGMA_IN, 
-        #         desired_fan_in=DESIRED_FAN_IN_IN,
-        #         sign=1
-        #     ),
-        #     exc_inh_sign=1
-        # )
-
-        for layer, prob, c_type in [
-            (hidden_layers["I"], CONN_P["I-H"], connectivity_type),
-            (hidden_layers["E"], CONN_P["I-H"], connectivity_type),
-            # (policy, CONN_P["D-O"], "fixed"),
-            # (value, CONN_P["D-O"], "fixed"),
-        ]:
+        # Field layers → output heads (forward + feedback)
+        for field, head, feedback_name in (
+            (policy_field, policy, "policy_feedback"),
+            (value_field,  value,  "value_feedback"),
+        ):
+            # for pop in field.populations():
             Connection(
-                # hidden_layers["downsample"],
-                input_pop,
-                layer,
-                make_connectivity(
-                    connectivity_type=c_type,
-                    # src_shape=DOWNSAMPLE_SHAPE,
-                    src_shape=INPUT_SHAPE,
-                    p=prob,
-                    sigma=SIGMA_IN,
-                    desired_fan_in=DESIRED_FAN_IN_IN,
-                    fan_in_scale=FAN_IN_SCALE_IN,
-                    sign=1
-                ),
-                exc_inh_sign=1
-            )
-
-        # ================= EXCITATORY =================
-        for layer, prob, c_type, sign in [
-            (hidden_layers["I"], CONN_P["H-H"], connectivity_type, 1),
-            (hidden_layers["E"], CONN_P["H-H"], connectivity_type, 1),
-            # (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, 1),
-            # (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, 1),
-            (policy, CONN_P["H-P"], "fixed", 1),
-            (value, CONN_P["H-V"], "fixed", 1),
-        ]:
-            Connection(
-                hidden_layers["E"],
-                layer,
-                make_connectivity(
-                    connectivity_type=c_type,
-                    src_shape=HIDDEN_E_SHAPE,
-                    p=prob,
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H1,
-                    sign=sign
-                ),
-                exc_inh_sign=sign
-            )
-
-        """
-        for layer in [
-            hidden_layers["I"],
-            hidden_layers["E"],
-            hidden_layers["downsample"],
-        ]:
-            Connection(
-                hidden_layers["E"],
-                layer,
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_E_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H1,
-                    sign=None
-                ),
-                target_var="ISynSigmaEps",
-                exc_inh_sign=None
-            )
-
-            Connection(
-                layer,
-                hidden_layers["E"],
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_E_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H1,
-                    sign=1
-                ),
-                feedback_name="pert_eps_feedback",
-                exc_inh_sign=1
-            )
-            Connection(
-                layer,
-                hidden_layers["E"],
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_E_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H1,
-                    sign=1
-                ),
-                feedback_name="pert_sigma_feedback",
-                exc_inh_sign=1
-            )"""
-
-        # ================= INHIBITORY =================
-        for layer, prob, c_type, sign in [
-            (hidden_layers["I"], CONN_P["H-H"], connectivity_type, -1),
-            (hidden_layers["E"], CONN_P["H-H"], connectivity_type, -1),
-            # (hidden_layers["policy_field"], CONN_P["H-H"], connectivity_type, -1),
-            # (hidden_layers["value_field"], CONN_P["H-H"], connectivity_type, -1),
-            (policy, CONN_P["H-P"], "fixed", -1),
-            (value, CONN_P["H-V"], "fixed", -1),
-        ]:
-            Connection(
-                hidden_layers["I"],
-                layer,
-                make_connectivity(
-                    connectivity_type=c_type,
-                    src_shape=HIDDEN_I_SHAPE,
-                    p=prob,
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H2,
-                    sign=sign
-                ),
-                exc_inh_sign=sign
-            )
-
-        """
-        for layer in [
-            hidden_layers["I"],
-            hidden_layers["E"],
-            hidden_layers["downsample"]
-        ]:
-            Connection(
-                hidden_layers["I"],
-                layer,
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_I_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H2,
-                    sign=None
-                ),
-                target_var="ISynSigmaEps",
+                field, head,
+                make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=0.99999, sign=None),
                 exc_inh_sign=None
             )
             Connection(
-                layer,
-                hidden_layers["I"],
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_I_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H2,
-                    sign=-1
-                ),
-                feedback_name="pert_eps_feedback",
-                exc_inh_sign=-1
+                field, head,
+                FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                feedback_name=feedback_name,
+                exc_inh_sign=None
             )
-            Connection(
-                layer,
-                hidden_layers["I"],
-                make_connectivity(
-                    connectivity_type=connectivity_type,
-                    src_shape=HIDDEN_I_SHAPE,
-                    p=CONN_P["H-H"],
-                    sigma=SIGMA_H,
-                    desired_fan_in=DESIRED_FAN_IN_H2,
-                    sign=-1
-                ),
-                feedback_name="pert_sigma_feedback",
-                exc_inh_sign=-1
-            )"""
+           
+        # for pop in ei_layers[-1].populations():
+        #     Connection(
+        #         pop, policy,
+        #         make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=CONN_P["H-P"], sign=None),
+        #         exc_inh_sign=None
+        #     )
+        #     Connection(
+        #         pop, value,
+        #         make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=CONN_P["H-V"], sign=None),
+        #         exc_inh_sign=None
+        #     )
 
-        # ================= OUTPUT CONNECTIONS =================
-        # Connection(
-        #     hidden_layers["policy_field"],
-        #     policy,
-        #     make_connectivity(
-        #         connectivity_type="fixed",
-        #         src_shape=HIDDEN_I_SHAPE,
-        #         p=0.5,
-        #         sigma=SIGMA_H,
-        #         desired_fan_in=DESIRED_FAN_IN_H2,
-        #         sign=None
-        #     ),
-        #     exc_inh_sign=None
-        # )
-        # Connection(
-        #     hidden_layers["value_field"],
-        #     value,
-        #     make_connectivity(
-        #         connectivity_type="fixed",
-        #         src_shape=HIDDEN_I_SHAPE,
-        #         p=0.99999,
-        #         sigma=SIGMA_H,
-        #         desired_fan_in=DESIRED_FAN_IN_H2,
-        #         sign=None
-        #     ),
-        #     exc_inh_sign=None
-        # )
+        # tde_transport from policy, all EI pops, and both fields
+        Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
+        for layer in ei_layers:
+            for pop in layer.populations():
+                Connection(pop, value, Dense(weight=1.0), feedback_name="tde_transport")
+        for field in (policy_field, value_field):
+            # for pop in field.populations():
+            Connection(field, value, Dense(weight=1.0), feedback_name="tde_transport")
 
-        # ================= FEEDBACK CONNECTIONS =================
-        Connection(
-            policy, value, Dense(weight=1.0),
-            feedback_name="tde_transport"
-        )
-        for hidden_layer in hidden_layers.values():
-            Connection(
-                hidden_layer, value, Dense(weight=1.0),
-                feedback_name="tde_transport"
-            )
-            sign = None
-            if hidden_layer == hidden_layers["E"]:
-                sign = 1
-            elif hidden_layer == hidden_layers["I"]:
-                sign = -1
-
-            Connection(
-                hidden_layer, policy,
-                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name="policy_feedback",
-                exc_inh_sign=sign
-            )
-            Connection(
-                hidden_layer, policy,
-                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name="policy_regularisation",
-                exc_inh_sign=sign
-            )
-            Connection(
-                hidden_layer, value,
-                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name="value_feedback",
-                exc_inh_sign=sign
-            )
-            Connection(
-                hidden_layer, value,
-                FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name="value_regularisation",
-                exc_inh_sign=sign
-            )
-            
+        # policy/value feedback from EI layers
+        for layer in ei_layers:
+            for pop in layer.populations():
+                Connection(
+                    pop, policy,
+                    FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                    feedback_name="policy_feedback",
+                    exc_inh_sign=None
+                )
+                Connection(
+                    pop, value,
+                    FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                    feedback_name="value_feedback",
+                    exc_inh_sign=None
+                )
 
     # ================= COMPILER =================
     dale_l1_reg = 0.0001/np.sqrt(DESIRED_FAN_IN_IN)
@@ -903,16 +953,18 @@ def build_compiled_network(connectivity_type="fixed"):
     compiler = EPropCompiler(
         example_timesteps=1,
         losses={
-            policy: "sparse_categorical_crossentropy" 
+            policy: "mean_square_error" # "sparse_categorical_crossentropy" 
                 if not GAUSSIAN_TRACE_POLICY else 
                 "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=Adam(1e-4), #, soft_grad_clip=10), 
-        # optimiser=Adam(1e-4, clamp_grad=(-5.0, 5.0)),
+        optimiser=Adam(8e-5), #, soft_grad_clip=10), 
+        # optimiser=Adam(1e-4, clamp_grad=(-10.0, 10.0)),
+        # c_reg=1e-2,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
+        reward_decay=reward_decay,
         gamma=gamma,
         td_lambda=td_lambda,
         train_output_bias=False,
@@ -922,7 +974,9 @@ def build_compiled_network(connectivity_type="fixed"):
         entropy_coeff_min=entropy_coeff_min,
         dale_rewiring_l1_strength=dale_l1_reg,
         policy_heads={
-            policy: PolicyTypes.CATEGORICAL if not GAUSSIAN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
+            policy: PolicyTypes.GENERIC 
+            if not GAUSSIAN_TRACE_POLICY 
+            else PolicyTypes.GAUSSIAN_TRACE, 
         },
         value_head=value
     )
@@ -932,7 +986,8 @@ def build_compiled_network(connectivity_type="fixed"):
 
     compiled_net = compiler.compile(network)
 
-    return compiled_net, network, input_pop, hidden_layers, policy, value
+    # return compiled_net, network, input_pop, hidden_layers, policy, value
+    return compiled_net, network, input_pop, {i: l for i, l in enumerate(ei_layers[0].populations())}, policy, value
 
 compiled_net, network, input_pop, hidden_layers, policy, value = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
@@ -996,14 +1051,14 @@ def make_repeated_spikes(
 
     return preprocess_spikes(times, idxs, input_size)
 
-def make_rate_coded_spikes(
+def make_poisson_spikes(
     values,    
     base_timestep,
     input_size,
     K,
     bg_noise=0.0   
 ):
-    values = np.clip(values + bg_noise, 0.0, 1.0)
+    values = np.clip(values + bg_noise, 0.0, 1.0) * 0.3
     # print(values)
     # for i in range(INPUT_SHAPE[0]):
     #     print()
@@ -1104,7 +1159,7 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     ax2.set_ylabel('Value')
     ax2.legend()
 
-    prob_img = ax3.imshow(np.zeros((4,1)), aspect='auto', origin='lower', vmin=0, vmax=1)
+    prob_img = ax3.imshow(np.zeros((NUM_OUTPUT_CHART,1)), aspect='auto', origin='lower', vmin=0, vmax=1)
     ax3.set_xlabel('Timestep'); ax3.set_ylabel('Action'); ax3.set_title('Action probs (best run)')
     fig.colorbar(prob_img, ax=ax3, fraction=0.02, pad=0.04)
 
@@ -1122,84 +1177,79 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     plot_interval = 0.2  # seconds
 
     while not stop_event.is_set():
-        try:
-            # drain queue (non-blocking) to keep latest metrics
-            while True:
-                metrics = metrics_q.get_nowait()
-                # expected fields: {'ep': int, 'reward': float, 'running_avg': float, 'snake_len': int,
-                #                   'best_values': [..] (optional), 'best_probs': 2D array (optional)}
-                ep = metrics.get('ep')
-                if ep is not None:
-                    ep_list.append(ep)
-                    rewards.append(metrics.get('reward', 0.0))
-                    avgs.append(metrics.get('running_avg', 0.0))
-                    lens.append(metrics.get('snake_len', 0))
-                if 'best_values' in metrics:
-                    best_values = metrics['best_values']
-                    best_reward_traces = metrics['best_reward_traces']
-                    best_value_function_values = metrics['best_value_function_values']
-                if 'best_probs' in metrics:
-                    best_probs = metrics['best_probs']
-                
-        except Exception:
-            pass
+        while not metrics_q.empty():
+            metrics = metrics_q.get_nowait()
+            # expected fields: {'ep': int, 'reward': float, 'running_avg': float, 'snake_len': int,
+            #                   'best_values': [..] (optional), 'best_probs': 2D array (optional)}
+            ep = metrics.get('ep')
+            if ep is not None:
+                ep_list.append(ep)
+                rewards.append(metrics.get('reward', 0.0))
+                avgs.append(metrics.get('running_avg', 0.0))
+                lens.append(metrics.get('snake_len', 0))
+            if 'best_values' in metrics:
+                best_values = metrics['best_values']
+                best_reward_traces = metrics['best_reward_traces']
+                best_value_function_values = metrics['best_value_function_values']
+            if 'best_probs' in metrics:
+                best_probs = metrics['best_probs']
 
-        now = time.time()
-        if now - last_plot_time > plot_interval:
-            if len(ep_list) > 0:
-                axis = ep_list
-                line_reward.set_data(axis, rewards)
-                avg_line.set_data(axis, avgs)
-                snake_len_line.set_data(axis, lens)
-                ax1.relim(); ax1.autoscale_view()
+        if len(ep_list) > 0:
+            axis = ep_list
+            line_reward.set_data(axis, rewards)
+            avg_line.set_data(axis, avgs)
+            snake_len_line.set_data(axis, lens)
+            ax1.relim(); ax1.autoscale_view()
 
-            if len(rewards) > 0:
-                recent_rewards = rewards[-WINDOW_EPISODES:]
-                recent_avgs = avgs[-WINDOW_EPISODES:]
+        if len(rewards) > 0:
+            recent_rewards = rewards[-WINDOW_EPISODES:]
+            recent_avgs = avgs[-WINDOW_EPISODES:]
 
-                axis_recent = np.arange(len(recent_rewards))
-                line_reward_recent.set_data(axis_recent, recent_rewards)
-                avg_line_recent.set_data(axis_recent, recent_avgs)
+            axis_recent = np.arange(len(recent_rewards))
+            line_reward_recent.set_data(axis_recent, recent_rewards)
+            avg_line_recent.set_data(axis_recent, recent_avgs)
 
-                ax1b.relim()
-                ax1b.autoscale_view()
+            ax1b.relim()
+            ax1b.autoscale_view()
 
-            if best_values:
-                value_line.set_data(range(len(best_values)), best_values)
-                reward_trace_line.set_data(range(len(best_reward_traces)), best_reward_traces)
-                # value_function_line.set_data(range(len(best_value_function_values)), best_value_function_values)
-                ax2.relim(); ax2.autoscale_view()
+        if best_values:
+            value_line.set_data(range(len(best_values)), best_values)
+            reward_trace_line.set_data(range(len(best_reward_traces)), best_reward_traces)
+            # value_function_line.set_data(range(len(best_value_function_values)), best_value_function_values)
+            ax2.relim(); ax2.autoscale_view()
 
-            if best_probs is not None:
-                data = np.array(best_probs).T                     # shape: (n_actions, time_steps)
-                n_actions, time_steps = data.shape
+        if best_probs is not None:
+            data = np.array(best_probs).T                     # shape: (n_actions, time_steps)
+            n_actions, time_steps = data.shape
 
-                prob_img.set_data(data)
+            prob_img.set_data(data)
 
-                # IMPORTANT: force full stretching just like original code
-                prob_img.set_extent([0, time_steps, 0, n_actions])
+            # IMPORTANT: force full stretching just like original code
+            prob_img.set_extent([0, time_steps, 0, n_actions])
 
-                ax3.set_xlim(0, time_steps)
-                ax3.set_ylim(0, n_actions)
-                ax3.set_aspect('auto')
+            ax3.set_xlim(0, time_steps)
+            ax3.set_ylim(0, n_actions)
+            ax3.set_aspect('auto')
 
-            plt.pause(0.001)
-            last_plot_time = now
-
-        time.sleep(0.03)  # give CPU a break
+        plt.pause(0.1)
+        time.sleep(0.1)  # give CPU a break
 
     plt.close(fig)
 
 # --- Visualization process: show best + random runs using OpenCV ---
-def viz_runs_loop(best_run_q: Queue, random_run_q: Queue, stop_event: mp.Event, decompress=True):
+def viz_runs_loop(
+        best_run_q: Queue, 
+        random_run_q: Queue, 
+        stop_event: mp.Event, 
+        decompress=True):
     # best run stored as encoded frames (bytes) or arrays; we'll decode on display
     best_run = []
     random_run = []
     window_best = "Best Run"
     window_random = "Random Run"
 
-    cv2.namedWindow(window_best, flags=cv2.WINDOW_GUI_NORMAL + cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow(window_random, flags=cv2.WINDOW_GUI_NORMAL + cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(window_best)
+    cv2.namedWindow(window_random)
     cv2.resizeWindow(window_best, 600, 600)
     cv2.resizeWindow(window_random, 600, 600)
 
@@ -1354,7 +1404,7 @@ def viz_sigma_loop(sigma_q: Queue, stop_event: mp.Event, shape_e, shape_i):
 # --- Wiring: start processes and pass queues to trainer ---
 def start_visualizers():
     manager = Manager()
-    metrics_q = manager.Queue(maxsize=10)
+    metrics_q = manager.Queue(maxsize=1000)
     best_run_q = manager.Queue(maxsize=2)
     random_run_q = manager.Queue(maxsize=2)
     sigma_q = manager.Queue(maxsize=2)
@@ -1363,16 +1413,43 @@ def start_visualizers():
     p_plots = mp.Process(target=viz_plots_loop, args=(metrics_q, stop_event), daemon=True)
     p_runs = mp.Process(target=viz_runs_loop, args=(best_run_q, random_run_q, stop_event), daemon=True)
     p_sigma = mp.Process(target=viz_sigma_loop, args=(sigma_q, stop_event, HIDDEN_E_SHAPE, HIDDEN_I_SHAPE), daemon=True)
+    # p_sigma = None
+
 
     p_plots.start()
     p_runs.start()
     p_sigma.start()
     return manager, metrics_q, best_run_q, random_run_q, sigma_q, stop_event, p_plots, p_runs, p_sigma
 
+
+# CSV_OUTPUT = "outputs/weight-back-dist-eprop-fields-hidden-layers-1-lambda-099.csv"
+# CSV_OUTPUT = "outputs/rand-eprop-with-noise-little-dist-weight.csv"
+# CSV_OUTPUT = "outputs/rand-eprop-fields-hidden-layers-5.csv"
+# CSV_OUTPUT = "outputs/weight-dist-eprop-fields-hidden-layers-5.csv"
+CSV_OUTPUT = "outputs/experiment_1.csv"
+os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
+
+# ALWAYS reset file for a new run
+if os.path.exists(CSV_OUTPUT):
+    os.remove(CSV_OUTPUT)
+
+with open(CSV_OUTPUT, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "episode",
+        "score",
+        "ep_steps",
+        "avg_abs_td_error",
+        "reward_rate",
+        "voltage",
+        "voltage_loss",
+        "frequency"
+    ])
+
 # --- Modify your train_snake_agent to send updates instead of internal plotting ---
 # Replace plt.ion() + figure creation in train_snake_agent with nothing and send updates to queues.
 # I will show a skeleton wrapper around your train loop:
-def train_snake_agent_with_ipc(episodes=1e10,
+def train_snake_agent_with_ipc(episodes=10000,
                                metrics_q: Queue=None,
                                best_run_q: Queue=None,
                                random_run_q: Queue=None,
@@ -1413,14 +1490,17 @@ def train_snake_agent_with_ipc(episodes=1e10,
         
         v_avg = 0
         v_reg_loss_avg = 0
+        freq_avg = 0
+        gamma_disc_reward = 0
+
         for ep in range(episodes):
-            if env.won:
-                compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
-                compiled_net.save((BOARD_SIZE,), serialiser)
-                best_reward = -np.inf
-                BOARD_SIZE += 1
-                print(f"WON! Increasing board size to {BOARD_SIZE}")
-                env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE)
+            # if env.won:
+            #     compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
+            #     compiled_net.save((BOARD_SIZE,), serialiser)
+            #     best_reward = -np.inf
+            #     BOARD_SIZE += 1
+            #     print(f"WON! Increasing board size to {BOARD_SIZE}")
+            #     env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE)
             if (ep) % 1000 == 0:
                 print("/////////////////////////////")
                 connections_sum = 0
@@ -1468,7 +1548,7 @@ def train_snake_agent_with_ipc(episodes=1e10,
             current_value_function_values = []
             current_probs = []
             # total_td = 0
-            frame = 1
+            ep_frames = 0
             # value_target = 0
 
             """
@@ -1481,7 +1561,7 @@ def train_snake_agent_with_ipc(episodes=1e10,
                 period=1
             )
             """
-            spikes = make_rate_coded_spikes(
+            spikes = make_poisson_spikes(
                 obs.reshape(-1),
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
@@ -1492,9 +1572,10 @@ def train_snake_agent_with_ipc(episodes=1e10,
             # previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
             reward_trace = 0
-            # td_error_trace = 0
+            td_error_sum_abs = 0
 
             while not done:
+                gamma_disc_reward *= gamma
                 action_label = 0
                 current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)
@@ -1504,68 +1585,152 @@ def train_snake_agent_with_ipc(episodes=1e10,
                     # print(sum(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view), sum(np.exp(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view)) )
                     # print("----------------")
                     if GAUSSIAN_TRACE_POLICY:
-                        action = compiled_net.get_readout(policy).flatten()
-                        probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
-                        action_label = np.random.choice(4, p=probs)
-                    else:
-                        probs = compiled_net.get_readout(policy).flatten()
-                        if abs(sum(probs) - 1.0) > 0.0001:
-                            raise ValueError(f"BAD PROBS {probs}")
-                        action_label = np.random.choice(4, p=probs)
+                        # action = compiled_net.get_readout(policy).flatten()
+                        compiled_net.neuron_populations[policy].vars["TanhOut"].pull_from_device()
+                        action_scalar = compiled_net.neuron_populations[policy].vars["TanhOut"].view[0]
 
-                        compiled_net.losses[policy].set_target(
-                            compiled_net.neuron_populations[policy],
-                            [action_label], policy.shape, 
-                            compiled_net.genn_model.batch_size,
-                            compiled_net.example_timesteps
-                        )
-                        compiled_net.losses[policy].set_var(
-                            compiled_net.neuron_populations[policy], "actionTaken", 1.0
-                        )
+                        x = np.clip(action_scalar, -1.0, 1.0)
+                        p_left  = max(0.0, -x)
+                        p_right = max(0.0,  x)
+                        p_fwd   = 1.0 - abs(x)
+
+                        probs = np.array([p_left, p_fwd, p_right])
+                        probs = probs / probs.sum()
+
+                        # map to your action space
+                        # assuming: 0=left, 1=forward, 2=right
+                        action_label = np.random.choice(3, p=probs)
+
+                        # relative action → absolute direction
+                        # 0 = left turn, 1 = forward, 2 = right turn
+                        dir_idx = env.dir_idx
+                        if action_label == 0:   # left
+                            dir_idx = (dir_idx - 1) % 4
+                        elif action_label == 2: # right
+                            dir_idx = (dir_idx + 1) % 4
+                        
+                        # forward = no change
+                        action_label = dir_idx
+                    else:
+                        logits = compiled_net.get_readout(policy).flatten()
+                        shifted_logits = logits - logits.max()
+                        exp_logs = np.exp(shifted_logits)
+                        probs = exp_logs / (exp_logs.sum() + 1e-8)
+                        
+                        # if abs(sum(probs) - 1.0) > 0.0001:
+                        #     raise ValueError(f"BAD PROBS {probs}")
+                        action_label = np.random.choice(NUM_OUTPUT, p=probs)
+
+                        y_true = np.zeros(NUM_OUTPUT)
+                        y_true[action_label] = 1.0
+                        PG = (probs - y_true)
+                        
+                        # log_p = np.log(probs + 1e-8)
+                        # entropy = -np.sum(probs * log_p)
+
+                        # entropy_grad_logits = -probs * (log_p + entropy)
+
+                        # E = entropy_coeff * entropy_grad_logits
+
+                        # Write into staging vars — sim code will move to PG/E next timestep
+                        compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = PG.astype(np.float32)
+                        compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
+
+                        # compiled_net.neuron_populations[policy].vars["pre_PRew"].view[:] = -E.astype(np.float32)
+                        # compiled_net.neuron_populations[policy].push_var_to_device("pre_PRew")
+
+                        # compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = E.astype(np.float32)
+                        # compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
+
+                        # GPU SOFTMAX VERSION
+                        # compiled_net.losses[policy].set_target(
+                        #     compiled_net.neuron_populations[policy],
+                        #     [action_label], policy.shape, 
+                        #     compiled_net.genn_model.batch_size,
+                        #     compiled_net.example_timesteps
+                        # )
+                        # compiled_net.losses[policy].set_var(
+                        #     compiled_net.neuron_populations[policy], "actionTaken", 1.0
+                        # )
+                        
                     current_probs.append(probs)
 
                 obs, reward, done = env.step(action_label)
                 total_reward += reward
-                reward_trace = reward_trace * 0.9261 + reward * 1.0
+                gamma_disc_reward += reward
+                reward_trace = reward_trace * reward_decay + reward * 1.0
                 if reward != 0:
                     compiled_net.losses[value].set_var(
                         compiled_net.neuron_populations[value], "reward", reward * 1.0
                 )
-                    
+                
+                # frame_img = (obs*255).astype(int)
+                # if compress_frames:
+                #     encoded = encode_frame(frame_img, compress=True, quality=compress_quality)
+                #     current_run.append(encoded)
+                # else:
+                #     current_run.append(frame_img.copy())
                 if env.wait_count == env.wait_inc:
-                    # capture frame scaled down for IPC
-                    # frame_img = env.img(scale=25)  # smaller scale to reduce size
-                    frame_img = (obs*255).astype(int)
-                    # frame_img = env.get_local_img_observation() *
+                    frame_img = env.img(scale=25) 
+                    # frame_img = (obs*255).astype(int)
                     if compress_frames:
                         encoded = encode_frame(frame_img, compress=True, quality=compress_quality)
                         current_run.append(encoded)
                     else:
                         current_run.append(frame_img.copy())
-                    spikes = make_rate_coded_spikes(
+                    spikes = make_poisson_spikes(
                         obs.reshape(-1),
                         compiled_net.genn_model.timestep,
                         INPUT_SIZE,
                         K=WAIT_INC                   # tune this
                     )
                     compiled_net.set_input({input_pop: [spikes]})
+                # spikes = make_rate_coded_spikes(
+                #     obs.reshape(-1),
+                #     compiled_net.genn_model.timestep,
+                #     INPUT_SIZE,
+                #     K=1
+                # )
+                # compiled_net.set_input({input_pop: [spikes]})
 
                 compiled_net.step_time(train_callback_list)
 
-                # compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].pull_from_device()
-                # compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].pull_from_device()
-                # compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].pull_from_device()
-                # v = compiled_net.neuron_populations[hidden_layers["E"]].vars["V"].view
-                # A = compiled_net.neuron_populations[hidden_layers["E"]].vars["A"].view
-                # beta = compiled_net.neuron_populations[hidden_layers["E"]].vars["Beta"].view
-
-                # v_avg = v_avg*0.999 + 0.0001*sum(abs(v))
-                # v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.0001*sum(abs(
-                #     np.maximum( v - (0.61 + beta * A), 0.0) +
-                #     np.maximum(-v - (0.61 + beta * A), 0.0)
-                # ))
-
                 if env.wait_count == env.wait_inc:
+                    for conn_pop in list(compiled_net.connection_populations.values())[::-1]:
+                        try:
+                            conn_pop.post_vars["FAvg"].pull_from_device()
+                            f = conn_pop.post_vars["FAvg"].view
+                        except:
+                            f = 0
+                            pass
+                    # print("----------------------------")
+                    # conn_pop.vars["SynSig"].pull_from_device()
+                    # print(np.mean(conn_pop.vars["SynSig"].values))
+                    
+                    # conn_pop.vars["RLNoiseTrace"].pull_from_device()
+                    # print(sum(abs(conn_pop.vars["RLNoiseTrace"].values)))
+                    # for smth in dir(conn_pop):
+                    #     print(smth)
+                    freq_avg = freq_avg*0.999 + 0.001*np.mean(abs(f))
+
+                    compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["V"].pull_from_device()
+                    compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["A"].pull_from_device()
+                    compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["Beta"].pull_from_device()
+
+                    v = compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["V"].view
+                    A = compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["A"].view
+                    beta = compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["Beta"].view
+
+                    # print("Betas mean:", np.mean(beta))
+
+                    v_avg = v_avg*0.999 + 0.001*np.mean(abs(v))
+                    v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.001*np.mean(abs(
+                        np.maximum( v - (0.61 + beta * A), 0.0) +
+                        np.maximum(-v - (0.61 + beta * A), 0.0)
+                    ))
+                    if np.isnan(v_avg):
+                        raise ValueError("Nan errors found in voltages") 
+
                     compiled_net.genn_model.custom_update("GradientLearn")
                     for o, custom_updates in compiled_net.optimisers:
                         for c in custom_updates:
@@ -1617,15 +1782,18 @@ def train_snake_agent_with_ipc(episodes=1e10,
                     print("-----------------TdE----------------")
                 # td_error_trace = 0
 
-                compiled_net.neuron_populations[hidden_layers["E"]].vars["TdE"].pull_from_device() 
-                if abs(td_error - compiled_net.neuron_populations[hidden_layers["E"]].vars["TdE"].view[0]) > 0.001:
+                compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].pull_from_device() 
+                if abs(td_error - compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].view[0]) > 0.001:
                     print("Host", td_error)
-                    print("Dev", compiled_net.neuron_populations[hidden_layers["E"]].vars["TdE"].view[0])
+                    print("Dev", compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].view[0])
                     print("--------------Hid E TdE----------------")
                 """
-                frame += 1
+                 
+                compiled_net.neuron_populations[value].vars["E"].pull_from_device() 
+                td_error_sum_abs += abs(compiled_net.neuron_populations[value].vars["E"].view[0])
+                ep_frames += 1
 
-            spikes = make_rate_coded_spikes(
+            spikes = make_poisson_spikes(
                 obs.reshape(-1),                                 # flattened RGB values
                 compiled_net.genn_model.timestep,
                 INPUT_SIZE,
@@ -1633,58 +1801,46 @@ def train_snake_agent_with_ipc(episodes=1e10,
             )
             compiled_net.set_input({input_pop: [spikes]})
             for i in range(WAIT_INC):
+                gamma_disc_reward *= gamma
                 if i % WAIT_INC == 0:
                     if GAUSSIAN_TRACE_POLICY:
-                        action = compiled_net.get_readout(policy).flatten()
-                        probs = np.exp(action - action.max()) / np.exp(action - action.max()).sum()
+                        # action = compiled_net.get_readout(policy).flatten()
+                        compiled_net.neuron_populations[policy].vars["TanhOut"].pull_from_device()
+                        action_scalar = compiled_net.neuron_populations[policy].vars["TanhOut"].view[0]
+
+                        x = np.clip(action_scalar, -1.0, 1.0)
+
+                        p_left  = max(0.0, -x)
+                        p_right = max(0.0,  x)
+                        p_fwd   = 1.0 - abs(x)
+
+                        probs = np.array([p_left, p_fwd, p_right])
+                        probs = probs / probs.sum()
                     else:
-                        probs = compiled_net.get_readout(policy).flatten()
+                        logits = compiled_net.get_readout(policy).flatten()
+                        probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
                     current_probs.append(probs)
                 current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)
                 
-                reward_trace = reward_trace * 0.9261
+                reward_trace = reward_trace * reward_decay
                 compiled_net.step_time(train_callback_list)
                 
                 # compiled_net.genn_model.custom_update("GradientLearn")
                 # for o, custom_updates in compiled_net.optimisers:
                 #     for c in custom_updates:
                 #         o.set_step(c, opt_updt := opt_updt+1)
-                
-                """    
-                value_estimate = compiled_net.get_readout(value)[0][0]
-                value_target = reward_trace + gamma * value_estimate
-                
-                td_error = value_target - previous_value_estimate
-                
-                previous_value_estimate = value_estimate
-
-                compiled_net.losses[policy].set_var(
-                    compiled_net.neuron_populations[policy], "tdError", td_error
-                )
-                compiled_net.losses[value].set_var(
-                    compiled_net.neuron_populations[value], "tdError", td_error
-                )
-                for hidden_layer in list(hidden_layers.values()):
-                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].view[:] = td_error
-                    compiled_net.neuron_populations[hidden_layer].vars["TdE"].push_to_device()
-
-                # train_callback_list.on_batch_end(0, all_metrics)
-                # for o, custom_updates in compiled_net.optimisers:
-                #     for c in custom_updates:
-                #         o.set_step(c, ep)
-                # td_error_trace = 0
-                """
             
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
                 for c in custom_updates:
                     o.set_step(c, opt_updt := opt_updt+1)
-            if dale_l1_reg > 0:
-                compiled_net.genn_model.custom_update("DaleRL1")
 
-            compiled_net.genn_model.custom_update("DalePrune")
-            compiled_net.genn_model.custom_update("DaleRewire")
+            # if dale_l1_reg > 0:
+            #     compiled_net.genn_model.custom_update("DaleRL1")
+
+            # compiled_net.genn_model.custom_update("DalePrune")
+            # compiled_net.genn_model.custom_update("DaleRewire")
 
             # Update if new best run (send best run to viz process)
             if total_reward >= best_reward and len(current_probs) > 0:
@@ -1713,11 +1869,18 @@ def train_snake_agent_with_ipc(episodes=1e10,
 
             if sigma_q is not None and (ep % 100 == 0):
                 try:
-                    compiled_net.neuron_populations[hidden_layers["E"]].vars["LogSigma"].pull_from_device()
-                    compiled_net.neuron_populations[hidden_layers["I"]].vars["LogSigma"].pull_from_device()
+                    compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["LogSigma"].pull_from_device()
+                    compiled_net.neuron_populations[list(hidden_layers.values())[1]].vars["LogSigma"].pull_from_device()
+                    for conn_pop in list(compiled_net.connection_populations.values()):
+                        if "LogSynSig" in conn_pop.vars:
+                            break
+                    conn_pop.vars["LogSynSig"].pull_from_device()
+                    # print(np.mean(conn_pop.vars["SynSig"].values))
                     sigma_data = {
-                        'E': compiled_net.neuron_populations[hidden_layers["E"]].vars["LogSigma"].view.copy(),
-                        'I': compiled_net.neuron_populations[hidden_layers["I"]].vars["LogSigma"].view.copy(),
+                        # 'E': compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["LogSigma"].view.copy(),
+                        'E': conn_pop.vars["LogSynSig"].values - 5,
+                        # 'I': compiled_net.neuron_populations[list(hidden_layers.values())[1]].vars["LogSigma"].view.copy(),
+                        'I': conn_pop.vars["LogSynSig"].values - 5 
                     }
                     if sigma_q.full():
                         try: sigma_q.get_nowait()
@@ -1736,6 +1899,19 @@ def train_snake_agent_with_ipc(episodes=1e10,
                 avg = smoothing * avg + (1 - smoothing) * total_reward
             running_avg.append(avg)
 
+            with open(CSV_OUTPUT, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    ep,
+                    total_reward,
+                    ep_frames,
+                    td_error_sum_abs / ep_frames,
+                    WAIT_INC * total_reward / ep_frames,
+                    v_avg,
+                    v_reg_loss_avg,
+                    freq_avg
+                ])
+            
             # Send metrics for plotting
             if metrics_q is not None:
                 metrics = {
@@ -1756,10 +1932,10 @@ def train_snake_agent_with_ipc(episodes=1e10,
                             metrics_q.get_nowait()
                         except:
                             pass
-                    metrics_q.put_nowait(metrics)
+                    metrics_q.put(metrics)
                 except Exception as e:
                     print("Metrics enqueue error:", e)
-
+            
             # logging
             if ep %10 == 0:
                 print(
@@ -1769,8 +1945,9 @@ def train_snake_agent_with_ipc(episodes=1e10,
                     f"- Snake len: {len(env.snake)-1:2d} "
                     f"- Snake len avg (last 100): {np.mean(snake_len_history):.2f} "
                     f"- Voltage running avg: {v_avg:.2f} "
-                    f"- Voltage reg loss running avg: {v_reg_loss_avg:.2f}"
-                    f"- Frame death: {frame} "
+                    f"- Voltage reg loss running avg: {v_reg_loss_avg:.2f} "
+                    f"- Frequency running avg: {1000 * freq_avg:.2f} "
+                    f"- Frame death: {ep_frames} "
                     f"- Alpha: {compiled_net.optimisers[0][0].alpha:.8f}"
                 )
 
@@ -1793,7 +1970,7 @@ if __name__ == "__main__":
 
     try:
         train_snake_agent_with_ipc(
-            episodes=int(1e10),
+            episodes=int(10000),
             metrics_q=metrics_q,
             best_run_q=best_run_q,
             random_run_q=random_run_q,

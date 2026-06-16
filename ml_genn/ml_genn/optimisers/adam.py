@@ -88,7 +88,7 @@ class Adam(Optimiser):
         
         if soft_grad_clip is not None:
             _genn_model["update_code"] = f"""
-            Gradient = Gradient / (1.0 + fabs(Gradient) * {1.0/soft_grad_clip});
+            Gradient = Gradient / (1.0 + fabs(Gradient) / {soft_grad_clip});
             {_genn_model["update_code"]}
             """
 

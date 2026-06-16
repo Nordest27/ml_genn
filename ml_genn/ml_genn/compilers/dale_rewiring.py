@@ -79,7 +79,7 @@ dale_prune_model = {
 
         if (prune) {
             if ( gennrand_uniform() < Resistance ){
-                g = Sign * 0.0001;
+                g = Sign * 1e-5 * fabs(gennrand_uniform());
             }
             else {
                 rowConnectivity[id_post / 32] &= ~(1 << (id_post % 32));
@@ -117,7 +117,7 @@ dale_rewire_model = {
             continue;
         }
 
-        add_synapse(j, Sign * 0.0001);
+        add_synapse(j, Sign * 1e-5 * fabs(gennrand_uniform()));
         rowConnectivity[j / 32] |= (1 << (j % 32));
         NumPruned--;
     }

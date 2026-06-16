@@ -34,8 +34,8 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                  v: InitValue = 0.0, a: InitValue = 0.0, beta: InitValue = 0.0174,
                  tau_mem: InitValue = 20.0, tau_refrac: InitValue = None,
                  tau_adapt: InitValue = 2000.0, relative_reset: bool = True,
-                 integrate_during_refrac: bool = True, perturbation_eps_std: float = 0.01,
-                 sigma_lr: float = 1e-4,
+                 integrate_during_refrac: bool = True, perturbation_eps_std: float = 1e-2,
+                 sigma_lr: float = 1e-6,
                  readout=None):
         super(AdaptiveLeakyIntegrateFire, self).__init__(readout)
 
@@ -81,17 +81,17 @@ class AdaptiveLeakyIntegrateFire(Neuron):
 
         sim_code_perturbation = """
                 // State-independent learned sigma
-                Sigma = exp(LogSigma);
-                PertEps = sqrt(1.0 - Alpha*Alpha) * Sigma * gennrand_normal();
+                Sigma = 0.0 * exp(LogSigma);
+                PertEps = Sigma * gennrand_normal();
                 PertEpsTrace = PertEpsTrace * Alpha + PertEps;
-                // PertEpsTraceDivSigma = PertEpsTraceDivSigma * Alpha + (PertEps*PertEps / (Sigma*Sigma) - 1.0);
+                PertEpsTraceDivSigma = PertEpsTraceDivSigma * 0.993 + (PertEpsTrace * PertEpsTrace * (1.0 - Alpha * Alpha) / (Sigma * Sigma)) - 1.0;
 
                 // Score function update + entropy regularization
                 LogSigma = fmax(fmin(
-                    LogSigma + SigmaLR * TdE * (PertEpsTrace * PertEpsTrace / (Sigma * Sigma) - 1.0)
-                    , -2.0), -15.0);
-
-                V = Alpha * V + Isyn + PertEps;
+                    LogSigma + SigmaLR * TdE * PertEpsTraceDivSigma 
+                    , 0.0), -15.0);
+                
+                V = Alpha * V + Isyn + 0.0 * PertEps;
                 A *= Rho;
                 """
 
@@ -118,7 +118,10 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 """
 
             genn_model["reset_code"] += """
+                // RefracTime = max(dt, TauRefrac + gennrand_normal() * TauRefrac / 2.0);
                 RefracTime = TauRefrac;
+                // if ( V > (Vthresh + (Beta * A)) )
+                //     RefracTime = 10 * TauRefrac;
                 """
             genn_model["threshold_condition_code"] += " && RefracTime <= 0.0"
         else:

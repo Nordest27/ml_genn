@@ -132,7 +132,7 @@ with network:
         hidden_1,
         ToroidalGaussian2D(
             sigma=SIGMA_IN,
-            p_max=p_max_in,
+            fan_in=100,
             weight=Normal(sd=std_in)
         )
     )
@@ -142,7 +142,7 @@ with network:
         hidden_2,
         ToroidalGaussian2D(
             sigma=SIGMA_H,
-            p_max=p_max_h1,
+            fan_in=100,
             weight=Normal(sd=std_h1)
         )
     )
@@ -152,7 +152,7 @@ with network:
         hidden_3,
         ToroidalGaussian2D(
             sigma=SIGMA_H,
-            p_max=p_max_h2,
+            fan_in=100,
             weight=Normal(sd=std_h2)
         )
     )
@@ -162,7 +162,7 @@ with network:
         hidden_3,
         ToroidalGaussian2D(
             sigma=SIGMA_H/2,
-            p_max=p_max_h2/2,
+            fan_in=50,
             weight=Normal(sd=std_h3/4)
         )
     )

@@ -53,6 +53,7 @@ default_params = {
 class PolicyTypes(Enum):
     CATEGORICAL = "categorical"
     GAUSSIAN_TRACE = "gaussian_trace"
+    GENERIC = "generic"
 
 def _has_connection_to_output(pop):
     # Loop through population's outgoing connections
@@ -85,6 +86,7 @@ class CompileState:
         self.sigma_eps_connections = []
 
         self.tde_transport_connections = []
+        self.policy_reward_connections = []
         self.pert_eps_transport_connections = []
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
@@ -193,6 +195,57 @@ eprop_lif_model = {
     eFiltered = eF;
     """}
 
+
+eprop_lif_pert_model = {
+    "params": [("CReg", "scalar"), ("Alpha", "scalar"), 
+               ("FTarget", "scalar"), ("AlphaFAv", "scalar"),
+               ("Vthresh_post", "scalar")],
+    "vars": [("g", "scalar", VarAccess.READ_ONLY),
+             ("eFiltered", "scalar"), ("DeltaG", "scalar"),
+             ("NoiseTrace", "scalar"),
+             ("RLNoiseTrace", "scalar"),],
+    "pre_vars": [("ZFilter", "scalar")],
+    "post_vars": [("Psi", "scalar"), ("FAvg", "scalar")],
+    "post_neuron_var_refs": [("RefracTime_post", "scalar"), ("V_post", "scalar"),
+                             ("E_post", "scalar"), ("Ebase_post", "scalar"), ("Noise", "scalar")],
+
+    "pre_spike_code": """
+    ZFilter += 1.0;
+    """,
+    "pre_dynamics_code": """
+    ZFilter *= Alpha;
+    """,
+
+    "post_spike_code": """
+    FAvg += (1.0 - AlphaFAv);
+    """,
+    "post_dynamics_code": """
+    FAvg *= AlphaFAv;
+    if (RefracTime_post > 0.0) {
+      Psi = 0.0;
+    }
+    else {
+      Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - Vthresh_post) / Vthresh_post));
+    }
+    """,
+
+    "pre_spike_syn_code": """
+    scalar eps = 0.01 * Noise;
+    addToPost(g + eps);
+    NoiseTrace += eps;
+    """,
+
+    "synapse_dynamics_code": """
+    const scalar e = ZFilter * Psi;
+    scalar eF = eFiltered;
+    eF = (eF * Alpha) + e;
+    
+    DeltaG += 0.0 * (eF * E_post) + ((FAvg - FTarget) * CReg * e) + e * NoiseTrace * fabs(E_post);
+    
+    NoiseTrace *= Alpha;
+    eFiltered = eF;
+    """}
+
 eprop_alif_model = {
     "params": [("CReg", "scalar"), ("Alpha", "scalar"), ("Rho", "scalar"),
                ("FTarget", "scalar"),("AlphaFAv", "scalar"),
@@ -285,9 +338,22 @@ eprop_alif_td_model = {
              ("epsilonA", "scalar"),
              ("DeltaG", "scalar"),
              ("RLTrace", "scalar"),
-             ("RLEpsTrace", "scalar"),],
+             ("RLEpsTrace", "scalar"),
+             ("NoiseTrace", "scalar"),
+             ("RLNoiseTrace", "scalar"),
+             ("LogSynSig", "scalar"),
+             ("SynSig", "scalar"),
+             ("SynSigTrace", "scalar")],
     "pre_vars": [("ZFilter", "scalar")],
-    "post_vars": [("Psi", "scalar"), ("FAvg", "scalar")],
+    "post_vars": [
+        ("Psi", "scalar"), 
+        ("FAvg", "scalar"), 
+        ("FAvgTrace", "scalar"),
+        ("Z", "scalar"),
+        ("NeuronNoiseTrace", "scalar")],
+    "pre_neuron_var_refs": [
+        ("Noise1_pre", "scalar"),
+    ],
     "post_neuron_var_refs": [
         ("RefracTime_post", "scalar"), 
         ("V_post", "scalar"),
@@ -301,8 +367,14 @@ eprop_alif_td_model = {
         ("TdE_post", "scalar"),
         ("PertEps_post", "scalar"),
         ("PertEpsTrace_post", "scalar"),
+        ("Sigma_post", "scalar"),
         ("PGEps_post", "scalar"),
-        ("Noise", "scalar")
+        ("PRew_post", "scalar"),
+        ("Noise1", "scalar"),
+        ("Noise2", "scalar"),
+        ("Noise3", "scalar"),
+        ("Noise4", "scalar"),
+
     ],
 
     "pre_spike_code": """
@@ -317,6 +389,10 @@ eprop_alif_td_model = {
     """,
     "post_dynamics_code": """
     FAvg *= AlphaFAv;
+
+    scalar fireReg = fabs(FAvg - FTarget);
+    FAvgTrace = Lambda * FAvgTrace + (1.0 - Lambda) * fabs(fireReg);
+
     if (RefracTime_post > 0.0) {
       Psi = 0.0;
     }
@@ -326,12 +402,28 @@ eprop_alif_td_model = {
     """,
 
     "pre_spike_syn_code": """
-    addToPost(g);
+    // Activate for better performance on PacMan with dist eprop
+    if (RefracTime_post <= 0.0) {
+        scalar Noise = Noise1;
+        
+        // const scalar selector = ((int)(1e7*eFiltered)) % 2;
+        // if (selector == 0) Noise = Noise1;
+        // else if (selector == 1) Noise = Noise2;
+        // else if (selector == 2) Noise = Noise3;
+        // else Noise = Noise4;
+
+        SynSig = exp(LogSynSig - 5);
+
+        scalar eps = SynSig * Noise;
+        addToPost(g + eps);
+        NoiseTrace += eps;
+    }
     """,
 
     "synapse_dynamics_code": """
-    DeltaG += TdE_post * (RLTrace + RLEpsTrace)
-        + CReg * (PR_post + VR_post) * eFiltered;
+    scalar reward = TdE_post + PRew_post;
+    DeltaG += reward * (RLTrace + RLEpsTrace + RLNoiseTrace)
+        + 0.0 * CReg * (PR_post + VR_post) * eFiltered;
     
     // --- Standard ALIF e-prop eligibility update ---
     scalar epsA = epsilonA;
@@ -341,23 +433,40 @@ eprop_alif_td_model = {
     const scalar e = psiZFilter - psiBetaEpsilonA;
     epsilonA = psiZFilter + ((Rho * epsA) - psiBetaEpsilonA);
 
-    // Firing-rate regularisation term
-    const scalar fireReg = (FAvg - FTarget) * e;
-    DeltaG += CReg * fireReg;
-
     // Voltage Regularization
     const scalar VReg = (
         (fmax(0.0, V_post - (Vthresh_post + (Beta_post * A_post))) +  
-         fmax(0.0, -V_post - (Vthresh_post + (Beta_post * A_post)))
-        ) * e // (ZFilter - epsA)
+        fmax(0.0, -V_post - (Vthresh_post + (Beta_post * A_post)))
+        )
     );
-    DeltaG += 0.0*VReg + 0.0*e * Noise;
+    DeltaG += -CReg * VReg * (RLEpsTrace + RLNoiseTrace) + 0.0 * CReg * VReg * (ZFilter - Beta_post * epsA);
 
     eFiltered = (eFiltered * Alpha) + e;
-    RLTrace = Lambda * RLTrace + eFiltered * ( 0.0*PG_post + 0.1*VE_post + 0.0*PGEps_post );
-    RLEpsTrace = Lambda * RLEpsTrace + eFiltered * PertEpsTrace_post;
-    // RLEpsTrace = Lambda * RLEpsTrace + e * PertEpsTrace_post;
-    // addToPre( PertEpsTrace_post);
+
+    // Firing-rate regularisation term
+    const scalar fireReg = (FAvg - FTarget);
+    scalar fireRegReward = FAvgTrace - fabs(fireReg);
+
+    DeltaG += CReg * fireReg * eFiltered + CReg * fireRegReward * (RLEpsTrace + RLNoiseTrace);
+
+    SynSig = exp(LogSynSig - 5);
+    // const scalar NormPertEpsTrace = (1.0 - Alpha * Alpha) * PertEpsTrace_post / (Sigma_post * Sigma_post + 1e-6);
+    const scalar NormNoiseTrace = (1.0 - Alpha * Alpha) * NoiseTrace / (SynSig * SynSig + 1e-6);
+
+    RLTrace = Lambda * RLTrace + eFiltered * ( 0.0 * PG_post - 0.0 * VE_post + 0.01 * PGEps_post );
+    // RLEpsTrace = Lambda * RLEpsTrace + e * NormPertEpsTrace;
+    RLNoiseTrace = Lambda * RLNoiseTrace + e * (NormNoiseTrace + NormNoiseTrace * PGEps_post); 
+
+    // SynSigTrace = SynSigTrace * 0.99649414273  + ((1.0 - Alpha * Alpha) * NoiseTrace * NoiseTrace / (SynSig * SynSig + 1e-6) - 1.0);
+    
+    // LogSynSig = fmax(fmin(
+    //    LogSynSig + 1e-6 * TdE_post * SynSigTrace
+    //   , -2.0 + 5), -15.0 + 5);
+
+    NoiseTrace *= Alpha;
+
+    // addToPre( g * Psi * NormPertEpsTrace );
+    addToPre( g * Psi * NormNoiseTrace );
     """
 }
 
@@ -556,6 +665,7 @@ class EPropCompiler(Compiler):
                  dale_rewiring_l1_strength: float = 0,
                  feedback_type: str = "symmetric",
                  # --- NEW ---
+                 reward_decay: float = 0.9,
                  gamma: float = None,
                  td_lambda: float = None,
                  entropy_coeff: float = 1e-4,
@@ -575,6 +685,7 @@ class EPropCompiler(Compiler):
         self.losses = losses
         self._optimiser = get_object(optimiser, Optimiser, "Optimiser",
                                      default_optimisers)
+        self.reward_decay = reward_decay
         self.tau_reg = tau_reg
         self.c_reg = c_reg
         self.f_target = f_target
@@ -650,7 +761,6 @@ class EPropCompiler(Compiler):
             # Add state variable to hold error
             # **NOTE** all loss functions require this!
             model_copy.add_var("E", "scalar", 0.0)
-
             # Add loss function to neuron model
             # **THINK** semantics of this i.e. modifying inplace 
             # seem a bit different than others
@@ -659,6 +769,8 @@ class EPropCompiler(Compiler):
 
             # Add sim-code to calculate error
             if self.gamma_lambda is not None:
+
+                model_copy.add_var("PRew", "scalar", 0.0)
                 if self.policy_heads.get(pop) == PolicyTypes.CATEGORICAL:
                     model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
                     
@@ -695,12 +807,14 @@ class EPropCompiler(Compiler):
                     )
                 elif self.policy_heads.get(pop) == PolicyTypes.GAUSSIAN_TRACE: 
                     model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
-
+                    
+                    model_copy.add_var("TanhOut", "scalar", 0.0)
                     model_copy.add_var("TdE", "scalar", 0.0)
-                    model_copy.add_var("LogSigma", "scalar", np.log(0.1))
+                    model_copy.add_var("LogSigma", "scalar", np.log(0.01))
                     model_copy.add_var("Action", "scalar", 0.0)
                     model_copy.add_var("SigmaTrace", "scalar", 0.0)
                     model_copy.add_var("SigmaLR", "scalar", 1e-4)
+                    model_copy.add_var("EpsTrace", "scalar", 0.0)
                     model_copy.add_var("PG", "scalar", 0.0)
                     model_copy.append_sim_code(
                         f"""         
@@ -713,25 +827,54 @@ class EPropCompiler(Compiler):
 
                         // Sample noise (IMPORTANT: keep eps explicitly)
                         const scalar eps = sigma * gennrand_normal();
+                        EpsTrace = EpsTrace * Alpha + eps;
 
-                        // Apply perturbation (same as before)
-                        if(gennrand_uniform() > 0.0/30.0) {{
-                            {model_copy.output_var_name} += fmax(-1.0, fmin(1.0, eps));
-                        }}
+                        {model_copy.output_var_name} = {model_copy.output_var_name} + eps;
+                        TanhOut = tanh({model_copy.output_var_name});
 
-                        // ---- MEAN TRACE (unchanged) ----
-                        PG = PG * Alpha + ({model_copy.output_var_name} - mu) / (sigma * sigma);
-
+                        // Linear Grad
+                        // PG = PG * Alpha + ({model_copy.output_var_name} - mu) / (sigma * sigma);
+                        // Tanh Grad                        
+                        const scalar tanh_sq = TanhOut * TanhOut;
+                        //const scalar correction = 2.0 * TanhOut / (1.0 - tanh_sq + 1e-6);
+                        // PG = PG * Alpha + (({model_copy.output_var_name} - mu) / (sigma * sigma)) - correction;
+                        PG = (EpsTrace / (sigma * sigma)) * (1.0 - tanh_sq);    
+                        
                         // ---- NEW: SIGMA TRACE (ALIF-style but WITH trace) ----
                         // instantaneous gradient
-                        const scalar grad_log_sigma = (eps * eps) / (sigma * sigma) - 1.0;
+                        // const scalar grad_log_sigma = (eps * eps) / (sigma * sigma) - 1.0;
 
                         // accumulate trace for sigma (NEW variable needed!)
-                        SigmaTrace = SigmaTrace * Alpha + grad_log_sigma;
+                        // SigmaTrace = SigmaTrace * Alpha + grad_log_sigma;
 
                         // update log sigma using TD error and trace
-                        LogSigma += SigmaLR * TdE * SigmaTrace;
+                        // LogSigma += SigmaLR * TdE * SigmaTrace;
                     """)
+                elif self.policy_heads.get(pop) == PolicyTypes.GENERIC:
+                    model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+                    
+                    model_copy.add_var("PG", "scalar", 0.0)
+                    model_copy.add_var("pre_PG", "scalar", 0.0)  # CPU writes here
+                    model_copy.add_var("TdE", "scalar", 0.0)
+                    model_copy.add_var("pre_E", "scalar", 0.0)   # CPU writes here too
+                    model_copy.add_var("pre_PRew", "scalar", 0.0)
+                    
+                    model_copy.append_sim_code(
+                        """
+                        TdE = ISynTdE;
+
+                        // Consume CPU-written values for exactly one timestep,
+                        // then zero the staging vars so they don't accumulate.
+                        PG = pre_PG;
+                        pre_PG = 0.0;
+
+                        E = pre_E;
+                        pre_E = 0.0;
+
+                        PRew = pre_PRew;
+                        pre_PRew = 0;
+                        """
+                    )
                 else:
                     model_copy.add_var("ValReg", "scalar", 0.0)
                     model_copy.add_var("PrevVal", "scalar", 0.0)
@@ -741,7 +884,6 @@ class EPropCompiler(Compiler):
                         ValTrace = ValTrace*0.5 + PrevVal*0.5;
                         // E = {model_copy.output_var_name} * {self.gamma} + reward - ValTrace;
                         E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
-                        // E = tdError;
 
                         ValReg = (
                             0.000 * ({model_copy.output_var_name})
@@ -749,7 +891,7 @@ class EPropCompiler(Compiler):
                             + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
                         );
                         PrevVal = {model_copy.output_var_name};
-                        reward *= 0.9261;
+                        reward *= {self.reward_decay};
                         tdError = 0;
                         """
                     )
@@ -783,14 +925,14 @@ class EPropCompiler(Compiler):
         # Otherwise, if neuron isn't an input i.e. it's hidden
         elif not isinstance(pop.neuron, Input):
             # Check hidden population is connected directly PGto output
-            if self.feedback_type == "symmetric" and not _has_connection_to_output(pop):
-                raise RuntimeError("In models trained with symmetric e-prop, all "
-                                   "hidden populations must be directly "
-                                   "connected to an output population")
-            if self.feedback_type == "random" and not _has_feedback_from_output(pop):
-                raise RuntimeError("In models trained with random e-prop all "
-                                   "hidden populations must be connected with "
-                                   "feedback connections to an output population")
+            # if self.feedback_type == "symmetric" and not _has_connection_to_output(pop):
+            #     raise RuntimeError("In models trained with symmetric e-prop, all "
+            #                        "hidden populations must be directly "
+            #                        "connected to an output population")
+            # if self.feedback_type == "random" and not _has_feedback_from_output(pop):
+            #     raise RuntimeError("In models trained with random e-prop all "
+            #                        "hidden populations must be connected with "
+            #                        "feedback connections to an output population")
 
             # Add additional input variable to receive feedback
             model_copy.add_additional_input_var("ISynFeedback", "scalar", 0.0)
@@ -798,9 +940,23 @@ class EPropCompiler(Compiler):
             # Add state variable to store 
             # feedback and initialise to zero
             model_copy.add_var("E", "scalar", 0.0)
+            model_copy.add_var("Ebase", "scalar", 0.0)
+            model_copy.add_var("Noise1", "scalar", 0.0)
+            model_copy.add_var("Noise2", "scalar", 0.0)
+            model_copy.add_var("Noise3", "scalar", 0.0)
+            model_copy.add_var("Noise4", "scalar", 0.0)
 
             # Add sim code to store incoming feedback in new state variable
-            model_copy.append_sim_code("E = ISynFeedback;")
+            model_copy.append_sim_code(
+                """
+                E = ISynFeedback;
+                Ebase = Ebase * 0.999 + E * 0.001;
+                Noise1 = gennrand_normal();
+                Noise2 = gennrand_normal();
+                Noise3 = gennrand_normal();
+                Noise4 = gennrand_normal();
+                """
+            )
 
             # Add sim-code to calculate error
             if self.gamma_lambda is not None:
@@ -810,15 +966,17 @@ class EPropCompiler(Compiler):
                 model_copy.add_additional_input_var("ISynPolicyRegularisation", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynValueRegularisation", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynTdE", "scalar", 0.0)
+                model_copy.add_additional_input_var("ISynPolicyReward", "scalar", 0.0)
                 model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
                 
                 model_copy.add_var("PG", "scalar", 0.0)
                 # model_copy.add_var("TdE", "scalar", 0.0)
+                model_copy.add_var("PRew", "scalar", 0.0)
                 model_copy.add_var("VE", "scalar", 0.0)
                 model_copy.add_var("PR", "scalar", 0.0)
                 model_copy.add_var("VR", "scalar", 0.0)
                 model_copy.add_var("PGEps", "scalar", 0.0)
-                model_copy.add_var("Noise", "scalar", 0.0)
+
                 # Reward-based policy gradient + entropy reg:
                 model_copy.append_sim_code(
                     """
@@ -827,8 +985,8 @@ class EPropCompiler(Compiler):
                     PR = ISynPolicyRegularisation;
                     VR = ISynValueRegularisation;
                     TdE = ISynTdE;
+                    PRew = ISynPolicyReward;
                     PGEps = ISynPertEps;
-                    Noise = gennrand_uniform() - 0.5;
                     """
                 )
 
@@ -854,6 +1012,20 @@ class EPropCompiler(Compiler):
                                           f"neurons")
         else:
             model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
+            model_copy.add_var("Noise1", "scalar", 0.0)
+            model_copy.add_var("Noise2", "scalar", 0.0)
+            model_copy.add_var("Noise3", "scalar", 0.0)
+            model_copy.add_var("Noise4", "scalar", 0.0)
+
+            # Add sim code to store incoming feedback in new state variable
+            model_copy.append_sim_code(
+                """
+                Noise1 = gennrand_normal();
+                Noise2 = gennrand_normal();
+                Noise3 = gennrand_normal();
+                Noise4 = gennrand_normal();
+                """
+            )
 
         # Build neuron model and return
         return model_copy
@@ -883,8 +1055,8 @@ class EPropCompiler(Compiler):
 
         # Check if conn are feedback
         if conn.is_feedback:
-            if self.feedback_type != "random":
-                raise ValueError("Feedback type must be 'random' when using random feedback connections")
+            # if self.feedback_type != "random":
+            #     raise ValueError("Feedback type must be 'random' when using random feedback connections")
 
             # Add connection to list of feedback connections
             if self.gamma_lambda is not None:
@@ -892,6 +1064,15 @@ class EPropCompiler(Compiler):
                     feedback_model = output_random_feedback_model
                     compile_state.tde_transport_connections.append(conn)
                     post_var_name = "E" 
+                    wum = WeightUpdateModel(
+                        model=feedback_model,
+                        var_vals={"g": connect_snippet.weight},
+                        post_neuron_var_refs={"E_post": post_var_name}
+                    )
+                if conn.name.endswith("policy_reward"):
+                    feedback_model = output_random_feedback_model
+                    compile_state.policy_reward_connections.append(conn)
+                    post_var_name = "PRew" 
                     wum = WeightUpdateModel(
                         model=feedback_model,
                         var_vals={"g": connect_snippet.weight},
@@ -974,17 +1155,19 @@ class EPropCompiler(Compiler):
 
         elif isinstance(target_neuron, LeakyIntegrateFire):
             wum = WeightUpdateModel(
-                model=eprop_lif_model,
+                model=eprop_lif_pert_model,
                 param_vals={"CReg": self.c_reg, "Alpha": alpha,
                             "FTarget": (self.f_target * self.dt) / 1000.0, 
                             "AlphaFAv": np.exp(-self.dt / self.tau_reg),
                             "Vthresh_post": target_neuron.v_thresh},
                 var_vals={"g": connect_snippet.weight, "eFiltered": 0.0,
-                          "DeltaG": 0.0},
+                          "DeltaG": 0.0, "NoiseTrace": 0.0, "RLNoiseTrace": 0.0,},
                 pre_var_vals={"ZFilter": 0.0},
                 post_var_vals={"Psi": 0.0, "FAvg": 0.0},
                 post_neuron_var_refs={"RefracTime_post": "RefracTime",
-                                      "V_post": "V", "E_post": "E"})
+                                      "V_post": "V", "E_post": "E", 
+                                      "Ebase_post": "Ebase", 
+                                      "Noise": "Noise"})
         # Otherise, if it's ALIF, create weight update model with eProp ALIF
         elif isinstance(target_neuron, AdaptiveLeakyIntegrateFire):
             compile_state.pert_eps_transport_connections.append(conn)
@@ -1026,9 +1209,20 @@ class EPropCompiler(Compiler):
                               "epsilonA": 0.0,
                               "RLTrace": 0.0,
                               "RLEpsTrace": 0.0,
+                              "NoiseTrace": 0.0,
+                              "RLNoiseTrace": 0.0,
+                              "LogSynSig": 0.0,
+                              "SynSig": 0.0,
+                              "SynSigTrace": 0.0
                     },
                     pre_var_vals={"ZFilter": 0.0},
-                    post_var_vals={"Psi": 0.0, "FAvg": 0.0},
+                    post_var_vals={
+                        "Psi": 0.0, "FAvg": 0.0, 
+                        "FAvgTrace": 0.0, "Z": 0.0,
+                        "NeuronNoiseTrace": 0.0},
+                    pre_neuron_var_refs={
+                        "Noise1_pre": "Noise1"
+                    },
                     post_neuron_var_refs={
                         "RefracTime_post": "RefracTime",
                         "Beta_post": "Beta",
@@ -1038,8 +1232,13 @@ class EPropCompiler(Compiler):
                         "PR_post": "PR", "VR_post": "VR",
                         "PertEpsTrace_post": "PertEpsTrace", 
                         "PertEps_post": "PertEps",
+                        "Sigma_post": "Sigma",
                         "PGEps_post": "PGEps",
-                        "Noise": "Noise"
+                        "PRew_post": "PRew",
+                        "Noise1": "Noise1",
+                        "Noise2": "Noise2",
+                        "Noise3": "Noise3",
+                        "Noise4": "Noise4"
                     })
         # Otherwise, if target neuron is readout, create 
         # weight update model with simple output learning rule
@@ -1077,7 +1276,7 @@ class EPropCompiler(Compiler):
                         param_vals={
                             "RetE": 0.0,
                             "Alpha": alpha,
-                            "GammaLambda": self.gamma_lambda
+                            "GammaLambda": self.gamma
                         },
                         var_vals={
                             "g": connect_snippet.weight, 
@@ -1100,7 +1299,13 @@ class EPropCompiler(Compiler):
 
 
             if self.feedback_type == "symmetric" and not conn.is_feedback:
-                compile_state.feedback_connections.append(conn)
+                if self.gamma_lambda is None:
+                    compile_state.feedback_connections.append(conn)
+                elif target_neuron.readout is not None:
+                    if target_pop in self.policy_heads:
+                        compile_state.policy_feedback_connections.append(conn)
+                    else:
+                        compile_state.value_feedback_connections.append(conn)
 
         # Add weights to list of checkpoint vars
         compile_state.checkpoint_connection_vars.append((conn, "g"))
@@ -1128,6 +1333,8 @@ class EPropCompiler(Compiler):
                 connection_populations[c].pre_target_var = "ISynPertEps"
             for c in compile_state.tde_transport_connections:
                 connection_populations[c].pre_target_var = "ISynTdE"
+            for c in compile_state.policy_feedback_connections:
+                connection_populations[c].pre_target_var = "ISynPolicyReward"
             for c in compile_state.pert_eps_transport_connections:
                 connection_populations[c].pre_target_var = "ISynPertEps"
             for c in compile_state.policy_feedback_connections:

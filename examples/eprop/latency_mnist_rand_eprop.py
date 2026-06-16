@@ -58,6 +58,10 @@ with network:
     # Random feedback matrices (COMMENT THESE LINES TO COMPARE WITH SYMMETRIC EPROP)
     Connection(hidden_1, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f1")
     Connection(hidden_2, output, Dense(Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))), feedback_name="f2")
+
+    # Deterministic feedback 
+    # Connection(hidden_1, output, Dense(1.0/10.0), feedback_name="f1")
+    # Connection(hidden_2, output, Dense(1.0/10.0), feedback_name="f2")
      
     
 
