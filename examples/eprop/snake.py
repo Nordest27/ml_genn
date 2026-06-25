@@ -854,7 +854,7 @@ def build_compiled_network(connectivity_type="fixed"):
         input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE)
 
         ei_layers = []
-        for i in range(1):  # increase to stack more layers
+        for i in range(5):  # increase to stack more layers
             ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
 
         policy_field = Population(
@@ -958,9 +958,9 @@ def build_compiled_network(connectivity_type="fixed"):
                 "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=Adam(8e-5), #, soft_grad_clip=10), 
+        optimiser=Adam(5e-5), #, soft_grad_clip=10), 
         # optimiser=Adam(1e-4, clamp_grad=(-10.0, 10.0)),
-        # c_reg=1e-2,
+        # c_reg=0.0,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
@@ -1058,7 +1058,7 @@ def make_poisson_spikes(
     K,
     bg_noise=0.0   
 ):
-    values = np.clip(values + bg_noise, 0.0, 1.0) * 0.3
+    values = np.clip(values + bg_noise, 0.0, 1.0) * 0.5
     # print(values)
     # for i in range(INPUT_SHAPE[0]):
     #     print()
@@ -1426,7 +1426,7 @@ def start_visualizers():
 # CSV_OUTPUT = "outputs/rand-eprop-with-noise-little-dist-weight.csv"
 # CSV_OUTPUT = "outputs/rand-eprop-fields-hidden-layers-5.csv"
 # CSV_OUTPUT = "outputs/weight-dist-eprop-fields-hidden-layers-5.csv"
-CSV_OUTPUT = "outputs/experiment_1.csv"
+CSV_OUTPUT = "outputs/combined_alternative_update_per_episode[Extended].csv"
 os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
 
 # ALWAYS reset file for a new run
@@ -1731,10 +1731,10 @@ def train_snake_agent_with_ipc(episodes=10000,
                     if np.isnan(v_avg):
                         raise ValueError("Nan errors found in voltages") 
 
-                    compiled_net.genn_model.custom_update("GradientLearn")
-                    for o, custom_updates in compiled_net.optimisers:
-                        for c in custom_updates:
-                            o.set_step(c, opt_updt := opt_updt+1)
+                    # compiled_net.genn_model.custom_update("GradientLearn")
+                    # for o, custom_updates in compiled_net.optimisers:
+                    #     for c in custom_updates:
+                    #         o.set_step(c, opt_updt := opt_updt+1)
                 
                 # compiled_net.genn_model.custom_update("GradientLearn")
                 # for o, custom_updates in compiled_net.optimisers:
@@ -1970,7 +1970,7 @@ if __name__ == "__main__":
 
     try:
         train_snake_agent_with_ipc(
-            episodes=int(10000),
+            episodes=int(100000),
             metrics_q=metrics_q,
             best_run_q=best_run_q,
             random_run_q=random_run_q,

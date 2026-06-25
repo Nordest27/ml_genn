@@ -403,7 +403,7 @@ eprop_alif_td_model = {
 
     "pre_spike_syn_code": """
     // Activate for better performance on PacMan with dist eprop
-    if (RefracTime_post <= 0.0) {
+    // if (RefracTime_post <= 0.0) {
         scalar Noise = Noise1;
         
         // const scalar selector = ((int)(1e7*eFiltered)) % 2;
@@ -417,7 +417,7 @@ eprop_alif_td_model = {
         scalar eps = SynSig * Noise;
         addToPost(g + eps);
         NoiseTrace += eps;
-    }
+    // }
     """,
 
     "synapse_dynamics_code": """
@@ -453,20 +453,20 @@ eprop_alif_td_model = {
     // const scalar NormPertEpsTrace = (1.0 - Alpha * Alpha) * PertEpsTrace_post / (Sigma_post * Sigma_post + 1e-6);
     const scalar NormNoiseTrace = (1.0 - Alpha * Alpha) * NoiseTrace / (SynSig * SynSig + 1e-6);
 
-    RLTrace = Lambda * RLTrace + eFiltered * ( 0.0 * PG_post - 0.0 * VE_post + 0.01 * PGEps_post );
+    // RLTrace = Lambda * RLTrace + eFiltered * ( 1.0 * PG_post - 0.1 * VE_post + 0.00 * PGEps_post );
     // RLEpsTrace = Lambda * RLEpsTrace + e * NormPertEpsTrace;
-    RLNoiseTrace = Lambda * RLNoiseTrace + e * (NormNoiseTrace + NormNoiseTrace * PGEps_post); 
+    RLNoiseTrace = Lambda * RLNoiseTrace + e * (NormNoiseTrace + 0.0 * NormNoiseTrace * PGEps_post); 
 
-    // SynSigTrace = SynSigTrace * 0.99649414273  + ((1.0 - Alpha * Alpha) * NoiseTrace * NoiseTrace / (SynSig * SynSig + 1e-6) - 1.0);
+    // SynSigTrace = SynSigTrace * 0.9 + Psi * ((1.0 - Alpha * Alpha) * NoiseTrace * NoiseTrace / (SynSig * SynSig + 1e-6) - 1.0);
     
     // LogSynSig = fmax(fmin(
-    //    LogSynSig + 1e-6 * TdE_post * SynSigTrace
-    //   , -2.0 + 5), -15.0 + 5);
+    //     LogSynSig + 1e-6 * TdE_post * SynSigTrace
+    //    , -2.0 + 5), -15.0 + 5);
 
     NoiseTrace *= Alpha;
 
     // addToPre( g * Psi * NormPertEpsTrace );
-    addToPre( g * Psi * NormNoiseTrace );
+    // addToPre( g * Psi * NormNoiseTrace );
     """
 }
 

@@ -24,7 +24,7 @@ import matplotlib.ticker as mticker
 # ── Config ────────────────────────────────────────────────────────────────────
 INPUT_GLOB    = "outputs/*.csv"
 OUT_DIR       = "outputs/renders/comparisons"
-WINDOW_EP     = 500        # episode-window size for per-run aggregation
+WINDOW_EP     = 100        # episode-window size for per-run aggregation
 BAND_ALPHA    = 0.15       # opacity of ±1 std band
 MINMAX_ALPHA  = 0.06       # opacity of best/worst-run band
 DPI           = 200

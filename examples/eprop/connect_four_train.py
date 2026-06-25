@@ -391,7 +391,7 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             policy: "mean_square_error",
             value:  "mean_square_error",
         },
-        optimiser=Adam(5e-5),
+        optimiser=Adam(1e-4),
         # c_reg=1e-1,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
