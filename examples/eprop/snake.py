@@ -21,18 +21,37 @@ from ml_genn.callbacks import Checkpoint
 from ml_genn.compilers import EPropCompiler, InferenceCompiler, PolicyTypes
 from ml_genn.connectivity import Dense, FixedProbability, Conv2D, ToroidalGaussian2D
 from ml_genn.initializers import Normal
-from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput
+from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, PoissonInput
 from ml_genn.serialisers import Numpy
-from ml_genn.optimisers import Adam
+from ml_genn.optimisers import Adam, AsyncLocalAdam, CAdam, AdaBelief
 from scipy.ndimage import gaussian_filter
 
 from ml_genn.compilers.eprop_compiler import default_params
 from collections import defaultdict
 
+from async_trace_logger import AsyncTraceLogger
+
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 import os 
 import csv
+
+def compute_returns(rewards, gamma):
+    """
+    Backward discounted return G_t = r_t + gamma * G_{t+1}, computed
+    per-timestep over a full episode (or trajectory) of rewards.
+
+    rewards: sequence of raw per-timestep rewards actually seen by the
+             network, in time order.
+    gamma:   per-timestep discount factor.
+
+    Returns a list the same length as `rewards`, where result[t] is the
+    true return-to-go from timestep t onward.
+    """
+    G = list(rewards)
+    for i in range(len(G) - 2, -1, -1):
+        G[i] += gamma * G[i + 1]
+    return G
 
 def extract_actual_sparse_connections(compiled_net):
     """
@@ -81,7 +100,15 @@ def extract_fanin_statistics(compiled_net):
     return stats
 
 class SnakeEnv:
-    def __init__(self, size=28, visible_range=5, scale=2, wait_inc=5, inp_shape=(5,5,3)):
+    def __init__(
+        self,
+        size=28,
+        visible_range=5,
+        scale=2,
+        wait_inc=5,
+        inp_shape=(5, 5, 3),
+        bounded_camera=None,
+    ):
         assert visible_range % 2 == 1, "visible_range must be odd"
         self.size = size
         self.visible_range = visible_range
@@ -89,7 +116,29 @@ class SnakeEnv:
         self.wait_inc = wait_inc
         self.won = False
         self.inp_shape = inp_shape
+        self.bounded_camera = bounded_camera
+        if self.bounded_camera and self.visible_range > self.size:
+            raise ValueError(
+                "BOUNDED_CAMERA=True requires visible_range <= board size "
+                f"(got visible_range={self.visible_range}, size={self.size})"
+            )
         self.reset()
+
+    def _camera_center(self):
+        """Return the camera center in board coordinates.
+
+        In bounded mode, shift the viewport just enough that the complete
+        visible_range x visible_range window remains inside the board.
+        In unbounded mode, preserve the original head-centered camera.
+        """
+        head_y, head_x = self.snake[0]
+        if not self.bounded_camera:
+            return head_y, head_x
+
+        half = self.visible_range // 2
+        center_y = int(np.clip(head_y, half, self.size - 1 - half))
+        center_x = int(np.clip(head_x, half, self.size - 1 - half))
+        return center_y, center_x
 
     def reset(self):
         self.snake = [
@@ -230,19 +279,25 @@ class SnakeEnv:
         """
         v = self.visible_range
         r = v // 2
+        camera_y, camera_x = self._camera_center()
         head_y, head_x = self.snake[0]
 
         obs = np.zeros((v, v, 3), dtype=np.float32)
 
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                y = head_y + dy
-                x = head_x + dx
+                y = camera_y + dy
+                x = camera_x + dx
                 local_y = dy + r
                 local_x = dx + r
 
-                # check walls
-                if y == -1 or y == self.size + 1 or x == -1 or x == self.size + 1:
+                # In bounded mode the camera is guaranteed to stay inside
+                # the board. In unbounded mode, retain the old one-cell wall
+                # outline rather than wrapping the observation.
+                if not self.bounded_camera and (
+                    y == -1 or y == self.size + 1 or
+                    x == -1 or x == self.size + 1
+                ):
                     obs[local_y, local_x, 0] = 1.0
                     continue
 
@@ -250,9 +305,9 @@ class SnakeEnv:
                 if (y, x) in self.snake:
                     obs[local_y, local_x, 1] = 1.0
 
-                # # head
-                # if (y, x) == (head_y, head_x):
-                #     obs[3, local_y, local_x] = 1.0
+                # head
+                if (y, x) == (head_y, head_x):
+                    obs[3, local_y, local_x] = [0.33, 1.0, 0.33]
 
                 # apple
                 if (y, x) in self.apples:
@@ -297,17 +352,16 @@ class SnakeEnv:
         
         v = self.visible_range
         r = v // 2
-        head_y, head_x = self.snake[0]
+        camera_y, camera_x = self._camera_center()
 
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                y = head_y + dy
-                x = head_x + dx
+                y = camera_y + dy
+                x = camera_x + dx
 
                 # walls
                 if y < 0 or y >= self.size or x < 0 or x >= self.size:
                     continue
-
 
                 img[y, x] = [0,0,0]
 
@@ -338,23 +392,25 @@ class SnakeEnv:
         """
         v = self.visible_range
         r = v // 2
+        camera_y, camera_x = self._camera_center()
         head_y, head_x = self.snake[0]
 
         img = np.zeros((v, v, 3), dtype=np.uint8)
 
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                y = head_y + dy
-                x = head_x + dx
+                y = camera_y + dy
+                x = camera_x + dx
                 local_y = dy + r
                 local_x = dx + r
 
-                # single-cell outline walls
-                if (
-                    (x == -1 and -1 <= y < self.size+1) or
-                    (x == self.size and -1 <= y < self.size+1) or
-                    (y == -1 and -1 <= x < self.size+1) or
-                    (y == self.size and -1 <= x < self.size+1)
+                # Bounded mode never samples outside the board. In unbounded
+                # mode, keep the old one-cell gray wall outline.
+                if not self.bounded_camera and (
+                    (x == -1 and -1 <= y < self.size + 1) or
+                    (x == self.size and -1 <= y < self.size + 1) or
+                    (y == -1 and -1 <= x < self.size + 1) or
+                    (y == self.size and -1 <= x < self.size + 1)
                 ):
                     img[local_y, local_x] = [100, 100, 100]  # gray
                     continue
@@ -408,11 +464,24 @@ BOARD_SIZE = 5
 VISIBLE_RANGE = 5
 SCALE = 4
 
+# Camera mode:
+#   True  -> the camera viewport is clamped to the board (never samples
+#            outside the board). The snake head can therefore move away
+#            from the exact image center when it approaches an edge.
+#   False -> the camera stays centered on the snake head, preserving the
+#            previous behavior (the viewport may extend beyond the board).
+BOUNDED_CAMERA = False
+
 WAIT_INC = 30
+
+# Same PoissonInput rate scaling as the Pong reference script. With the
+# default 1 ms timestep, an input value of 1.0 becomes a Poisson rate of
+# 0.5 per timestep, i.e. a spike probability of 1-exp(-0.5) ~= 0.39.
+INPUT_RATE_SCALE = 0.7
 
 INPUT_C = 3
 
-INPUT_SHAPE = (20, 20, INPUT_C)
+INPUT_SHAPE = (VISIBLE_RANGE*SCALE, VISIBLE_RANGE*SCALE, INPUT_C)
 DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
 UNIFIED_SHAPE = (30, 30, INPUT_C)
 HIDDEN_E_SHAPE = (20, 20, INPUT_C)
@@ -851,10 +920,13 @@ def build_compiled_network(connectivity_type="fixed"):
     )
 
     with network:
-        input_pop = Population(SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE)
+        # PoissonInput generates the spikes on-device from the current rate image.
+        # The host therefore only needs to push one float32 rate per pixel whenever
+        # the observation frame changes.
+        input_pop = Population(PoissonInput(), INPUT_SHAPE)
 
         ei_layers = []
-        for i in range(5):  # increase to stack more layers
+        for i in range(1):  # increase to stack more layers
             ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
 
         policy_field = Population(
@@ -958,9 +1030,11 @@ def build_compiled_network(connectivity_type="fixed"):
                 "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=Adam(5e-5), #, soft_grad_clip=10), 
-        # optimiser=Adam(1e-4, clamp_grad=(-10.0, 10.0)),
-        # c_reg=0.0,
+        optimiser=AdaBelief(1e-5, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5), #, soft_grad_clip=10), 
+        # optimiser=Adam(7e-6, beta1=0.9, beta2=0.999, l2_init_strength=0.0*1e-5), #, soft_grad_clip=10), 
+        c_reg=1e-4,
+        # c_reg=1.0,
+        # f_target=120,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
@@ -1004,6 +1078,17 @@ all_metrics = {}
 ####################### TRAIN #######################
 #####################################################
 
+def obs_to_poisson_rate(obs):
+    """Convert Snake's [0, 1] RGB observation to Poisson rates.
+
+    This matches the Pong script: PoissonInput performs the stochastic spike
+    generation on-device every simulated timestep, so the CPU only supplies
+    the current rate image when the environment observation changes.
+    """
+    return (np.clip(obs, 0.0, 1.0) * INPUT_RATE_SCALE).astype(np.float32)
+
+
+# Legacy host-side spike encoders retained for reference; not used with PoissonInput.
 def make_repeated_spikes(
     indices,
     base_timestep,
@@ -1421,12 +1506,9 @@ def start_visualizers():
     p_sigma.start()
     return manager, metrics_q, best_run_q, random_run_q, sigma_q, stop_event, p_plots, p_runs, p_sigma
 
-
-# CSV_OUTPUT = "outputs/weight-back-dist-eprop-fields-hidden-layers-1-lambda-099.csv"
-# CSV_OUTPUT = "outputs/rand-eprop-with-noise-little-dist-weight.csv"
-# CSV_OUTPUT = "outputs/rand-eprop-fields-hidden-layers-5.csv"
-# CSV_OUTPUT = "outputs/weight-dist-eprop-fields-hidden-layers-5.csv"
-CSV_OUTPUT = "outputs/combined_alternative_update_per_episode[Extended].csv"
+CSV_PREFIX = "x2"
+REPETITION = 5
+CSV_OUTPUT = f"outputs/{CSV_PREFIX}({REPETITION}).csv"
 os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
 
 # ALWAYS reset file for a new run
@@ -1446,6 +1528,14 @@ with open(CSV_OUTPUT, "w", newline="") as f:
         "frequency"
     ])
 
+TRACE_LOG_PATH = f"outputs/complete_value_traces/{CSV_PREFIX}({REPETITION}).csv"
+os.makedirs(os.path.dirname(TRACE_LOG_PATH), exist_ok=True)
+
+if os.path.exists(TRACE_LOG_PATH):
+    os.remove(TRACE_LOG_PATH)
+
+trace_logger = AsyncTraceLogger(TRACE_LOG_PATH)
+
 # --- Modify your train_snake_agent to send updates instead of internal plotting ---
 # Replace plt.ion() + figure creation in train_snake_agent with nothing and send updates to queues.
 # I will show a skeleton wrapper around your train loop:
@@ -1463,7 +1553,7 @@ def train_snake_agent_with_ipc(episodes=10000,
     global BOARD_SIZE
     opt_updt = 0
     with compiled_net:
-        env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE)
+        env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
         best_reward = -np.inf
         best_run = []
         running_avg = []
@@ -1492,15 +1582,17 @@ def train_snake_agent_with_ipc(episodes=10000,
         v_reg_loss_avg = 0
         freq_avg = 0
         gamma_disc_reward = 0
-
-        for ep in range(episodes):
+        ep = 0
+        # while compiled_net.genn_model.timestep < 30e6: 
+        while ep < 20000 or compiled_net.genn_model.timestep < 30e6:
+            ep += 1
             # if env.won:
             #     compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
             #     compiled_net.save((BOARD_SIZE,), serialiser)
             #     best_reward = -np.inf
             #     BOARD_SIZE += 1
             #     print(f"WON! Increasing board size to {BOARD_SIZE}")
-            #     env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE)
+            #     env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
             if (ep) % 1000 == 0:
                 print("/////////////////////////////")
                 connections_sum = 0
@@ -1561,13 +1653,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 period=1
             )
             """
-            spikes = make_poisson_spikes(
-                obs.reshape(-1),
-                compiled_net.genn_model.timestep,
-                INPUT_SIZE,
-                K=WAIT_INC                       # tune this
-            )
-            compiled_net.set_input({input_pop: [spikes]})
+            compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
             # compiled_net.step_time(train_callback_list)
             # previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
@@ -1579,7 +1665,13 @@ def train_snake_agent_with_ipc(episodes=10000,
                 action_label = 0
                 current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)
-        
+
+                trace_logger.log(
+                    compiled_net.genn_model.timestep,
+                    current_values[-1],
+                    reward_trace,
+                )
+
                 if env.wait_count == 0:
                     # compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].pull_from_device()
                     # print(sum(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view), sum(np.exp(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view)) )
@@ -1678,13 +1770,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                         current_run.append(encoded)
                     else:
                         current_run.append(frame_img.copy())
-                    spikes = make_poisson_spikes(
-                        obs.reshape(-1),
-                        compiled_net.genn_model.timestep,
-                        INPUT_SIZE,
-                        K=WAIT_INC                   # tune this
-                    )
-                    compiled_net.set_input({input_pop: [spikes]})
+                    compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
                 # spikes = make_rate_coded_spikes(
                 #     obs.reshape(-1),
                 #     compiled_net.genn_model.timestep,
@@ -1723,7 +1809,7 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                     # print("Betas mean:", np.mean(beta))
 
-                    v_avg = v_avg*0.999 + 0.001*np.mean(abs(v))
+                    v_avg = v_avg*0.999 + 0.001*np.mean(v)
                     v_reg_loss_avg = v_reg_loss_avg*0.999 + 0.001*np.mean(abs(
                         np.maximum( v - (0.61 + beta * A), 0.0) +
                         np.maximum(-v - (0.61 + beta * A), 0.0)
@@ -1736,10 +1822,10 @@ def train_snake_agent_with_ipc(episodes=10000,
                     #     for c in custom_updates:
                     #         o.set_step(c, opt_updt := opt_updt+1)
                 
-                # compiled_net.genn_model.custom_update("GradientLearn")
-                # for o, custom_updates in compiled_net.optimisers:
-                #     for c in custom_updates:
-                #         o.set_step(c, opt_updt := opt_updt+1)
+                compiled_net.genn_model.custom_update("GradientLearn")
+                for o, custom_updates in compiled_net.optimisers:
+                    for c in custom_updates:
+                        o.set_step(c, opt_updt := opt_updt+1)
                 
                 """
                 value_estimate = compiled_net.get_readout(value)[0][0]
@@ -1793,13 +1879,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 td_error_sum_abs += abs(compiled_net.neuron_populations[value].vars["E"].view[0])
                 ep_frames += 1
 
-            spikes = make_poisson_spikes(
-                obs.reshape(-1),                                 # flattened RGB values
-                compiled_net.genn_model.timestep,
-                INPUT_SIZE,
-                K=WAIT_INC                   # tune this
-            )
-            compiled_net.set_input({input_pop: [spikes]})
+            compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
             for i in range(WAIT_INC):
                 gamma_disc_reward *= gamma
                 if i % WAIT_INC == 0:
@@ -1821,20 +1901,26 @@ def train_snake_agent_with_ipc(episodes=10000,
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
                     current_probs.append(probs)
                 current_values.append(compiled_net.get_readout(value)[0].mean())
-                current_reward_traces.append(reward_trace)
-                
+                current_reward_traces.append(reward_trace)      
+
+                trace_logger.log(
+                    compiled_net.genn_model.timestep,
+                    current_values[-1],
+                    reward_trace,
+                )
+
                 reward_trace = reward_trace * reward_decay
                 compiled_net.step_time(train_callback_list)
                 
-                # compiled_net.genn_model.custom_update("GradientLearn")
-                # for o, custom_updates in compiled_net.optimisers:
-                #     for c in custom_updates:
-                #         o.set_step(c, opt_updt := opt_updt+1)
+                compiled_net.genn_model.custom_update("GradientLearn")
+                for o, custom_updates in compiled_net.optimisers:
+                    for c in custom_updates:
+                        o.set_step(c, opt_updt := opt_updt+1)
             
-            compiled_net.genn_model.custom_update("GradientLearn")
-            for o, custom_updates in compiled_net.optimisers:
-                for c in custom_updates:
-                    o.set_step(c, opt_updt := opt_updt+1)
+            # compiled_net.genn_model.custom_update("GradientLearn")
+            # for o, custom_updates in compiled_net.optimisers:
+            #     for c in custom_updates:
+            #         o.set_step(c, opt_updt := opt_updt+1)
 
             # if dale_l1_reg > 0:
             #     compiled_net.genn_model.custom_update("DaleRL1")
@@ -1922,7 +2008,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 }
                 if last_best_values:
                     metrics['best_values'] = last_best_values
-                    metrics['best_reward_traces'] = last_best_reward_traces
+                    metrics['best_reward_traces'] = compute_returns(last_best_reward_traces, gamma)
                     metrics['best_value_function_values'] = last_best_value_function_values
                 if last_best_probs is not None:
                     metrics['best_probs'] = last_best_probs
@@ -1970,7 +2056,7 @@ if __name__ == "__main__":
 
     try:
         train_snake_agent_with_ipc(
-            episodes=int(100000),
+            episodes=int(20000),
             metrics_q=metrics_q,
             best_run_q=best_run_q,
             random_run_q=random_run_q,
@@ -1979,6 +2065,7 @@ if __name__ == "__main__":
             compress_quality=80
         )
     finally:
+        trace_logger.close()
         stop_event.set()
         time.sleep(0.2)
         if p_plots.is_alive(): p_plots.terminate()

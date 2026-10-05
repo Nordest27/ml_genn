@@ -17,7 +17,7 @@ from ml_genn.connectivity import Dense, FixedProbability, ToroidalGaussian2D
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, SpikeInput
 from ml_genn.serialisers import Numpy
-from ml_genn.optimisers import Adam
+from ml_genn.optimisers import Adam, AdaBelief
 
 from ml_genn.compilers.eprop_compiler import default_params
 
@@ -384,12 +384,15 @@ CONN_P = {
 
 gamma                  = 0.1  ** (1 / WAIT_INC)
 td_lambda              = 0.1  ** (1 / WAIT_INC)
+reward_decay            = 0.1  ** (1 / WAIT_INC)
 
 entropy_coeff     = 0.0 * 1e-2
 entropy_decay     = 0.9999 ** (1 / WAIT_INC)
 entropy_coeff_min = 0.0 * 1e-5
 
-dale_l1_reg = 0.0 
+dale_l1_reg = 0.0
+
+KERNEL_PROFILING = False
 
 serialiser = Numpy("door_key_mnist_checkpoints")
 
@@ -680,12 +683,15 @@ def build_compiled_network(connectivity_type="toroidal"):
     compiler = EPropCompiler(
         example_timesteps=1,
         losses={
-            policy: "sparse_categorical_crossentropy",
+            policy: "mean_square_error",
             value: "mean_square_error",
         },
-        optimiser=Adam(1e-4),#, soft_grad_clip=10),
+        optimiser=AdaBelief(5e-6, task_steps=1, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5), #, soft_grad_clip=10), 
+        c_reg=1e-2,
         batch_size=1,
+        kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
+        reward_decay=reward_decay,
         gamma=gamma,
         td_lambda=td_lambda,
         train_output_bias=False,
@@ -695,7 +701,7 @@ def build_compiled_network(connectivity_type="toroidal"):
         entropy_coeff_min=entropy_coeff_min,
         dale_rewiring_l1_strength=dale_l1_reg,
         policy_heads={
-            policy: PolicyTypes.CATEGORICAL if not GAUSSIAN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
+            policy: PolicyTypes.GENERIC if not GAUSSIAN_TRACE_POLICY else PolicyTypes.GAUSSIAN_TRACE, 
         },
         value_head=value,
     )
@@ -960,7 +966,14 @@ def train_door_key_agent(episodes=100000,
     """
     Train the Door-Key MNIST Memory agent using e-prop learning.
     Gradient updates are driven by GradientLearn / DalePrune / DaleRewire
-    custom updates, mirroring the snake training loop.
+    custom updates, mirroring the snake training loop. The policy head is
+    the GENERIC type: action probabilities are recovered from the policy
+    readout via a host-side softmax, and the policy-gradient signal
+    (probs - one_hot(action)) is staged into "pre_PG" on the policy
+    population every timestep the action is (re-)sampled, exactly as in
+    the snake trainer. Gradient application (GradientLearn + optimiser
+    step) now happens after every single simulation timestep rather than
+    only at the end of each wait period.
     """
     opt_updt = 0
 
@@ -1018,25 +1031,25 @@ def train_door_key_agent(episodes=100000,
                 action_label = 0
 
                 if env.wait_count == 0:
-                    probs = compiled_net.get_readout(policy).flatten()
-                    if abs(sum(probs) - 1.0) > 0.0001:
-                        print("BAD PROBS", sum(probs))
+                    logits = compiled_net.get_readout(policy).flatten()
+                    shifted_logits = logits - logits.max()
+                    exp_logs = np.exp(shifted_logits)
+                    probs = exp_logs / (exp_logs.sum() + 1e-8)
+
                     action_label = np.random.choice(NUM_OUTPUT, p=probs)
-                    if probs[env.current_digit] > 1/10:
-                        action_label = env.current_digit
-                    # action_label = np.random.choice(4, p=(probs[:4]+0.01)/(sum(probs[:4]+0.01)))
-                    
+                    # if probs[env.current_digit] > 1/10:
+                    #     action_label = env.current_digit
+                    action_label = np.random.choice(4, p=(probs[:4]+0.01)/(sum(probs[:4]+0.01)))
+
                     current_probs.append(probs)
 
-                    compiled_net.losses[policy].set_target(
-                        compiled_net.neuron_populations[policy],
-                        [action_label], policy.shape,
-                        compiled_net.genn_model.batch_size,
-                        compiled_net.example_timesteps
-                    )
-                    compiled_net.losses[policy].set_var(
-                        compiled_net.neuron_populations[policy], "actionTaken", 1.0
-                    )
+                    y_true = np.zeros(NUM_OUTPUT)
+                    y_true[action_label] = 1.0
+                    PG = (probs - y_true)
+
+                    # Write into staging var — sim code will move to PG next timestep
+                    compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = PG.astype(np.float32)
+                    compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
 
                 obs, reward, done = env.step(action_label)
                 total_reward  += reward
@@ -1075,15 +1088,18 @@ def train_door_key_agent(episodes=100000,
 
                 compiled_net.step_time(train_callback_list)
 
-                if env.wait_count == env.wait_inc:
-                    compiled_net.genn_model.custom_update("GradientLearn")
-                    for o, custom_updates in compiled_net.optimisers:
-                        for c in custom_updates:
-                            o.set_step(c, opt_updt := opt_updt + 1)
+                # Per-timestep gradient application
+                compiled_net.genn_model.custom_update("GradientLearn")
+                for o, custom_updates in compiled_net.optimisers:
+                    for c in custom_updates:
+                        o.set_step(c, opt_updt := opt_updt + 1)
 
                 frame += 1
 
             probs = compiled_net.get_readout(policy).flatten()
+            shifted_logits = probs - probs.max()
+            exp_logs = np.exp(shifted_logits)
+            probs = exp_logs / (exp_logs.sum() + 1e-8)
             current_probs.append(probs)
 
             # ---- Episode tail: drain reward trace ----
@@ -1109,12 +1125,15 @@ def train_door_key_agent(episodes=100000,
 
                 compiled_net.step_time(train_callback_list)
 
-                # compiled_net.genn_model.custom_update("GradientLearn")
-                # for o, custom_updates in compiled_net.optimisers:
-                #     for c in custom_updates:
-                #         o.set_step(c, opt_updt := opt_updt + 1)
+                compiled_net.genn_model.custom_update("GradientLearn")
+                for o, custom_updates in compiled_net.optimisers:
+                    for c in custom_updates:
+                        o.set_step(c, opt_updt := opt_updt + 1)
 
             probs = compiled_net.get_readout(policy).flatten()
+            shifted_logits = probs - probs.max()
+            exp_logs = np.exp(shifted_logits)
+            probs = exp_logs / (exp_logs.sum() + 1e-8)
             current_probs.append(probs)
 
             compiled_net.step_time(train_callback_list)

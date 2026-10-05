@@ -343,13 +343,15 @@ eprop_alif_td_model = {
              ("RLNoiseTrace", "scalar"),
              ("LogSynSig", "scalar"),
              ("SynSig", "scalar"),
-             ("SynSigTrace", "scalar")],
+             ("SynSigTrace", "scalar"),
+             ("UpdateCount", "scalar")],
     "pre_vars": [("ZFilter", "scalar")],
     "post_vars": [
         ("Psi", "scalar"), 
         ("FAvg", "scalar"), 
         ("FAvgTrace", "scalar"),
         ("Z", "scalar"),
+        ("PrevV", "scalar"),
         ("NeuronNoiseTrace", "scalar")],
     "pre_neuron_var_refs": [
         ("Noise1_pre", "scalar"),
@@ -374,7 +376,6 @@ eprop_alif_td_model = {
         ("Noise2", "scalar"),
         ("Noise3", "scalar"),
         ("Noise4", "scalar"),
-
     ],
 
     "pre_spike_code": """
@@ -386,19 +387,23 @@ eprop_alif_td_model = {
 
     "post_spike_code": """
     FAvg += (1.0 - AlphaFAv);
+    Z = 1.0;
     """,
     "post_dynamics_code": """
+    Z = 0.0;
     FAvg *= AlphaFAv;
 
     scalar fireReg = fabs(FAvg - FTarget);
     FAvgTrace = Lambda * FAvgTrace + (1.0 - Lambda) * fabs(fireReg);
 
-    if (RefracTime_post > 0.0) {
+    if ( RefracTime_post > 0.0 ) {
       Psi = 0.0;
     }
     else {
       Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
     }
+
+    PrevV = V_post;
     """,
 
     "pre_spike_syn_code": """
@@ -413,17 +418,63 @@ eprop_alif_td_model = {
         // else Noise = Noise4;
 
         SynSig = exp(LogSynSig - 5);
-
         scalar eps = SynSig * Noise;
         addToPost(g + eps);
         NoiseTrace += eps;
     // }
     """,
 
+    # "pre_spike_syn_code": """
+    # // --- Use existing per-neuron Gaussian noise as entropy source, not as delivered noise ---
+    # uint32_t bitsPre  = (uint32_t)((Noise1_pre + 20.0) * 1e6);
+    # uint32_t bitsPost = (uint32_t)((Noise1 + 20.0) * 1e6);
+
+    # uint32_t tBits;
+    # { scalar tOff = t + 20.0; tBits = (uint32_t)(tOff * 1e6); }
+
+    # uint32_t synId = (uint32_t)id_pre * 73856093u ^ (uint32_t)id_post * 19349663u;
+    # uint32_t s0 = bitsPre ^ bitsPost ^ synId ^ tBits;
+
+    # // splitmix32-style mix, applied twice for two independent uniforms
+    # // (x >> n) rewritten as (x / 2^n) since GeNN's transpiler doesn't support >>
+    # uint32_t x = s0;
+    # x = x ^ (x / 65536u); x = x * 0x7feb352du;
+    # x = x ^ (x / 32768u); x = x * 0x846ca68bu;
+    # x = x ^ (x / 65536u);
+    # uint32_t h1 = x;
+
+    # x = s0 + 0x9E3779B9u;
+    # x = x ^ (x / 65536u); x = x * 0x7feb352du;
+    # x = x ^ (x / 32768u); x = x * 0x846ca68bu;
+    # x = x ^ (x / 65536u);
+    # uint32_t h2 = x;
+
+    # const scalar u1 = (h1 + 0.5) / 4294967296.0;
+    # const scalar u2 = (h2 + 0.5) / 4294967296.0;
+
+    # // Box-Muller: the actual per-synapse independent Gaussian
+    # const scalar synapseNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
+    
+    # SynSig = exp(LogSynSig - 5);
+    # scalar eps = SynSig * synapseNoise;
+    # addToPost(g + eps);
+    # NoiseTrace += eps;
+    # """,
+
     "synapse_dynamics_code": """
+    scalar deltaV = fabs(PrevV - V_post);
+
+    // if (g > 0) DeltaG += 1e-4;
+    // else DeltaG -= 1e-4;
+    
+    // UpdateCount *= AlphaFAv;
+    // if (DeltaG == 0.0) UpdateCount += (1.0 - AlphaFAv);
+    
     scalar reward = TdE_post + PRew_post;
+    
     DeltaG += reward * (RLTrace + RLEpsTrace + RLNoiseTrace)
-        + 0.0 * CReg * (PR_post + VR_post) * eFiltered;
+       - 0.01 * deltaV * (RLEpsTrace + RLNoiseTrace)
+       + 0.0 * CReg * (PR_post + VR_post) * eFiltered;
     
     // --- Standard ALIF e-prop eligibility update ---
     scalar epsA = epsilonA;
@@ -451,11 +502,12 @@ eprop_alif_td_model = {
 
     SynSig = exp(LogSynSig - 5);
     // const scalar NormPertEpsTrace = (1.0 - Alpha * Alpha) * PertEpsTrace_post / (Sigma_post * Sigma_post + 1e-6);
-    const scalar NormNoiseTrace = (1.0 - Alpha * Alpha) * NoiseTrace / (SynSig * SynSig + 1e-6);
+    // const scalar NormNoiseTrace = (1.0 - Alpha * Alpha) * NoiseTrace / (SynSig * SynSig + 1e-6);
+    const scalar NormNoiseTrace = NoiseTrace / (SynSig * SynSig + 1e-6);
 
-    // RLTrace = Lambda * RLTrace + eFiltered * ( 1.0 * PG_post - 0.1 * VE_post + 0.00 * PGEps_post );
+    // RLTrace = Lambda * RLTrace + eFiltered * ( 1.0 * PG_post - 0.1 * VE_post + 0.0 * PGEps_post );
     // RLEpsTrace = Lambda * RLEpsTrace + e * NormPertEpsTrace;
-    RLNoiseTrace = Lambda * RLNoiseTrace + e * (NormNoiseTrace + 0.0 * NormNoiseTrace * PGEps_post); 
+    RLNoiseTrace = Lambda * RLNoiseTrace + e * NormNoiseTrace; 
 
     // SynSigTrace = SynSigTrace * 0.9 + Psi * ((1.0 - Alpha * Alpha) * NoiseTrace * NoiseTrace / (SynSig * SynSig + 1e-6) - 1.0);
     
@@ -467,6 +519,8 @@ eprop_alif_td_model = {
 
     // addToPre( g * Psi * NormPertEpsTrace );
     // addToPre( g * Psi * NormNoiseTrace );
+    
+    // addToPre( deltaV );
     """
 }
 
@@ -885,11 +939,11 @@ class EPropCompiler(Compiler):
                         // E = {model_copy.output_var_name} * {self.gamma} + reward - ValTrace;
                         E = {model_copy.output_var_name} * {self.gamma} + reward - PrevVal; // TdE
 
-                        ValReg = (
-                            0.000 * ({model_copy.output_var_name})
-                            + 0.1 * ({model_copy.output_var_name} - PrevVal)
-                            + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
-                        );
+                        // ValReg = (
+                        //     0.000 * ({model_copy.output_var_name})
+                        //     + 0.1 * ({model_copy.output_var_name} - PrevVal)
+                        //     + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
+                        // );
                         PrevVal = {model_copy.output_var_name};
                         reward *= {self.reward_decay};
                         tdError = 0;
@@ -952,7 +1006,7 @@ class EPropCompiler(Compiler):
                 E = ISynFeedback;
                 Ebase = Ebase * 0.999 + E * 0.001;
                 Noise1 = gennrand_normal();
-                Noise2 = gennrand_normal();
+                Noise2 = gennrand_uniform();
                 Noise3 = gennrand_normal();
                 Noise4 = gennrand_normal();
                 """
@@ -1213,13 +1267,14 @@ class EPropCompiler(Compiler):
                               "RLNoiseTrace": 0.0,
                               "LogSynSig": 0.0,
                               "SynSig": 0.0,
-                              "SynSigTrace": 0.0
+                              "SynSigTrace": 0.0,
+                              "UpdateCount": 0.0
                     },
                     pre_var_vals={"ZFilter": 0.0},
                     post_var_vals={
                         "Psi": 0.0, "FAvg": 0.0, 
                         "FAvgTrace": 0.0, "Z": 0.0,
-                        "NeuronNoiseTrace": 0.0},
+                        "PrevV": 0.0, "NeuronNoiseTrace": 0.0},
                     pre_neuron_var_refs={
                         "Noise1_pre": "Noise1"
                     },

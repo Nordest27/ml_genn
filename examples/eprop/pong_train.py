@@ -1,51 +1,83 @@
-##################### CONNECT FOUR — SNN AGENT #####################
-#####################################################################
-# Drop-in replacement for the snake training script.
-# Uses the same EProp / mlGeNN stack; imports PerformanceVisualizer
-# from the generic visualizer module.
-#####################################################################
+##################### HARDCODED PONG — SNN AGENT #####################
+###############################################################
+# Drop-in sibling of the ALE-based atari training script (atari_env.py
+# + its train() loop), but pointed at the hardcoded PongEnv instead of
+# gym/ALE. Same EProp / mlGeNN stack, same EILayer / EILayerConfig
+# helpers, same softmax policy head as pacmanAgents.py's
+# PolicyTypes.GENERIC branch.
+#
+# The one meaningful simplification vs. the ALE script: PongEnv's
+# step(action) already takes the ordinal action scheme directly
+# (0=down, 1=stay, 2=up -- see PongEnv's docstring), so there's no
+# ALE action-id resolution step (no resolve_ordinal_action_map(),
+# no _PONG_ACTION_MAP). The policy head's argmax/categorical index
+# *is* the environment action, full stop.
+#
+# Everything else -- EI layer construction, connectivity, policy/value
+# fields, the per-timestep GradientLearn custom update, the "resample
+# the action every simulated timestep, only refresh the input frame
+# (and push PG) every FRAME_SKIP steps" cadence -- mirrors the ALE
+# script's train() loop 1:1, since PongEnv's obs/step API was written
+# to match AtariEnv's (obs = env.reset(); obs, reward, done =
+# env.step(action)).
+###############################################################
 
 import numpy as np
-import cv2
 import random
-import time
-import multiprocessing as mp
 import csv
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from pygenn import SynapseMatrixConnectivity
 from ml_genn import Population, Connection, Network
 from ml_genn.callbacks import Checkpoint
 from ml_genn.compilers import EPropCompiler, PolicyTypes
 from ml_genn.connectivity import Dense, FixedProbability, ToroidalGaussian2D
 from ml_genn.initializers import Normal
 from ml_genn.neurons import (LeakyIntegrate, AdaptiveLeakyIntegrateFire,
-                              SpikeInput)
+                              PoissonInput)
 from ml_genn.serialisers import Numpy
-from ml_genn.optimisers import Adam, AsyncLocalAdam, CAdam, AdaBelief
-from ml_genn.utils.data import preprocess_spikes
+from ml_genn.optimisers import CAdam, AdaBelief
 from ml_genn.utils.callback_list import CallbackList
 from ml_genn.compilers.eprop_compiler import default_params
 
-from connect_four_env import ConnectFourEnv
+from pong_env import PongEnv
 from performance_visualizer import PerformanceVisualizer
 
-# ─── Board / timing constants ────────────────────────────────────
-BOARD_ROWS  = 6
-BOARD_COLS  = 7
-WAIT_INC    = 30          # timesteps per move ("thinking time")
-PIXEL_SCALE = 40
 
-NUM_ACTIONS = BOARD_COLS  # one action per column
-OBS_SCALE   = 2
+def compute_returns(rewards, gamma):
+    """
+    Backward discounted return G_t = r_t + gamma * G_{t+1}, computed
+    per-timestep over a full episode (or trajectory) of rewards.
+
+    rewards: sequence of raw per-timestep rewards actually seen by the
+             network, in time order.
+    gamma:   per-timestep discount factor.
+
+    Returns a list the same length as `rewards`, where result[t] is the
+    true return-to-go from timestep t onward.
+    """
+    G = list(rewards)
+    for i in range(len(G) - 2, -1, -1):
+        G[i] += gamma * G[i + 1]
+    return G
+
+# ─── Game / timing constants ─────────────────────────────────────
+ENV_NAME      = "HardcodedPong"
+VISIBLE_RANGE = 85         # PongEnv's local-crop window (table units)
+RENDER_SCALE  = 1            # cosmetic scale for env.render() / img()
+FRAME_SKIP    = 2           # how often the SNN's *input frame* refreshes;
+                              # the action is still resampled every timestep
+
 # ─── Network topology ────────────────────────────────────────────
-INPUT_SHAPE = (BOARD_ROWS * OBS_SCALE, BOARD_COLS * OBS_SCALE, 3) 
-INPUT_SIZE     = int(np.prod(INPUT_SHAPE)) 
+# Single grayscale-ish local crop, no frame stacking -- same stance as
+# the ALE script: any velocity signal has to come from the SNN's own
+# recurrent/adaptive state, not from pre-stacked frames.
+INPUT_SHAPE = (VISIBLE_RANGE, VISIBLE_RANGE, 1)
+INPUT_SIZE  = int(np.prod(INPUT_SHAPE))
 
-HIDDEN_E_SHAPE = (20, 20, 3)
-HIDDEN_I_SHAPE = (15, 15, 3)
+HIDDEN_E_SHAPE = (21, 21, 1)
+HIDDEN_I_SHAPE = (15, 15, 1)
 NUM_HIDDEN_E   = int(np.prod(HIDDEN_E_SHAPE))
 NUM_HIDDEN_I   = int(np.prod(HIDDEN_I_SHAPE))
 
@@ -61,21 +93,34 @@ DESIRED_FAN_IN_H2 = 300
 CONN_P = {"I-H": 0.1, "H-H": 0.1, "H-P": 0.5, "H-V": 0.5, "F": 1.0}
 
 # ─── Temporal / learning constants ───────────────────────────────
-reward_decay          = 0.1  ** (1 / WAIT_INC)
-gamma                 = 0.9   ** (1 / WAIT_INC)
-td_lambda             = 0.1   ** (1 / WAIT_INC)
-entropy_coeff         = 1e-2
-entropy_decay         = 0.99999 ** (1 / WAIT_INC)
-entropy_coeff_min     = 0.0
+reward_decay      = 0.1
+gamma             = 0.95
+td_lambda         = 0.95
+entropy_coeff     = 1e-2
+entropy_decay     = 0.99999
+entropy_coeff_min = 0.0
 
-TRAIN             = True
-KERNEL_PROFILING  = False
-CHECKPOINT_NAME   = None      # set to e.g. "c4_mid" to resume
+# ─── Policy-head constants ────────────────────────────────────────
+# PongEnv.step() takes the ordinal action directly: 0=down, 1=stay,
+# 2=up. NUM_POLICY_OUTPUTS is pulled straight from the env's own
+# n_actions rather than hardcoded, so this script stays correct if
+# PongEnv's action count ever changes.
+_probe_env = PongEnv(visible_range=VISIBLE_RANGE, scale=RENDER_SCALE,
+                      inp_shape=INPUT_SHAPE)
+NUM_ACTIONS = _probe_env.n_actions
+_probe_env.close()
+del _probe_env
 
-serialiser = Numpy("c4_checkpoints")
+NUM_POLICY_OUTPUTS = NUM_ACTIONS
+
+TRAIN            = True
+KERNEL_PROFILING = False
+CHECKPOINT_NAME  = None      # set e.g. "pong_mid" to resume
+
+serialiser = Numpy("pong_checkpoints")
 
 # ─── CSV output ──────────────────────────────────────────────────
-CSV_OUTPUT = "outputs/c4_experiment.csv"
+CSV_OUTPUT = f"outputs/{ENV_NAME.lower()}_experiment.csv"
 os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
 
 if os.path.exists(CSV_OUTPUT):
@@ -95,7 +140,7 @@ with open(CSV_OUTPUT, "w", newline="") as f:
     ])
 
 
-# ─── Connectivity helpers (mirrors snake.py) ─────────────────────
+# ─── Connectivity helpers (identical to pacmanAgents.py / atari script) ─
 
 def make_connectivity(
     connectivity_type,
@@ -142,7 +187,7 @@ def make_connectivity(
 
 @dataclass
 class EILayerConfig:
-    """Configuration for a single EI layer (identical to snake.py)."""
+    """Configuration for a single EI layer (identical to pacmanAgents.py)."""
     e_shape: Tuple[int, ...]
     i_shape: Tuple[int, ...]
 
@@ -168,9 +213,7 @@ class EILayerConfig:
 
 
 class EILayer:
-    """
-    A single Excitatory-Inhibitory layer (mirrors snake.py EILayer).
-    """
+    """A single Excitatory-Inhibitory layer (mirrors pacmanAgents.py / atari script)."""
 
     def __init__(self, cfg: EILayerConfig, name: str = ""):
         self.cfg  = cfg
@@ -180,14 +223,14 @@ class EILayer:
         self._internal_connections: list = []
 
     def build(self):
-        cfg    = self.cfg
+        cfg = self.cfg
         neuron_kwargs = dict(
             v_thresh=cfg.v_thresh,
             tau_mem=cfg.tau_mem,
             tau_refrac=cfg.tau_refrac,
             tau_adapt=cfg.tau_adapt,
             beta=cfg.beta,
-            integrate_during_refrac=True
+            integrate_during_refrac=True,
         )
         self.e = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.e_shape)
         self.i = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.i_shape)
@@ -289,7 +332,7 @@ class EILayer:
                 ),
                 exc_inh_sign=-1,
             )
-        
+
     def connect_to_field(
         self,
         field: Population,
@@ -341,9 +384,10 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
 
     with network:
         # ── Populations ──────────────────────────────────────────
-        input_pop = Population(
-            SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE
-        )
+        # PoissonInput: rate-based spike generation happens on-device,
+        # so the CPU only needs to push one rate value per pixel per
+        # env step -- see obs_to_poisson_rate().
+        input_pop = Population(PoissonInput(), INPUT_SHAPE)
 
         alif_params = dict(
             v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
@@ -361,34 +405,38 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             AdaptiveLeakyIntegrateFire(**alif_params), HIDDEN_I_SHAPE
         )
 
+        # Policy head: NUM_POLICY_OUTPUTS-unit softmax readout, same
+        # PolicyTypes.GENERIC head used in pacmanAgents.py and the
+        # ALE Pong script -- here NUM_POLICY_OUTPUTS == PongEnv's own
+        # n_actions (3: down/stay/up), and the sampled index is fed to
+        # env.step() with no further remapping.
         policy = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), NUM_ACTIONS
+            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"),
+            NUM_POLICY_OUTPUTS,
         )
         value = Population(
             LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1
         )
 
-        # Input → first EI layer (excitatory only, using full connectivity_type)
+        # Input → first EI layer (excitatory only)
         ei_layers[0].connect_from(
             input_pop, INPUT_SHAPE,
             connectivity_type=connectivity_type,
             desired_fan_in=DESIRED_FAN_IN_IN,
             sigma=SIGMA_IN,
-            # fan_in_scale=FAN_IN_SCALE_IN,
         )
 
         # Stack EI layers
         for i in range(len(ei_layers) - 1):
-            ei_layers[i].connect_to_next(ei_layers[i+1])
-
+            ei_layers[i].connect_to_next(ei_layers[i + 1])
 
         # ── Last EI layer → field populations ────────────────────
         ei_layers[-1].connect_to_field(policy_field, p=CONN_P["H-H"])
         ei_layers[-1].connect_to_field(value_field,  p=CONN_P["H-H"])
 
-        # ── Field → output heads (forward + feedback) ────────────
+        # ── Field → output heads ──────────────────────────────────
         for field, head, feedback_name, n_out in (
-            (policy_field, policy, "policy_feedback", NUM_ACTIONS),
+            (policy_field, policy, "policy_feedback", NUM_POLICY_OUTPUTS),
             (value_field,  value,  "value_feedback",  1),
         ):
             Connection(
@@ -397,12 +445,6 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
                                   p=0.99999, sign=None),
                 exc_inh_sign=None,
             )
-            # Connection(
-            #     field, head,
-            #     FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(n_out))),
-            #     feedback_name=feedback_name,
-            #     exc_inh_sign=None,
-            # )
 
         # ── tde_transport: policy + all hidden → value ────────────
         Connection(policy, value, Dense(weight=1.0),
@@ -415,24 +457,6 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             Connection(field, value, Dense(weight=1.0),
                        feedback_name="tde_transport")
 
-        # # ── policy/value feedback from EI layers ──────────────────
-        # for layer in ei_layers:
-        #     for pop in layer.populations():
-        #         Connection(
-        #             pop, policy,
-        #             FixedProbability(CONN_P["F"],
-        #                              Normal(sd=1.0 / np.sqrt(NUM_ACTIONS))),
-        #             feedback_name="policy_feedback",
-        #             exc_inh_sign=None,
-        #         )
-        #         Connection(
-        #             pop, value,
-        #             FixedProbability(CONN_P["F"],
-        #                              Normal(sd=1.0 / np.sqrt(1))),
-        #             feedback_name="value_feedback",
-        #             exc_inh_sign=None,
-        #         )
- 
     # ── Compiler ─────────────────────────────────────────────────
     compiler = EPropCompiler(
         example_timesteps=1,
@@ -440,7 +464,7 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             policy: "mean_square_error",
             value:  "mean_square_error",
         },
-        optimiser=AdaBelief(1e-5, task_steps=1, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5),
+        optimiser=AdaBelief(1e-5, task_steps=1, beta1=0.99, beta2=0.99999),
         c_reg=1e-2,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
@@ -470,50 +494,74 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
 
 # ─── Spike encoding ──────────────────────────────────────────────
 
-def make_rate_coded_spikes(values, base_timestep, input_size, K):
-    values = np.clip(values, 0.0, 1.0) * 0.3
-    times, idxs = [], []
-    for i, v in enumerate(values):
-        if v <= 0:
-            continue
-        fired = np.nonzero(np.random.rand(K) < v)[0]
-        if fired.size == 0:
-            continue
-        times.append((base_timestep + fired).astype(np.int64))
-        idxs.append(np.full(fired.size, i, dtype=np.int64))
-    if not times:
-        return preprocess_spikes(np.empty(0, np.int64),
-                                 np.empty(0, np.int64), input_size)
-    return preprocess_spikes(np.concatenate(times),
-                             np.concatenate(idxs), input_size)
+# Per-timestep firing probability of PoissonInput is 1 - exp(-rate*dt).
+# dt = 1.0 ms here (EPropCompiler default), so INPUT_RATE_SCALE = 0.5
+# gives a peak per-timestep firing probability of 1 - exp(-0.5) ≈ 0.39
+# at full pixel intensity.
+INPUT_RATE_SCALE = 0.5
+
+def obs_to_poisson_rate(obs):
+    """
+    PongEnv observations already come back as float32 in [0,1], shaped
+    INPUT_SHAPE (get_local_img_observation() divides by 255 before
+    returning). Just rescale to a per-timestep Poisson rate for
+    PoissonInput -- the GPU resamples spikes from this rate every
+    timestep on its own, so this only needs to be pushed once per env
+    step (while the frame is held for FRAME_SKIP timesteps).
+    """
+    return (np.clip(obs, 0.0, 1.0) * INPUT_RATE_SCALE).astype(np.float32)
 
 
-def softmax_masked(logits, mask):
-    logits = logits.copy()
-    logits[~mask] = -1e9
-    e = np.exp(logits - logits.max())
-    return e / (e.sum() + 1e-8)
+def softmax_policy(logits):
+    """
+    Softmax policy head -- the PolicyTypes.GENERIC branch from
+    pacmanAgents.py's getAction(), applied to PongEnv's 3-unit
+    (down/stay/up) readout:
 
+      1. logits -> softmax -> probs, a genuine 3-way categorical.
+      2. Sample one action from that categorical. The sampled index
+         *is* the PongEnv action -- 0=down, 1=stay, 2=up, matching
+         PongEnv.step()'s own convention, so there's no id remapping.
+      3. PG = probs - one_hot(action), the analytic score-function
+         gradient for softmax + categorical sampling, pushed straight
+         to the policy population's `pre_PG` var.
+
+    Stateless -- no trace to carry across calls, so no reset() is
+    needed between episodes.
+    """
+    logits = np.asarray(logits, dtype=np.float64).flatten()
+    shifted = logits - logits.max()
+    exp_l = np.exp(shifted)
+    probs = exp_l / (exp_l.sum() + 1e-8)
+
+    action_idx = int(np.random.choice(len(probs), p=probs))
+
+    y_true = np.zeros_like(probs)
+    y_true[action_idx] = 1.0
+    pg = probs - y_true
+
+    return action_idx, probs, pg
 
 # ─── Main training loop ──────────────────────────────────────────
 
 def train(compiled_net, input_pop, hidden_layers, policy, value,
           train_callback_list, visualizer, episodes=int(1e10)):
 
-    env         = ConnectFourEnv(rows=BOARD_ROWS, cols=BOARD_COLS,
-                                  wait_inc=WAIT_INC, scale=PIXEL_SCALE,
-                                  obs_scale = OBS_SCALE, opponent="opportunistic")
-    opt_updt    = 0
-    best_reward_ep = -10000
-    best_reward = -np.inf
-    best_run    = []
-    avg         = 0.0
-    smoothing   = 0.95
+    env = PongEnv(
+        visible_range=VISIBLE_RANGE, scale=RENDER_SCALE,
+        inp_shape=INPUT_SHAPE,
+    )
 
-    # Running diagnostic averages (mirrors snake.py)
-    v_avg         = 0.0
+    opt_updt       = 0
+    best_reward_ep = -10000
+    best_reward    = -np.inf
+    avg            = 0.0
+    smoothing      = 0.95
+
+    # Running diagnostic averages (mirrors pacmanAgents.py / atari script)
+    v_avg          = 0.0
     v_reg_loss_avg = 0.0
-    freq_avg      = 0.0
+    freq_avg       = 0.0
 
     train_callback_list.on_epoch_begin(0)
     train_callback_list.on_batch_begin(0)
@@ -531,64 +579,26 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
         ep_frames      = 0
         td_error_sum_abs = 0.0
 
-        # ── initial spike encoding ───────────────────────────────
-        spikes = make_rate_coded_spikes(
-            obs.reshape(-1), compiled_net.genn_model.timestep,
-            INPUT_SIZE, WAIT_INC
-        )
-        compiled_net.set_input({input_pop: [spikes]})
-        env.wait_count = WAIT_INC
+        # ── initial input encoding ───────────────────────────────
+        compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
+        frame_skip = FRAME_SKIP
 
         # ── episode loop ─────────────────────────────────────────
         while not done:
 
-            current_values.append(compiled_net.get_readout(value)[0].mean())
-            current_rt.append(reward_trace)
+            # ── per-step diagnostics (mirrors pacmanAgents.py / atari script) ───
+            if frame_skip == FRAME_SKIP:
+                h = compiled_net.get_readout(policy).flatten()
+                action_idx, probs, pg = softmax_policy(h)
 
-            if env.wait_count == 0:
-                logits = compiled_net.get_readout(policy).flatten()
-                mask   = env.legal_mask()
-                probs  = softmax_masked(logits, mask)
-
-                action_label = np.random.choice(NUM_ACTIONS, p=probs)
-
-                y_true = np.zeros(NUM_ACTIONS)
-                y_true[action_label] = 1.0
-                PG = probs - y_true
-
-                log_p = np.log(probs + 1e-8)
-                entropy = -np.sum(probs * log_p)
-
-                # entropy_grad_logits = -probs * (log_p + entropy)
-
-                # E = entropy_coeff * entropy_grad_logits
-
-                compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = PG.astype(np.float32)
+                compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = \
+                    pg.astype(np.float32)
                 compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
 
-                # compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = E.astype(np.float32)
-                # compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
-                
+                ep_frames += 1
                 current_probs.append(probs)
 
-            else:
-                legal = np.where(env.legal_mask())[0]
-                action_label = int(random.choice(legal)) if len(legal) else 0
-
-            obs, reward, done = env.step(action_label)
-            total_reward += reward
-            reward_trace  = reward_trace * reward_decay + reward
-
-            if reward != 0:
-                compiled_net.losses[value].set_var(
-                    compiled_net.neuron_populations[value], "reward", reward
-                )
-
-            # ── per-step diagnostics (mirrors snake.py) ──────────
-            if env.wait_count == env.wait_inc:
-                ep_frames += 1
                 syn_sig_vals = []
-                # Firing frequency
                 for conn_pop in list(compiled_net.connection_populations.values())[::-1]:
                     try:
                         conn_pop.post_vars["FAvg"].pull_from_device()
@@ -601,9 +611,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                     except Exception:
                         pass
                 freq_avg = np.mean(abs(f))
-                syn_sig_avg = np.mean(syn_sig_vals)
 
-                # Voltage diagnostics on first hidden population
                 first_hidden = list(hidden_layers.values())[0]
                 compiled_net.neuron_populations[first_hidden].vars["V"].pull_from_device()
                 compiled_net.neuron_populations[first_hidden].vars["A"].pull_from_device()
@@ -619,56 +627,57 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                     np.maximum(-v_view - (0.61 + beta_view * A_view), 0.0)
                 ))
 
-                # Capture frame + new spikes
-                current_run.append(env.render())
-                spikes = make_rate_coded_spikes(
-                    obs.reshape(-1), compiled_net.genn_model.timestep,
-                    INPUT_SIZE, WAIT_INC
+                current_run.append(obs)
+                compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
+
+            current_values.append(compiled_net.get_readout(value)[0].mean())
+            current_rt.append(reward_trace)
+
+            # Fresh categorical draw every timestep from the same
+            # softmax(h) distribution -- h (and hence probs) only
+            # changes when the input frame is refreshed above, but the
+            # actual action taken is resampled continuously so the
+            # paddle can still be corrected mid-frame.
+            action_idx, probs, pg = softmax_policy(h)
+
+            # No id remapping needed: PongEnv.step() takes the ordinal
+            # action_idx directly (0=down, 1=stay, 2=up).
+            obs, reward, done = env.step(action_idx)
+            total_reward += reward
+            reward_trace  = reward_trace * reward_decay + reward
+
+            if reward != 0:
+                compiled_net.losses[value].set_var(
+                    compiled_net.neuron_populations[value], "reward", reward
                 )
-                compiled_net.set_input({input_pop: [spikes]})
 
             compiled_net.step_time(train_callback_list)
 
-            # if env.wait_count == env.wait_inc:
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
                 for c in custom_updates:
                     o.set_step(c, opt_updt := opt_updt + 1)
 
-        # ── terminal drain ───────────────────────────────────────
-        spikes = make_rate_coded_spikes(
-            obs.reshape(-1), compiled_net.genn_model.timestep,
-            INPUT_SIZE, WAIT_INC
-        )
-        compiled_net.set_input({input_pop: [spikes]})
-        for _ in range(WAIT_INC):
-            current_values.append(compiled_net.get_readout(value)[0].mean())
-            reward_trace = reward_trace * reward_decay
-            current_rt.append(reward_trace)
-            compiled_net.step_time(train_callback_list)            
+            frame_skip -= 1
+            if frame_skip == 0:
+                frame_skip = FRAME_SKIP
 
-            compiled_net.genn_model.custom_update("GradientLearn")
-            for o, custom_updates in compiled_net.optimisers:
-                for c in custom_updates:
-                    o.set_step(c, opt_updt := opt_updt + 1)
-
-        for _ in range(3):
-            current_run.append(env.render())
         # ── periodic checkpoint ───────────────────────────────────
         if (ep + 1) % 1000 == 0:
-            compiled_net.save((f"c4_ep{ep+1}",), serialiser)
+            compiled_net.save((f"pong_ep{ep+1}",), serialiser)
             print(f"  [checkpoint saved at ep {ep+1}]")
 
         # ── best-run tracking + visualizer ────────────────────────
-        if current_probs and ep > best_reward_ep + 100:
+        if current_probs and (total_reward >= best_reward or (ep - best_reward_ep) > 50):
             best_reward_ep = ep
             best_reward    = total_reward
-            best_run       = list(current_run)[-6:]
+            best_run       = list(current_run)
             if visualizer:
                 visualizer.push_best_sequence(best_run)
+                current_G = compute_returns(current_rt, gamma)
                 visualizer.push_metrics(
                     values=current_values,
-                    reward_trace=np.array(current_rt),
+                    reward_trace=np.array(current_G),
                     probs=current_probs,
                 )
 
@@ -676,7 +685,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
         if visualizer:
             visualizer.push_metrics(reward=total_reward)
 
-        # ── CSV logging (mirrors snake.py) ────────────────────────
+        # ── CSV logging ────────────────────────────────────────────
         safe_ep_frames = max(ep_frames, 1)
         with open(CSV_OUTPUT, "a", newline="") as f:
             writer = csv.writer(f)
@@ -685,7 +694,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 total_reward,
                 ep_frames,
                 td_error_sum_abs / safe_ep_frames,
-                WAIT_INC * total_reward / safe_ep_frames,
+                total_reward / safe_ep_frames,
                 v_avg,
                 v_reg_loss_avg,
                 freq_avg,
@@ -697,8 +706,8 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 f"reward {total_reward:+7.2f} | "
                 f"best {best_reward:+7.2f} | "
                 f"avg {avg:+7.2f} | "
-                f"outcome {env.winner} | "
-                f"moves {env.moves} | "
+                f"env steps {env.steps_taken:4d} | "
+                f"score {env.player_score}-{env.opponent_score} | "
                 f"voltage {v_avg:.4f} | "
                 f"freq {1000 * freq_avg:.4f}"
             )

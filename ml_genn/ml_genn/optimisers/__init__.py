@@ -3,10 +3,13 @@ by learning rules to model parameters. They are implemented as GeNN
 custom updates which access both the variable and the gradients via variable references.
 """
 from .adam import Adam
+from .cadam import CAdam
+from .ada_belief import AdaBelief
+from .adam_acc import AsyncLocalAdam
 from .optimiser import Optimiser
 
 from ..utils.module import get_module_classes
 
 default_optimisers = get_module_classes(globals(), Optimiser)
 
-__all__ = ["Adam", "Optimiser", "default_optimisers"]
+__all__ = ["Adam", "CAdam", "AdaBelief", "AsyncLocalAdam", "Optimiser", "default_optimisers"]

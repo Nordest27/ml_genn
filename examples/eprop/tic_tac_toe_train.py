@@ -1,8 +1,22 @@
-##################### CONNECT FOUR — SNN AGENT #####################
+##################### TIC TAC TOE — SNN AGENT #####################
 #####################################################################
-# Drop-in replacement for the snake training script.
+# Drop-in replacement for the connect_four / snake training scripts.
 # Uses the same EProp / mlGeNN stack; imports PerformanceVisualizer
 # from the generic visualizer module.
+#
+# UPDATED for the new TicTacToeEnv turn model:
+#   - Both players get an equal wait_inc "thinking" phase before each of
+#     their moves (previously only the agent waited; the opponent moved
+#     for free inside the same step() call as soon as wait_count hit 0).
+#   - Either player can move first each episode (env's first_player=
+#     "random" by default).
+#   - env.wait_count == 0 no longer implies "it's the agent's turn" — use
+#     env.awaiting_agent_action instead, which is only True when the next
+#     step() call will consume a real `action` to place the agent's piece.
+#   - Every timestep (whichever player is thinking/moving) re-encodes and
+#     feeds spikes for the current observation, since the opponent's move
+#     now also changes what's on the board mid-episode outside of the
+#     single combined step() call the old code relied on.
 #####################################################################
 
 import numpy as np
@@ -22,27 +36,48 @@ from ml_genn.compilers import EPropCompiler, PolicyTypes
 from ml_genn.connectivity import Dense, FixedProbability, ToroidalGaussian2D
 from ml_genn.initializers import Normal
 from ml_genn.neurons import (LeakyIntegrate, AdaptiveLeakyIntegrateFire,
-                              SpikeInput)
+                              SpikeInput, PoissonInput)
 from ml_genn.serialisers import Numpy
 from ml_genn.optimisers import Adam, AsyncLocalAdam, CAdam, AdaBelief
 from ml_genn.utils.data import preprocess_spikes
 from ml_genn.utils.callback_list import CallbackList
 from ml_genn.compilers.eprop_compiler import default_params
 
-from connect_four_env import ConnectFourEnv
+from tic_tac_toe_env import TicTacToeEnv
 from performance_visualizer import PerformanceVisualizer
 
-# ─── Board / timing constants ────────────────────────────────────
-BOARD_ROWS  = 6
-BOARD_COLS  = 7
-WAIT_INC    = 30          # timesteps per move ("thinking time")
-PIXEL_SCALE = 40
 
-NUM_ACTIONS = BOARD_COLS  # one action per column
-OBS_SCALE   = 2
+def compute_returns(rewards, gamma):
+    """
+    Backward discounted return G_t = r_t + gamma * G_{t+1}, computed
+    per-timestep over a full episode of rewards.
+
+    rewards: sequence of raw per-timestep rewards actually seen by the
+             network, in time order (NOT the forward-decayed
+             `reward_trace` — that's a different, causal-only quantity).
+    gamma:   per-timestep discount factor.
+
+    Returns a list the same length as `rewards`, where result[t] is the
+    true return-to-go from timestep t onward.
+    """
+    G = list(rewards)
+    for i in range(len(G) - 2, -1, -1):
+        G[i] += gamma * G[i + 1]
+    return G
+
+# ─── Board / timing constants ────────────────────────────────────
+BOARD_ROWS  = 3
+BOARD_COLS  = 3
+WAIT_INC    = 30          # timesteps per move ("thinking time") — SAME for both players
+PIXEL_SCALE = 120
+
+NUM_ACTIONS = BOARD_ROWS * BOARD_COLS  # one action per cell (flattened)
+OBS_SCALE   = 5                        # 4x4 px per cell -> 12x12 observation
+FIRST_PLAYER = "random"                # "agent" | "opponent" | "random" | 1 | -1
+
 # ─── Network topology ────────────────────────────────────────────
-INPUT_SHAPE = (BOARD_ROWS * OBS_SCALE, BOARD_COLS * OBS_SCALE, 3) 
-INPUT_SIZE     = int(np.prod(INPUT_SHAPE)) 
+INPUT_SHAPE = (BOARD_ROWS * OBS_SCALE, BOARD_COLS * OBS_SCALE, 3)  # (12, 12, 3)
+INPUT_SIZE     = int(np.prod(INPUT_SHAPE))
 
 HIDDEN_E_SHAPE = (20, 20, 3)
 HIDDEN_I_SHAPE = (15, 15, 3)
@@ -62,40 +97,35 @@ CONN_P = {"I-H": 0.1, "H-H": 0.1, "H-P": 0.5, "H-V": 0.5, "F": 1.0}
 
 # ─── Temporal / learning constants ───────────────────────────────
 reward_decay          = 0.1  ** (1 / WAIT_INC)
-gamma                 = 0.9   ** (1 / WAIT_INC)
-td_lambda             = 0.1   ** (1 / WAIT_INC)
+gamma                 = 0.7   ** (1 / WAIT_INC)
+td_lambda             = 0.5   ** (1 / WAIT_INC)
 entropy_coeff         = 1e-2
 entropy_decay         = 0.99999 ** (1 / WAIT_INC)
 entropy_coeff_min     = 0.0
 
 TRAIN             = True
 KERNEL_PROFILING  = False
-CHECKPOINT_NAME   = None      # set to e.g. "c4_mid" to resume
+CHECKPOINT_NAME   = None # "ttt_ep76000"
+CHECKPOINT_SAVE_NAME = "ttt"
+if CHECKPOINT_NAME is not None:
+    CONNECTIVITY_TYPE = "fixed"
 
-serialiser = Numpy("c4_checkpoints")
+print("CHEKPOINT_NAME", CHECKPOINT_NAME)
+serialiser = Numpy("ttt_checkpoints")
 
 # ─── CSV output ──────────────────────────────────────────────────
-CSV_OUTPUT = "outputs/c4_experiment.csv"
-os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
+CSV_OUTPUT = "outputs_ttt/weight_dist(1).csv"
+def init_csv(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        os.remove(path)          # or rename with a timestamp instead
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerow([
+            "episode", "score", "ep_steps", "avg_abs_td_error",
+            "reward_rate", "voltage", "voltage_loss", "frequency", "first_player",
+        ])
 
-if os.path.exists(CSV_OUTPUT):
-    os.remove(CSV_OUTPUT)
-
-with open(CSV_OUTPUT, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow([
-        "episode",
-        "score",
-        "ep_steps",
-        "avg_abs_td_error",
-        "reward_rate",
-        "voltage",
-        "voltage_loss",
-        "frequency",
-    ])
-
-
-# ─── Connectivity helpers (mirrors snake.py) ─────────────────────
+# ─── Connectivity helpers (mirrors connect_four_snn.py) ──────────
 
 def make_connectivity(
     connectivity_type,
@@ -142,7 +172,7 @@ def make_connectivity(
 
 @dataclass
 class EILayerConfig:
-    """Configuration for a single EI layer (identical to snake.py)."""
+    """Configuration for a single EI layer (identical to connect_four_snn.py)."""
     e_shape: Tuple[int, ...]
     i_shape: Tuple[int, ...]
 
@@ -169,7 +199,7 @@ class EILayerConfig:
 
 class EILayer:
     """
-    A single Excitatory-Inhibitory layer (mirrors snake.py EILayer).
+    A single Excitatory-Inhibitory layer (mirrors connect_four_snn.py EILayer).
     """
 
     def __init__(self, cfg: EILayerConfig, name: str = ""):
@@ -289,7 +319,7 @@ class EILayer:
                 ),
                 exc_inh_sign=-1,
             )
-        
+
     def connect_to_field(
         self,
         field: Population,
@@ -342,7 +372,7 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
     with network:
         # ── Populations ──────────────────────────────────────────
         input_pop = Population(
-            SpikeInput(max_spikes=INPUT_SIZE * WAIT_INC), INPUT_SHAPE
+            PoissonInput(), INPUT_SHAPE
         )
 
         alif_params = dict(
@@ -374,13 +404,11 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             connectivity_type=connectivity_type,
             desired_fan_in=DESIRED_FAN_IN_IN,
             sigma=SIGMA_IN,
-            # fan_in_scale=FAN_IN_SCALE_IN,
         )
 
         # Stack EI layers
         for i in range(len(ei_layers) - 1):
             ei_layers[i].connect_to_next(ei_layers[i+1])
-
 
         # ── Last EI layer → field populations ────────────────────
         ei_layers[-1].connect_to_field(policy_field, p=CONN_P["H-H"])
@@ -397,12 +425,6 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
                                   p=0.99999, sign=None),
                 exc_inh_sign=None,
             )
-            # Connection(
-            #     field, head,
-            #     FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(n_out))),
-            #     feedback_name=feedback_name,
-            #     exc_inh_sign=None,
-            # )
 
         # ── tde_transport: policy + all hidden → value ────────────
         Connection(policy, value, Dense(weight=1.0),
@@ -415,24 +437,6 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             Connection(field, value, Dense(weight=1.0),
                        feedback_name="tde_transport")
 
-        # # ── policy/value feedback from EI layers ──────────────────
-        # for layer in ei_layers:
-        #     for pop in layer.populations():
-        #         Connection(
-        #             pop, policy,
-        #             FixedProbability(CONN_P["F"],
-        #                              Normal(sd=1.0 / np.sqrt(NUM_ACTIONS))),
-        #             feedback_name="policy_feedback",
-        #             exc_inh_sign=None,
-        #         )
-        #         Connection(
-        #             pop, value,
-        #             FixedProbability(CONN_P["F"],
-        #                              Normal(sd=1.0 / np.sqrt(1))),
-        #             feedback_name="value_feedback",
-        #             exc_inh_sign=None,
-        #         )
- 
     # ── Compiler ─────────────────────────────────────────────────
     compiler = EPropCompiler(
         example_timesteps=1,
@@ -440,8 +444,13 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
             policy: "mean_square_error",
             value:  "mean_square_error",
         },
-        optimiser=AdaBelief(1e-5, task_steps=1, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5),
+        # optimiser=AdaBelief(1e-5, task_steps=1, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5),
+        optimiser=Adam(1e-5, beta1=0.9, beta2=0.999, l2_init_strength=1e-5),
+        # optimiser=Adam(5e-5, beta1=0.9, beta2=0.999),
         c_reg=1e-2,
+        # c_reg=1e-4,
+        f_target=10,
+        # f_target=100,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
         feedback_type="random",
@@ -459,6 +468,7 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
     )
 
     if CHECKPOINT_NAME is not None:
+        print("Loading", CHECKPOINT_NAME)
         network.load((CHECKPOINT_NAME,), serialiser)
 
     compiled_net = compiler.compile(network)
@@ -494,15 +504,22 @@ def softmax_masked(logits, mask):
     e = np.exp(logits - logits.max())
     return e / (e.sum() + 1e-8)
 
+INPUT_RATE_SCALE = 0.5
+
+def obs_to_poisson_rate(obs):
+    return (
+        np.clip(obs, 0.0, 1.0)
+        * INPUT_RATE_SCALE
+    ).astype(np.float32)
 
 # ─── Main training loop ──────────────────────────────────────────
-
 def train(compiled_net, input_pop, hidden_layers, policy, value,
           train_callback_list, visualizer, episodes=int(1e10)):
 
-    env         = ConnectFourEnv(rows=BOARD_ROWS, cols=BOARD_COLS,
-                                  wait_inc=WAIT_INC, scale=PIXEL_SCALE,
-                                  obs_scale = OBS_SCALE, opponent="opportunistic")
+    env         = TicTacToeEnv(rows=BOARD_ROWS, cols=BOARD_COLS,
+                                wait_inc=WAIT_INC, scale=PIXEL_SCALE,
+                                obs_scale=OBS_SCALE, opponent="minimax",
+                                first_player=FIRST_PLAYER)
     opt_updt    = 0
     best_reward_ep = -10000
     best_reward = -np.inf
@@ -510,7 +527,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
     avg         = 0.0
     smoothing   = 0.95
 
-    # Running diagnostic averages (mirrors snake.py)
+    # Running diagnostic averages (mirrors connect_four_snn.py)
     v_avg         = 0.0
     v_reg_loss_avg = 0.0
     freq_avg      = 0.0
@@ -530,14 +547,18 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
         current_probs  = []
         ep_frames      = 0
         td_error_sum_abs = 0.0
+        first_player_this_ep = env.current_player  # 1=agent, -1=opponent
 
         # ── initial spike encoding ───────────────────────────────
-        spikes = make_rate_coded_spikes(
-            obs.reshape(-1), compiled_net.genn_model.timestep,
-            INPUT_SIZE, WAIT_INC
-        )
-        compiled_net.set_input({input_pop: [spikes]})
-        env.wait_count = WAIT_INC
+        compiled_net.set_input({
+            input_pop: obs_to_poisson_rate(obs)
+        })
+
+        # Tracks whether we just crossed into a new mover's think-phase,
+        # so we know when to re-encode/re-render (mirrors the old
+        # `env.wait_count == env.wait_inc` check, but now fires at the
+        # start of EITHER player's think-phase, not just the agent's).
+        last_wait_count = env.wait_count
 
         # ── episode loop ─────────────────────────────────────────
         while not done:
@@ -545,7 +566,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
             current_values.append(compiled_net.get_readout(value)[0].mean())
             current_rt.append(reward_trace)
 
-            if env.wait_count == 0:
+            if env.awaiting_agent_action:
                 logits = compiled_net.get_readout(policy).flatten()
                 mask   = env.legal_mask()
                 probs  = softmax_masked(logits, mask)
@@ -559,23 +580,20 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 log_p = np.log(probs + 1e-8)
                 entropy = -np.sum(probs * log_p)
 
-                # entropy_grad_logits = -probs * (log_p + entropy)
-
-                # E = entropy_coeff * entropy_grad_logits
-
                 compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = PG.astype(np.float32)
                 compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
 
-                # compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = E.astype(np.float32)
-                # compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
-                
                 current_probs.append(probs)
-
+                action_to_step = action_label
             else:
+                # Either still in a think-phase (either player), or it's
+                # the opponent's turn to move — `action` is ignored by
+                # env.step() in both cases, so any legal-looking value is
+                # fine here (kept for readability / debuggability only).
                 legal = np.where(env.legal_mask())[0]
-                action_label = int(random.choice(legal)) if len(legal) else 0
+                action_to_step = int(random.choice(legal)) if len(legal) else 0
 
-            obs, reward, done = env.step(action_label)
+            obs, reward, done = env.step(action_to_step)
             total_reward += reward
             reward_trace  = reward_trace * reward_decay + reward
 
@@ -584,8 +602,15 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                     compiled_net.neuron_populations[value], "reward", reward
                 )
 
-            # ── per-step diagnostics (mirrors snake.py) ──────────
-            if env.wait_count == env.wait_inc:
+            # ── per-step diagnostics (mirrors connect_four_snn.py) ──
+            # Fires at the START of every think-phase (agent's OR
+            # opponent's) rather than only the agent's, since wait_count
+            # resets to wait_inc for whichever player's turn it now is.
+            started_new_think_phase = (
+                (not done) and env.wait_count == env.wait_inc
+                and last_wait_count != env.wait_inc
+            )
+            if started_new_think_phase:
                 ep_frames += 1
                 syn_sig_vals = []
                 # Firing frequency
@@ -613,39 +638,38 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 A_view    = compiled_net.neuron_populations[first_hidden].vars["A"].view
                 beta_view = compiled_net.neuron_populations[first_hidden].vars["Beta"].view
 
-                v_avg = v_avg * 0.999 + 0.001 * np.mean(abs(v_view))
+                v_avg = v_avg * 0.999 + 0.001 * np.mean(v_view)
                 v_reg_loss_avg = v_reg_loss_avg * 0.999 + 0.001 * np.mean(abs(
                     np.maximum( v_view - (0.61 + beta_view * A_view), 0.0) +
                     np.maximum(-v_view - (0.61 + beta_view * A_view), 0.0)
                 ))
 
-                # Capture frame + new spikes
+                # Capture frame + re-encode spikes for the (possibly just
+                # updated, e.g. after the opponent moved) board state.
                 current_run.append(env.render())
-                spikes = make_rate_coded_spikes(
-                    obs.reshape(-1), compiled_net.genn_model.timestep,
-                    INPUT_SIZE, WAIT_INC
-                )
-                compiled_net.set_input({input_pop: [spikes]})
+                compiled_net.set_input({
+                    input_pop: obs_to_poisson_rate(obs)
+                })
+
+
+            last_wait_count = env.wait_count if not done else last_wait_count
 
             compiled_net.step_time(train_callback_list)
 
-            # if env.wait_count == env.wait_inc:
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
                 for c in custom_updates:
                     o.set_step(c, opt_updt := opt_updt + 1)
 
         # ── terminal drain ───────────────────────────────────────
-        spikes = make_rate_coded_spikes(
-            obs.reshape(-1), compiled_net.genn_model.timestep,
-            INPUT_SIZE, WAIT_INC
-        )
-        compiled_net.set_input({input_pop: [spikes]})
+        compiled_net.set_input({
+            input_pop: obs_to_poisson_rate(obs)
+        })
         for _ in range(WAIT_INC):
             current_values.append(compiled_net.get_readout(value)[0].mean())
             reward_trace = reward_trace * reward_decay
             current_rt.append(reward_trace)
-            compiled_net.step_time(train_callback_list)            
+            compiled_net.step_time(train_callback_list)
 
             compiled_net.genn_model.custom_update("GradientLearn")
             for o, custom_updates in compiled_net.optimisers:
@@ -656,7 +680,8 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
             current_run.append(env.render())
         # ── periodic checkpoint ───────────────────────────────────
         if (ep + 1) % 1000 == 0:
-            compiled_net.save((f"c4_ep{ep+1}",), serialiser)
+            compiled_net.save_connectivity((f"{CHECKPOINT_SAVE_NAME}_ep{ep+1}",), serialiser)
+            compiled_net.save((f"{CHECKPOINT_SAVE_NAME}_ep{ep+1}",), serialiser)
             print(f"  [checkpoint saved at ep {ep+1}]")
 
         # ── best-run tracking + visualizer ────────────────────────
@@ -666,9 +691,10 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
             best_run       = list(current_run)[-6:]
             if visualizer:
                 visualizer.push_best_sequence(best_run)
+                current_G = compute_returns(current_rt, gamma)
                 visualizer.push_metrics(
                     values=current_values,
-                    reward_trace=np.array(current_rt),
+                    reward_trace=np.array(current_G),
                     probs=current_probs,
                 )
 
@@ -676,7 +702,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
         if visualizer:
             visualizer.push_metrics(reward=total_reward)
 
-        # ── CSV logging (mirrors snake.py) ────────────────────────
+        # ── CSV logging (mirrors connect_four_snn.py) ─────────────
         safe_ep_frames = max(ep_frames, 1)
         with open(CSV_OUTPUT, "a", newline="") as f:
             writer = csv.writer(f)
@@ -685,10 +711,11 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 total_reward,
                 ep_frames,
                 td_error_sum_abs / safe_ep_frames,
-                WAIT_INC * total_reward / safe_ep_frames,
+                total_reward / safe_ep_frames,
                 v_avg,
                 v_reg_loss_avg,
                 freq_avg,
+                "agent" if first_player_this_ep == 1 else "opponent",
             ])
 
         if ep % 10 == 0:
@@ -699,6 +726,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 f"avg {avg:+7.2f} | "
                 f"outcome {env.winner} | "
                 f"moves {env.moves} | "
+                f"first {'agent' if first_player_this_ep == 1 else 'opponent'} | "
                 f"voltage {v_avg:.4f} | "
                 f"freq {1000 * freq_avg:.4f}"
             )
@@ -707,6 +735,7 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
 # ─── Entry point ─────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    init_csv(CSV_OUTPUT)
 
     compiled_net, network, input_pop, hidden_layers, policy, value = \
         build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)

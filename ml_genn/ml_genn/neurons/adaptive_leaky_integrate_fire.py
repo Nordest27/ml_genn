@@ -84,12 +84,12 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 Sigma = 0.0 * exp(LogSigma);
                 PertEps = Sigma * gennrand_normal();
                 PertEpsTrace = PertEpsTrace * Alpha + PertEps;
-                PertEpsTraceDivSigma = PertEpsTraceDivSigma * 0.993 + (PertEpsTrace * PertEpsTrace * (1.0 - Alpha * Alpha) / (Sigma * Sigma)) - 1.0;
+                // PertEpsTraceDivSigma = PertEpsTraceDivSigma * 0.993 + (PertEpsTrace * PertEpsTrace * (1.0 - Alpha * Alpha) / (Sigma * Sigma)) - 1.0;
 
                 // Score function update + entropy regularization
-                LogSigma = fmax(fmin(
-                    LogSigma + SigmaLR * TdE * PertEpsTraceDivSigma 
-                    , 0.0), -15.0);
+                // LogSigma = fmax(fmin(
+                //     LogSigma + SigmaLR * TdE * PertEpsTraceDivSigma 
+                //     , 0.0), -15.0);
                 
                 V = Alpha * V + Isyn + 0.0 * PertEps;
                 A *= Rho;
@@ -118,10 +118,7 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 """
 
             genn_model["reset_code"] += """
-                // RefracTime = max(dt, TauRefrac + gennrand_normal() * TauRefrac / 2.0);
                 RefracTime = TauRefrac;
-                // if ( V > (Vthresh + (Beta * A)) )
-                //     RefracTime = 10 * TauRefrac;
                 """
             genn_model["threshold_condition_code"] += " && RefracTime <= 0.0"
         else:

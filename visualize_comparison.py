@@ -25,8 +25,8 @@ import matplotlib.ticker as mticker
 INPUT_GLOB    = "outputs/*.csv"
 OUT_DIR       = "outputs/renders/comparisons"
 WINDOW_EP     = 100        # episode-window size for per-run aggregation
-BAND_ALPHA    = 0.15       # opacity of ±1 std band
-MINMAX_ALPHA  = 0.06       # opacity of best/worst-run band
+BAND_ALPHA    = 0.07       # opacity of ±1 std band
+MINMAX_ALPHA  = 0.00       # opacity of best/worst-run band
 DPI           = 200
 
 # Matches a trailing "(<number>)" right before the extension, e.g.
@@ -76,8 +76,11 @@ PATTERN_COLORS: list[tuple[str, str]] = [
     ("weight_dist_prop",   "#1F4E79"),  # darkest blue  (most specific variant)
     ("weight_prop_dist",   "#1F4E79"),  # darkest blue  (most specific variant)
     ("weight_dist_uniform","#2F5C8A"),  # dark blue
-    ("weight_dist",        "#4C72B0"),  # base blue     (family base / fallback within family)
-    ("weight_dist_no_heuristic",        "#A6B7D3"),  # base blue     (family base / fallback within family)
+    ("weight_dist_ind_noise","#367BB8"),
+    ("weight_dist_ada_belief","#5E07FF"),
+
+    ("weight_dist",        "#5E07FF"),  # base blue     (family base / fallback within family)
+    ("weight_dist_no_psi",        "#A6B7D3"),  # base blue     (family base / fallback within family)
     ("weight_dist_update_per_episode",        "#87A6DB"),  # base blue     (family base / fallback within family)
     
     ("weight_dist_no_creg_update_per_episode",        "#506588"),  # base blue     (family base / fallback within family)
@@ -150,12 +153,20 @@ def get_color_for_solution(name: str) -> str:
     return color
 
 # Subplot definitions (must match plot_training.py)  ────────────────────────────
+# The TD Error panel has been removed. Voltage and Voltage Loss have been
+# fused into a single panel: "voltage_loss" is the primary series (solid
+# line, own y-axis, as before), and "voltage" (mean) is overlaid on a
+# secondary y-axis as a dashed line via "secondary_cols" / "secondary_label"
+# so it's clear from the panel itself what the dashed line represents.
 PANELS = [
     {"title": "Episode Reward",  "cols": ["score"]},
     {"title": "Reward Rate",     "cols": ["reward_rate", "gamma_disc_reward"]},
-    {"title": "TD Error |mean|", "cols": ["avg_abs_td_error"]},
-    {"title": "Voltage",         "cols": ["voltage"]},
-    {"title": "Voltage Loss",    "cols": ["voltage_loss"]},
+    {
+        "title": "Voltage Loss  (dashed: Voltage, mean)",
+        "cols": ["voltage_loss"],
+        "secondary_cols": ["voltage"],
+        "secondary_ylabel": "Voltage",
+    },
     {"title": "Frequency (Hz)",       "cols": ["frequency"]},
 ]
 
@@ -254,6 +265,39 @@ def finish_ax(ax, title: str):
     ax.grid(axis="y", color="grey", alpha=0.2, linewidth=0.5)
 
 
+def _compute_series_xyz(dfs, col, n_runs):
+    """Shared aggregation logic (single-run window mean±std, or multi-run
+    across-run mean±std+min/max) for one column, used by both the primary
+    and secondary series in the fused Voltage Loss / Voltage panel."""
+    if n_runs == 1:
+        df  = dfs[0]
+        ep  = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
+        val = pd.to_numeric(df[col],       errors="coerce").to_numpy(dtype=np.float64)
+        if col == "frequency":
+            val = val * 1000
+        agg = window_rolling_mean_std(ep, val, WINDOW_EP)
+        if agg is None:
+            return None
+        x, mean, std = agg
+        return x, mean, std, None, None
+    else:
+        per_run_series = []
+        for df in dfs:
+            df_col = find_col(df, [col])
+            if df_col is None:
+                continue
+            ep  = pd.to_numeric(df["episode"], errors="coerce")[:19999].to_numpy(dtype=np.float64)
+            val = pd.to_numeric(df[df_col],    errors="coerce")[:19999].to_numpy(dtype=np.float64)
+            if df_col == "frequency":
+                val = val * 1000
+            per_run_series.append(per_run_window_means(ep, val, WINDOW_EP))
+        agg = aggregate_runs_by_window(per_run_series, WINDOW_EP)
+        if agg is None:
+            return None
+        x, mean, std, vmin, vmax = agg
+        return x, mean, std, vmin, vmax
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, list[str]]]):
     chart_slug = re.sub(r"[^A-Za-z0-9]+", "_", chart_key).strip("_").lower()
@@ -262,7 +306,10 @@ def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, li
     # pre-load each solution's dataframes once
     loaded = [(key, [pd.read_csv(p) for p in paths]) for key, paths in solutions]
 
-    fig, axs = plt.subplots(3, 2, figsize=(14, 10))
+    n_panels = len(PANELS)
+    n_cols = 2
+    n_rows = (n_panels + n_cols - 1) // n_cols
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows))
     base_title = "Snake 5 × 5"
     run_label  = "1 run" if n_runs == 1 else f"{n_runs} runs"
     full_title = (base_title if chart_key == MISC_CHART_KEY else f"{base_title} - {chart_key}")
@@ -284,45 +331,32 @@ def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, li
             if col is None:
                 continue
 
-            if n_runs == 1:
-                # ── Single-run branch: within-window mean ± std ──────────────
-                df  = dfs[0]
-                ep  = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
-                val = pd.to_numeric(df[col],       errors="coerce").to_numpy(dtype=np.float64)
-                if col == "frequency":
-                    val = val * 1000
-                agg = window_rolling_mean_std(ep, val, WINDOW_EP)
-                if agg is None:
-                    continue
-                x, mean, std = agg
-                panel_has_data[idx] = True
-                ax.fill_between(x, mean - std, mean + std,
-                                color=color, alpha=BAND_ALPHA, linewidth=0, zorder=2)
-                line, = ax.plot(x, mean, color=color, linewidth=2.0, zorder=3)
+            result = _compute_series_xyz(dfs, col, n_runs)
+            if result is None:
+                continue
+            x, mean, std, vmin, vmax = result
+            panel_has_data[idx] = True
 
-            else:
-                # ── Multi-run branch: across-run mean ± std + min/max band ───
-                per_run_series = []
-                for df in dfs:
-                    df_col = find_col(df, panel["cols"])
-                    if df_col is None:
-                        continue
-                    ep  = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
-                    val = pd.to_numeric(df[df_col],    errors="coerce").to_numpy(dtype=np.float64)
-                    if df_col == "frequency":
-                        val = val * 1000
-                    per_run_series.append(per_run_window_means(ep, val, WINDOW_EP))
-
-                agg = aggregate_runs_by_window(per_run_series, WINDOW_EP)
-                if agg is None:
-                    continue
-                x, mean, std, vmin, vmax = agg
-                panel_has_data[idx] = True
+            if vmin is not None:
                 ax.fill_between(x, vmin, vmax,
                                 color=color, alpha=MINMAX_ALPHA, linewidth=0, zorder=1)
-                ax.fill_between(x, mean - std, mean + std,
-                                color=color, alpha=BAND_ALPHA, linewidth=0, zorder=2)
-                line, = ax.plot(x, mean, color=color, linewidth=2.0, zorder=3)
+            ax.fill_between(x, mean - std, mean + std,
+                            color=color, alpha=BAND_ALPHA, linewidth=0, zorder=2)
+            line, = ax.plot(x, mean, color=color, linewidth=1.0, zorder=3)
+
+            # ── Secondary (dashed) series fused onto the SAME axis ────────────
+            # Just another line on ax, using the same y-scale as the primary
+            # series — no separate/twin axis, so there's no independent
+            # scaling to go wrong.
+            sec_cols = panel.get("secondary_cols")
+            if sec_cols:
+                sec_col = find_col(dfs[0], sec_cols)
+                if sec_col is not None:
+                    sec_result = _compute_series_xyz(dfs, sec_col, n_runs)
+                    if sec_result is not None:
+                        sx, smean, sstd, _, _ = sec_result
+                        ax.plot(sx, smean, color=color, linewidth=1.0,
+                                linestyle="--", alpha=0.8, zorder=3)
 
             if idx == 0:
                 legend_handles.append(line)
@@ -332,8 +366,22 @@ def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, li
     for idx, panel in enumerate(PANELS):
         if panel_has_data[idx]:
             finish_ax(axs[idx], panel["title"])
+            # Small note clarifying the dashed line, since the convention
+            # (solid = voltage loss, dashed = voltage mean) isn't otherwise
+            # obvious from the plot alone.
+            if panel.get("secondary_cols"):
+                axs[idx].text(
+                    0.02, 0.02,
+                    "Solid = Voltage Loss  |  Dashed = Voltage (mean)",
+                    transform=axs[idx].transAxes,
+                    ha="left", va="bottom",
+                    fontsize=6, color="grey", style="italic",
+                )
         else:
             axs[idx].set_visible(False)
+
+    for idx in range(len(PANELS), len(axs)):
+        axs[idx].set_visible(False)
 
     fig.legend(legend_handles, legend_labels, loc="lower center",
                bbox_to_anchor=(0.5, -0.02), ncol=min(len(legend_labels), 4),

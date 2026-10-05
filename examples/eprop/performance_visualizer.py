@@ -110,7 +110,7 @@ def _plot_loop(metrics_q: Queue, stop_event: mp.Event,
 
     # value / reward-trace chart
     value_line,  = ax_value.plot([], [], label="value")
-    rt_line,     = ax_value.plot([], [], label="reward trace (centred)")
+    rt_line,     = ax_value.plot([], [], label="reward trace")
     ax_value.legend(fontsize=8)
     ax_value.set_title("Value & reward trace (best run)")
 
@@ -178,7 +178,7 @@ def _plot_loop(metrics_q: Queue, stop_event: mp.Event,
                 if len(reward_trace) > 0:
                     rt_arr = np.asarray(reward_trace)
                     xrt = np.arange(len(rt_arr))
-                    rt_line.set_data(xrt, rt_arr + np.mean(values))
+                    rt_line.set_data(xrt, rt_arr)
                 ax_value.relim()
                 ax_value.autoscale_view()
 
@@ -256,7 +256,7 @@ def _sequence_loop(best_q: Queue, aux_q: Queue, stop_event: mp.Event):
             break
 
         t += 1
-        time.sleep(1.0)
+        time.sleep(0.1)
 
     cv2.destroyAllWindows()
 

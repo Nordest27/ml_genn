@@ -22,8 +22,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 
 # ── Config ────────────────────────────────────────────────────────────────────
-INPUT_GLOB = "outputs/*.csv"
-OUT_DIR    = "outputs/renders"
+INPUT_GLOB = "outputs_ttt/*.csv"
+OUT_DIR    = "outputs_ttt/renders"
 WINDOW_EP  = 50   # episode-window size for rolling mean / std smoothing
 BAND_ALPHA = 0.25  # opacity of ±1 std shaded region
 DPI        = 200
