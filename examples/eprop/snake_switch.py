@@ -1,0 +1,206 @@
+"""Snake with performance-triggered task switches, and a monitor of frozen ("dead") hidden neurons.
+
+SwitchingEnv wraps SnakeEnv. Whenever the agent's reward per environment step over the last `window` moves
+reaches `criterion`, the task is mangled: the input channels are permuted, the actions are remapped and/or
+the view is flipped. Every mangle is a bijection, so each new task is exactly as learnable as the first one,
+but the learned input/output mapping is wrong after it. A rule that keeps its plasticity relearns quickly and
+reaches more switches within a fixed budget; the number of switches is the score. The sequence of mangles is
+fixed by `seed`, so every rule sees the same sequence.
+
+NeuronMonitor samples the hidden ALIF populations once per environment step and, every `report_every`
+moves, writes per population: the fraction of plasticity-dead neurons (mean pseudo-derivative psi below
+`psi_eps`, so their synapses cannot change), split into silent and still-firing ones, the mean psi, and the
+fraction of the previous report's dead neurons that recovered.
+"""
+import csv
+import os
+from collections import deque
+
+import numpy as np
+
+MANGLES = ("channels", "actions", "flip")
+
+
+class SwitchingEnv:
+    def __init__(self, env, criterion=0.08, window=20000, mangles=("channels", "actions"), seed=0,
+                 log_path=None, wait_inc=30):
+        unknown = set(mangles) - set(MANGLES)
+        if unknown:
+            raise ValueError(f"unknown mangles {sorted(unknown)}; available: {MANGLES}")
+        self.env, self.criterion, self.window, self.mangles = env, criterion, int(window), tuple(mangles)
+        self.rng = np.random.default_rng(seed)
+        self.n_channels = env.inp_shape[2]
+        self.n_actions = 4
+        self.chan = np.arange(self.n_channels)
+        self.act = np.arange(self.n_actions)
+        self.flip = (False, False)
+        self.switches = 0
+        self.moves = 0                     # environment moves (excluding the waiting steps)
+        self.moves_at_switch = 0
+        self.recent = deque(maxlen=self.window)
+        self.recent_sum = 0.0
+        self.log_path, self.wait_inc = log_path, wait_inc
+        if log_path:
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+            with open(log_path, "w", newline="") as f:
+                csv.writer(f).writerow(["switch", "moves", "moves_since_last", "channels", "actions", "flip"])
+
+    # ---- delegation: the training loop reads env.wait_count, env.dir_idx, env.img(...), ...
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def __setattr__(self, name, value):
+        if name in ("wait_count",):
+            setattr(self.env, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def _mangle(self, obs):
+        obs = obs[:, :, self.chan]
+        if self.flip[0]:
+            obs = obs[::-1]
+        if self.flip[1]:
+            obs = obs[:, ::-1]
+        return np.ascontiguousarray(obs)
+
+    def reset(self):
+        return self._mangle(self.env.reset())
+
+    def step(self, action):
+        moving = self.env.wait_count == 0
+        obs, reward, done = self.env.step(int(self.act[action]))
+        if moving or done:
+            self.moves += 1
+            if len(self.recent) == self.window:
+                self.recent_sum -= self.recent[0]
+            self.recent.append(reward)
+            self.recent_sum += reward
+            if self.ready():
+                self._switch()
+        return self._mangle(obs), reward, done
+
+    def env_probs(self, probs):
+        """Policy probabilities in the environment's action order (index = real direction), for plots."""
+        out = np.zeros_like(np.asarray(probs, dtype=float))
+        out[self.act] = probs
+        return out
+
+    def agent_view(self):
+        """The observation the network receives now (mangled), as a uint8 image."""
+        return (np.clip(self._mangle(self.env.get_local_img_observation()), 0, 1) * 255).astype(np.uint8)
+
+    def img(self, scale=10):
+        """Frame for the viewers: the real board, what the agent sees, and the current task in a header."""
+        import cv2
+        board = self.env.img(scale=scale)
+        h = board.shape[0]
+        view = cv2.resize(self.agent_view(), (h, h), interpolation=cv2.INTER_NEAREST)
+        sep = np.full((h, 4, 3), 255, np.uint8)
+        frame = np.concatenate([board, sep, view], axis=1)
+        header = np.zeros((34, frame.shape[1], 3), np.uint8)
+        flip = "".join(("V" if self.flip[0] else "") + ("H" if self.flip[1] else "")) or "-"
+        cv2.putText(header, f"task {self.switches}   board | agent sees", (4, 13), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(header, f"ch {''.join(map(str, self.chan))} act {''.join(map(str, self.act))} flip {flip}",
+                    (4, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 255), 1, cv2.LINE_AA)
+        return np.concatenate([header, frame], axis=0)
+
+    def rate(self):
+        """Reward per environment move over the window (moves since the last switch only)."""
+        return self.recent_sum / max(len(self.recent), 1)
+
+    def ready(self):
+        return len(self.recent) == self.window and self.rate() >= self.criterion
+
+    def _new_perm(self, current):
+        while True:
+            p = self.rng.permutation(len(current))
+            if not np.array_equal(p, current):
+                return p
+
+    def _switch(self):
+        if "channels" in self.mangles:
+            self.chan = self._new_perm(self.chan)
+        if "actions" in self.mangles:
+            self.act = self._new_perm(self.act)
+        if "flip" in self.mangles:
+            options = [f for f in ((False, True), (True, False), (True, True), (False, False)) if f != self.flip]
+            self.flip = options[self.rng.integers(len(options))]
+        self.switches += 1
+        since = self.moves - self.moves_at_switch
+        self.moves_at_switch = self.moves
+        self.recent.clear()
+        self.recent_sum = 0.0
+        print(f"[switch {self.switches}] after {since} moves: channels {self.chan.tolist()}, "
+              f"actions {self.act.tolist()}, flip {self.flip}", flush=True)
+        if self.log_path:
+            with open(self.log_path, "a", newline="") as f:
+                csv.writer(f).writerow([self.switches, self.moves, since, " ".join(map(str, self.chan)),
+                                        " ".join(map(str, self.act)), "".join("1" if x else "0" for x in self.flip)])
+
+
+def pseudo_derivative(v, a, beta, v_thresh, refrac):
+    """psi of the ALIF e-prop rule (zero during the refractory period)."""
+    psi = (1.0 / v_thresh) * 0.3 * np.maximum(0.0, 1.0 - np.abs((v - (v_thresh + beta * a)) / v_thresh))
+    return np.where(refrac > 0, 0.0, psi)
+
+
+class NeuronMonitor:
+    def __init__(self, compiled_net, populations, labels, log_path, report_every=10000, psi_eps=0.01,
+                 silent_hz=0.5, dt_ms=1.0):
+        """populations: hidden ALIF ml_genn Populations; labels: their names in the log."""
+        self.net, self.pops, self.labels = compiled_net, list(populations), list(labels)
+        self.report_every, self.psi_eps, self.silent_hz, self.dt_ms = int(report_every), psi_eps, silent_hz, dt_ms
+        self.log_path = log_path
+        self.psi_sum = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
+        self.spikes = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
+        self.prev_spike_count = [None] * len(self.pops)
+        self.samples, self.moves = 0, 0
+        self.prev_dead = [None] * len(self.pops)
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        cols = ["timestep", "moves", "switch"]
+        for l in self.labels:
+            cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
+                     f"{l}_recovered"]
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(cols)
+
+    def _vars(self, pop, names):
+        npop = self.net.neuron_populations[pop]
+        out = []
+        for n in names:
+            npop.vars[n].pull_from_device()
+            out.append(np.asarray(npop.vars[n].view).ravel().astype(np.float64))
+        return out
+
+    def sample(self, timestep, switch=0):
+        """Call once per environment move."""
+        for i, p in enumerate(self.pops):
+            v, a, refrac = self._vars(p, ("V", "A", "RefracTime"))
+            self.psi_sum[i] += pseudo_derivative(v, a, p.neuron.beta, p.neuron.v_thresh, refrac)
+            # a neuron fired since the last sample if it is (or was recently) refractory
+            self.spikes[i] += refrac > 0
+        self.samples += 1
+        self.moves += 1
+        if self.moves % self.report_every == 0:
+            self.report(timestep, switch)
+
+    def report(self, timestep, switch):
+        row = [int(timestep), self.moves, switch]
+        for i, p in enumerate(self.pops):
+            psi = self.psi_sum[i] / max(self.samples, 1)
+            active = self.spikes[i] / max(self.samples, 1)        # fraction of samples in refractory
+            refrac_ms = float(np.mean(np.atleast_1d(p.neuron.tau_refrac or 1.0)))
+            hz = 1000.0 * active / max(refrac_ms, self.dt_ms)       # refractory fraction / refractory time
+            dead = psi < self.psi_eps
+            silent = dead & (hz < self.silent_hz)
+            rec = (float(np.mean(~dead[self.prev_dead[i]])) if self.prev_dead[i] is not None
+                   and self.prev_dead[i].any() else float("nan"))
+            row += [dead.mean(), silent.mean(), (dead & ~silent).mean(), psi.mean(), hz.mean(), rec]
+            self.prev_dead[i] = dead
+            self.psi_sum[i][:] = 0
+            self.spikes[i][:] = 0
+        self.samples = 0
+        with open(self.log_path, "a", newline="") as f:
+            csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])
+        return row

@@ -31,6 +31,7 @@ from collections import defaultdict
 
 from async_trace_logger import AsyncTraceLogger
 import snake_hparams
+import snake_switch
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
@@ -462,7 +463,7 @@ def expected_toroidal_connections(
 
 CONNECTIVITY_TYPE = "toroidal"
 WINDOW_EPISODES = 100
-BOARD_SIZE = 5
+BOARD_SIZE = HP["board_size"]
 
 VISIBLE_RANGE = 5
 SCALE = 4
@@ -1276,6 +1277,7 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     best_reward_traces = []
     best_value_function_values = []
     best_probs = None
+    last_switch = 0                    # snake_switch: dashed line at every task switch
 
     last_plot_time = 0.0
     plot_interval = 0.2  # seconds
@@ -1291,6 +1293,10 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
                 rewards.append(metrics.get('reward', 0.0))
                 avgs.append(metrics.get('running_avg', 0.0))
                 lens.append(metrics.get('snake_len', 0))
+                if metrics.get('switch', 0) > last_switch:
+                    last_switch = metrics['switch']
+                    ax1.axvline(ep, color='k', ls='--', lw=0.8, alpha=0.6)
+                    ax1.set_title(f'Training Progress (task {last_switch})')
             if 'best_values' in metrics:
                 best_values = metrics['best_values']
                 best_reward_traces = metrics['best_reward_traces']
@@ -1341,6 +1347,17 @@ def viz_plots_loop(metrics_q: Queue, stop_event: mp.Event):
     plt.close(fig)
 
 # --- Visualization process: show best + random runs using OpenCV ---
+_window_shapes = {}
+
+
+def _fit_window(window, frame):
+    """Keep the window 600 px high with the frame's aspect ratio (snake_switch frames are wider)."""
+    shape = frame.shape[:2]
+    if _window_shapes.get(window) != shape:
+        _window_shapes[window] = shape
+        cv2.resizeWindow(window, int(600 * shape[1] / shape[0]), 600)
+
+
 def viz_runs_loop(
         best_run_q: Queue, 
         random_run_q: Queue, 
@@ -1389,6 +1406,7 @@ def viz_runs_loop(
             frame = decode_frame(f_blob) if decompress else f_blob
             if frame is None:
                 continue
+            _fit_window(window_best, frame)
             cv2.imshow(window_best, frame)
             key = cv2.waitKey(1)  # adjust speed here
             if key == 27:  # Esc to exit
@@ -1403,6 +1421,7 @@ def viz_runs_loop(
             frame = decode_frame(f_blob) if decompress else f_blob
             if frame is None:
                 continue
+            _fit_window(window_random, frame)
             cv2.imshow(window_random, frame)
             key = cv2.waitKey(1)
             if key == 27:
@@ -1573,7 +1592,19 @@ def train_snake_agent_with_ipc(episodes=10000,
     opt_updt = 0
     with compiled_net:
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
+        if HP["switch"]:
+            env = snake_switch.SwitchingEnv(env, **HP["switch"], wait_inc=WAIT_INC,
+                                            log_path=f"outputs/{CSV_PREFIX}({REPETITION})_switches.csv")
+        monitor = None
+        if HP["monitor"]:
+            alif = [p for p in compiled_net.neuron_populations
+                    if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
+            labels = ["E", "I", "policy_field", "value_field"] if len(alif) == 4 else [p.name for p in alif]
+            monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
+                                                 f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
+                                                 report_every=HP["monitor_every"])
         best_reward = -np.inf
+        shown_task = 0                     # snake_switch: task whose best run the viewers show
         best_run = []
         running_avg = []
         snake_len_history = []
@@ -1764,7 +1795,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                         #     compiled_net.neuron_populations[policy], "actionTaken", 1.0
                         # )
                         
-                    current_probs.append(probs)
+                    current_probs.append(env.env_probs(probs) if isinstance(env, snake_switch.SwitchingEnv)
+                                         else probs)
 
                 obs, reward, done = env.step(action_label)
                 total_reward += reward
@@ -1799,6 +1831,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                 # compiled_net.set_input({input_pop: [spikes]})
 
                 compiled_net.step_time(train_callback_list)
+
+                if monitor is not None and env.wait_count == env.wait_inc:
+                    monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
 
                 if env.wait_count == env.wait_inc:
                     for conn_pop in list(compiled_net.connection_populations.values())[::-1]:
@@ -1918,7 +1953,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                     else:
                         logits = compiled_net.get_readout(policy).flatten()
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
-                    current_probs.append(probs)
+                    current_probs.append(env.env_probs(probs) if isinstance(env, snake_switch.SwitchingEnv)
+                                         else probs)
                 current_values.append(compiled_net.get_readout(value)[0].mean())
                 current_reward_traces.append(reward_trace)      
 
@@ -1946,6 +1982,12 @@ def train_snake_agent_with_ipc(episodes=10000,
 
             # compiled_net.genn_model.custom_update("DalePrune")
             # compiled_net.genn_model.custom_update("DaleRewire")
+
+            # snake_switch: after a task switch the best run (and its value / probability plots) starts over,
+            # so the viewers show the new task; the episode that contains the switch is shown first
+            if getattr(env, "switches", 0) != shown_task:
+                shown_task = env.switches
+                best_reward = -np.inf
 
             # Update if new best run (send best run to viz process)
             if total_reward >= best_reward and len(current_probs) > 0:
@@ -2023,7 +2065,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                     'ep': ep,
                     'reward': total_reward,
                     'running_avg': avg,
-                    'snake_len': len(env.snake)-1
+                    'snake_len': len(env.snake)-1,
+                    'switch': getattr(env, "switches", 0),
                 }
                 if last_best_values:
                     metrics['best_values'] = last_best_values

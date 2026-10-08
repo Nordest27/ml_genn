@@ -25,6 +25,21 @@ import random
 import time
 import multiprocessing as mp
 import csv
+import snake_hparams
+
+# Hyperparameters: TTT_CONFIG=config.json overrides these (same keys as snake_hparams where they overlap).
+TTT_DEFAULTS = {
+    "hidden_rule": None,         # None: monolithic compiler; else a preset or dict (ml_genn.compilers.eprop)
+    "feedback_type": "random",
+    "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
+    "optimiser": "adam",         # "adam" (beta 0.9/0.999) | "adabelief" (beta 0.99/0.99999)
+    "lr": 1e-5,
+    "c_reg": 1e-2,
+    "f_target": 10.0,
+    "seed": None,
+    "csv_output": "outputs_ttt/weight_dist(1).csv",
+}
+HP = snake_hparams.load(TTT_DEFAULTS, "TTT_CONFIG")
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -114,7 +129,7 @@ print("CHEKPOINT_NAME", CHECKPOINT_NAME)
 serialiser = Numpy("ttt_checkpoints")
 
 # ─── CSV output ──────────────────────────────────────────────────
-CSV_OUTPUT = "outputs_ttt/weight_dist(1).csv"
+CSV_OUTPUT = HP["csv_output"]
 def init_csv(path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if os.path.exists(path):
@@ -438,22 +453,34 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
                        feedback_name="tde_transport")
 
     # ── Compiler ─────────────────────────────────────────────────
-    compiler = EPropCompiler(
+    if HP["hidden_rule"] is None:
+        compiler_cls, rule_kwargs = EPropCompiler, {}
+    else:
+        from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
+        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"],
+                                                           "optimise_feedback": HP["optimise_feedback"]}
+    if HP["optimiser"] == "adam":
+        optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999, l2_init_strength=1e-5)
+    else:
+        optimiser = AdaBelief(HP["lr"], beta1=0.99, beta2=0.99999, l2_init_strength=1e-5)
+    compiler = compiler_cls(
+        **rule_kwargs,
+        rng_seed=0 if HP["seed"] is None else HP["seed"] + 1,   # GeNN: 0 = random seed
         example_timesteps=1,
         losses={
             policy: "mean_square_error",
             value:  "mean_square_error",
         },
         # optimiser=AdaBelief(1e-5, task_steps=1, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5),
-        optimiser=Adam(1e-5, beta1=0.9, beta2=0.999, l2_init_strength=1e-5),
+        optimiser=optimiser,
         # optimiser=Adam(5e-5, beta1=0.9, beta2=0.999),
-        c_reg=1e-2,
+        c_reg=HP["c_reg"],
         # c_reg=1e-4,
-        f_target=10,
+        f_target=HP["f_target"],
         # f_target=100,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
-        feedback_type="random",
+        feedback_type=HP["feedback_type"],
         reward_decay=reward_decay,
         gamma=gamma,
         td_lambda=td_lambda,

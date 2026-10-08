@@ -1,0 +1,133 @@
+"""snake_switch without GeNN: python -m pytest -q tests"""
+import csv, sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import snake_switch as S  # noqa: E402
+
+
+class FakeSnake:
+    """Moves every `wait_inc` steps; a move earns `good` reward if the env-level action equals `target`."""
+    inp_shape = (4, 4, 3)
+
+    def __init__(self, wait_inc=2, target=1):
+        self.wait_inc, self.target, self.wait_count, self.received = wait_inc, target, 0, []
+        self.img_calls = 0
+
+    def reset(self):
+        self.wait_count = self.wait_inc
+        o = np.zeros(self.inp_shape); o[0, 0, 0] = 1.0; o[3, 2, 1] = 0.5
+        return o
+
+    def step(self, action):
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self.reset_obs(), 0.0, False
+        self.received.append(action)
+        self.wait_count = self.wait_inc
+        return self.reset_obs(), (1.0 if action == self.target else -1.0), False
+
+    def reset_obs(self):
+        o = np.zeros(self.inp_shape); o[0, 0, 0] = 1.0; o[3, 2, 1] = 0.5
+        return o
+
+    def img(self, scale=1):
+        self.img_calls += 1
+        return np.full((4 * scale, 4 * scale, 3), 100, np.uint8)
+
+    def get_local_img_observation(self):
+        return self.reset_obs()
+
+
+def drive(env, policy, steps):
+    obs = env.reset()
+    for _ in range(steps):
+        obs, r, d = env.step(policy(obs))
+    return obs
+
+
+def test_switch_triggers_on_criterion_and_remaps_actions(tmp_path):
+    base = FakeSnake()
+    env = S.SwitchingEnv(base, criterion=0.9, window=20, mangles=("actions",), seed=0, log_path=str(tmp_path / "s.csv"))
+    drive(env, lambda o: 1, 3 * 25)                  # agent index 1 == env action 1 -> perfect until a switch
+    assert env.switches == 1                         # after the switch, index 1 maps elsewhere: rate collapses
+    assert int(env.act[1]) != 1
+    assert base.received[-1] == int(env.act[1])
+    rows = list(csv.reader(open(tmp_path / "s.csv")))
+    assert rows[1][0] == "1" and int(rows[1][2]) == 20
+
+
+def test_no_switch_below_criterion_or_before_window_fills():
+    env = S.SwitchingEnv(FakeSnake(), criterion=0.9, window=50, mangles=("channels",), seed=0)
+    drive(env, lambda o: 0, 3 * 200)                 # always wrong: rate -1
+    assert env.switches == 0
+    env = S.SwitchingEnv(FakeSnake(), criterion=0.9, window=50, mangles=("channels",), seed=0)
+    drive(env, lambda o: 1, 3 * 49)                  # perfect but window not full
+    assert env.switches == 0
+
+
+def test_channel_permutation_and_flip_are_bijections():
+    env = S.SwitchingEnv(FakeSnake(), criterion=-2, window=1, mangles=("channels", "flip"), seed=3)
+    o0 = FakeSnake().reset_obs()
+    for _ in range(5):
+        env._switch()
+        o = env._mangle(o0)
+        assert sorted(o.ravel()) == sorted(o0.ravel())
+        assert o[..., list(env.chan).index(0)].sum() == 1.0      # channel 0 moved to its new place
+
+
+def test_same_seed_same_sequence_and_delegation():
+    a = S.SwitchingEnv(FakeSnake(), mangles=("channels", "actions"), seed=7)
+    b = S.SwitchingEnv(FakeSnake(), mangles=("channels", "actions"), seed=7)
+    for _ in range(4):
+        a._switch(); b._switch()
+        assert np.array_equal(a.chan, b.chan) and np.array_equal(a.act, b.act)
+    a.wait_count = 5
+    assert a.env.wait_count == 5 and a.img(scale=2).shape == (34 + 8, 8 + 4 + 8, 3)
+    with pytest.raises(ValueError):
+        S.SwitchingEnv(FakeSnake(), mangles=("rotate",))
+
+
+def test_monitor_classifies_dead_neurons(tmp_path):
+    vth = 0.61
+    # neuron 0: near threshold (plastic); 1: silent far below; 2: far above and firing (refractory half the time)
+    v = np.array([vth, 0.0, 5.0]); refrac_seq = [np.array([0, 0, 2.0]), np.array([0, 0, 0.0])]
+    class Pop:
+        shape, name = (3,), "h"
+        neuron = SimpleNamespace(beta=0.0, v_thresh=vth, tau_refrac=3.0)
+    pop = Pop()
+    state = {"i": 0}
+
+    class Var:
+        def __init__(self, f): self.f = f
+        def pull_from_device(self): pass
+        @property
+        def view(self): return self.f()
+    vars_ = {"V": Var(lambda: v), "A": Var(lambda: np.zeros(3)), "RefracTime": Var(lambda: refrac_seq[state["i"] % 2])}
+    net = SimpleNamespace(neuron_populations={pop: SimpleNamespace(vars=vars_)})
+    m = S.NeuronMonitor(net, [pop], ["h"], str(tmp_path / "n.csv"), report_every=10)
+    for k in range(10):
+        state["i"] = k
+        m.sample(k, 0)
+    rows = list(csv.DictReader(open(tmp_path / "n.csv")))
+    assert float(rows[0]["h_dead"]) == pytest.approx(2 / 3, abs=1e-3)
+    assert float(rows[0]["h_dead_silent"]) == pytest.approx(1 / 3, abs=1e-3)
+    assert float(rows[0]["h_dead_firing"]) == pytest.approx(1 / 3, abs=1e-3)
+
+
+def test_frame_shows_agent_view_and_probs_use_real_directions():
+    env = S.SwitchingEnv(FakeSnake(), mangles=("channels", "actions"), seed=1)
+    env._switch()
+    frame = env.img(scale=10)                                   # header 34 px, board 40 px, sep 4, view 40
+    view = frame[34:, 44:]
+    expected = np.kron(env.agent_view(), np.ones((10, 10, 1), np.uint8))
+    assert np.array_equal(view, expected)
+    assert env.agent_view()[0, 0, list(env.chan).index(0)] == 255  # the mangled view, not the raw one
+    probs = np.array([0.1, 0.2, 0.3, 0.4])
+    real = env.env_probs(probs)
+    for k in range(4):
+        assert real[env.act[k]] == probs[k]                      # index k moves in direction act[k]

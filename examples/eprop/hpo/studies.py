@@ -75,3 +75,39 @@ STUDIES = {
     "unbiased": {"inherit": "proposed", "base": {"hidden_rule": {"preset": "unbiased"}},
                  "space": {"lr": LR}, **ONE_D},
 }
+
+
+# ---- combined rules: e-prop's feedback learning signal plus perturbation terms ----------------------------
+# Inherit the noise level (and homeostat) from the perturbation study and the learning rate, c_reg, optimiser and
+# feedback learning from adaptive e-prop; search the learning rate and the weight of the e-prop term relative to
+# the perturbation terms (hidden_rule.eprop; the perturbation coefficients stay 1).
+MIX = ("log", 0.1, 10.0)
+for _combo, _parents in (("eprop_plus_proposed", ["proposed", "adaptive_eprop"]),
+                         ("eprop_plus_gradient", ["proposed", "adaptive_eprop"]),
+                         ("eprop_plus_drift", ["proposed", "adaptive_eprop"]),
+                         ("eprop_plus_proposed_homeostat", ["proposed_homeostat", "adaptive_eprop"]),
+                         ("eprop_plus_homeostat", ["proposed_homeostat", "adaptive_eprop"])):
+    STUDIES[_combo] = {"inherit": _parents, "base": {"hidden_rule": {"preset": _combo}},
+                       "space": {"lr": LR, "hidden_rule.eprop": MIX}, "n": 12}
+
+# ---- harder Snake: longer horizon (gamma) and a larger board ------------------------------------------------
+# Each tuned rule run on a grid, every value with 2 seeds for 9M timesteps (screen; rerun winners at full length).
+# gamma is per environment step (0.5 = a horizon of about 2 moves). The PPO baseline (ppo_snake_baseline) uses 0.99:
+# run it at the same gamma values for the ceiling of each objective.
+HARDER = {"grid": True, "rungs": [9e6], "seeds": [2], "keep": 1.0}
+for _name in ("proposed", "adaptive_eprop", "eprop_plus_proposed"):
+    STUDIES[f"gamma_{_name}"] = {"inherit": _name, "space": {"gamma_env": ("choice", [0.5, 0.8, 0.9, 0.95])},
+                                 **HARDER}
+    STUDIES[f"board7_{_name}"] = {"inherit": _name, "base": {"board_size": 7},
+                                  "space": {"gamma_env": ("choice", [0.5, 0.9])}, **HARDER}
+
+# ---- snake_switch: rules compared on performance-triggered task switches (score = switches reached) --------
+# Each study inherits a tuned rule and runs it 5 times at full length (no search). Set the criterion from your
+# reward-rate curves: reachable by the good rules in a few million timesteps, not trivially.
+SWITCH = {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"], "seed": 0}
+SWITCH_RUN = {"n": 1, "rungs": [30e6], "seeds": [5], "keep": 1.0}
+for _name in ("proposed", "proposed_homeostat", "gradient_only", "gradient_only_homeostat", "adaptive_eprop",
+              "eprop_plus_proposed", "eprop_plus_gradient", "eprop_plus_drift", "eprop_plus_proposed_homeostat",
+              "eprop_plus_homeostat"):
+    STUDIES[f"switch_{_name}"] = {"inherit": _name, "base": {"switch": SWITCH, "monitor": True},
+                                  "space": {}, **SWITCH_RUN}

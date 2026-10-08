@@ -78,21 +78,28 @@ def get_path(cfg, key):
 def study(name):
     if name not in STUDIES:
         raise SystemExit(f"unknown study '{name}'; available: {', '.join(STUDIES)}")
-    return {**DEFAULT_SCHEDULE, **STUDIES[name]}
+    s = {**DEFAULT_SCHEDULE, **STUDIES[name]}
+    if s.get("grid"):                                  # every combination of the listed values, no base point
+        s["n"] = math.prod(len(v[1]) for v in s["space"].values())
+    return s
 
 
 def base_config(name, root):
     """The study's starting point: the inherited study's best config, then the study's own base."""
     s = study(name)
     cfg = {}
-    if s.get("inherit"):
-        best = root / s["inherit"] / "best.json"
+    parents = s.get("inherit") or []
+    for parent in [parents] if isinstance(parents, str) else parents:     # later parents override earlier ones
+        best = root / parent / "best.json"
         if not best.exists():
-            raise SystemExit(f"study '{name}' inherits from '{s['inherit']}', which has no best.json yet: run it first")
-        cfg = json.loads(best.read_text())
-        cfg.pop("_meta", None)
-        if isinstance(cfg.get("hidden_rule"), dict) and isinstance(s.get("base", {}).get("hidden_rule"), dict):
-            cfg["hidden_rule"].pop("preset", None)          # the study's own preset wins
+            raise SystemExit(f"study '{name}' inherits from '{parent}', which has no best.json yet: run it first")
+        p = json.loads(best.read_text())
+        p.pop("_meta", None)
+        if isinstance(p.get("hidden_rule"), str):
+            p["hidden_rule"] = {"preset": p["hidden_rule"]}
+        cfg = deep_merge(cfg, p)
+    if isinstance(cfg.get("hidden_rule"), dict) and isinstance(s.get("base", {}).get("hidden_rule"), dict):
+        cfg["hidden_rule"].pop("preset", None)              # the study's own preset wins
     return deep_merge(cfg, s.get("base", {}))
 
 
@@ -125,6 +132,15 @@ def sample(space, n, seed):
             p[k] = float(f"{v:.4g}") if isinstance(v, float) else v
         points.append(p)
     return points
+
+
+def grid_points(space):
+    import itertools
+    keys = list(space)
+    for k in keys:
+        if space[k][0] != "choice":
+            raise ValueError(f"grid studies take ('choice', [values]) only; {k} is {space[k][0]}")
+    return [dict(zip(keys, combo)) for combo in itertools.product(*(space[k][1] for k in keys))]
 
 
 def run_config(base, point, seed, budget, prefix):
@@ -225,6 +241,12 @@ class Job:
             # the simulation's timesteps, so the window is placed on the CSV's own timeline
             score = window_rate(data[0], data[1], timesteps, frac)
             score = score if np.isfinite(score) else float("-inf")
+            if self.cfg.get("switch"):
+                # snake_switch: the score is the number of task switches reached; the reward rate at the end
+                # (|rate| < 1) only breaks ties
+                sw = self.csv.with_name(self.csv.stem + "_switches.csv")
+                n = max(sum(1 for _ in open(sw)) - 1, 0) if sw.exists() else 0
+                score = n + 1e-3 * (score if np.isfinite(score) else -1.0)
         hz = float(data[2][-1]) if data is not None and len(data[2]) else float("nan")
         return {**self.meta, "key": self.key, "score": score, "status": self.status, "timesteps": timesteps,
                 "final_hz": hz, "wall_s": round(time.time() - self.t0, 1)}
@@ -344,7 +366,7 @@ def run_study(name, root, jobs, retry_failed=False):
     sdir = root / name
     sdir.mkdir(parents=True, exist_ok=True)
     base = base_config(name, root)
-    points = sample(s["space"], s["n"], s.get("sobol_seed", 0))
+    points = grid_points(s["space"]) if s.get("grid") else sample(s["space"], s["n"], s.get("sobol_seed", 0))
     (sdir / "points.json").write_text(json.dumps({"base": base, "points": points}, indent=1))
     res_path = sdir / "results.jsonl"
     alive = list(range(len(points)))
@@ -508,12 +530,12 @@ def main(argv=None):
         tp = a.throughput or (json.loads(cal.read_text())["timesteps_per_s_per_run"] if cal.exists() else None)
         jobs = a.jobs or (json.loads(cal.read_text())["jobs"] if cal.exists() else 1)
         total = 0
-        print(f"  {'study':26s} {'configs per rung':>18s} {'runs':>12s} {'timesteps':>10s}" + ("  hours" if tp else ""))
+        print(f"  {'study':34s} {'configs per rung':>18s} {'runs':>12s} {'timesteps':>10s}" + ("  hours" if tp else ""))
         for name in a.studies or STUDIES:
             configs, runs, ts = plan_study(name)
             total += ts
             h = f"  {ts / tp / jobs / 3600:5.1f}" if tp else ""
-            print(f"  {name:26s} {'/'.join(map(str, configs)):>18s} {'/'.join(map(str, runs)):>12s} {ts / 1e6:9.0f}M{h}")
+            print(f"  {name:34s} {'/'.join(map(str, configs)):>18s} {'/'.join(map(str, runs)):>12s} {ts / 1e6:9.0f}M{h}")
         h = f", {total / tp / jobs / 3600:.1f} h with {jobs} job(s) at {tp:.0f} timesteps/s each" if tp else \
             " (run `calibrate` or pass --throughput for hours)"
         print(f"  total {total / 1e6:.0f}M timesteps = {total / 30e6:.1f} full-length runs{h}")

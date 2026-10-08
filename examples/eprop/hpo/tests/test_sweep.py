@@ -109,3 +109,38 @@ def test_runs_are_stopped_when_the_sweep_exits(env, monkeypatch):
     sweep._stop_all()
     time.sleep(0.2)
     assert j.proc.poll() is not None
+
+
+def test_switch_runs_are_scored_by_switches(env):
+    sweep.STUDIES["sw"] = {**SMALL, "n": 2, "rungs": [2e5], "seeds": [1], "keep": 1.0,
+                           "base": {"hidden_rule": {"preset": "proposed"}, "switch": {"criterion": 0.1}},
+                           "space": {"lr": ("choice", [3e-5])}}
+    sweep.run_study("sw", env, jobs=1)
+    r = {x["config"]: x["score"] for x in sweep.load_results(env / "sw" / "results.jsonl").values()}
+    assert 2.99 < r[0] < 3.01 and 0.99 < r[1] < 1.01          # base lr 1e-5 -> 3 switches; lr 3e-5 -> 1
+    assert json.loads((env / "sw" / "best.json").read_text())["_meta"]["config"] == 0
+
+
+def test_inherit_from_several_studies_in_order(env):
+    for name, cfg in (("pa", {"lr": 1e-5, "hidden_rule": {"preset": "proposed", "log_syn_sigma": 0.4}}),
+                      ("pb", {"lr": 7e-6, "optimise_feedback": True, "hidden_rule": {"preset": "eprop"}})):
+        (env / name).mkdir(); (env / name / "best.json").write_text(json.dumps(cfg))
+    sweep.STUDIES["combo"] = {**SMALL, "inherit": ["pa", "pb"], "base": {"hidden_rule": {"preset": "eprop_plus_proposed"}},
+                              "space": {}}
+    base = sweep.base_config("combo", env)
+    assert base["lr"] == 7e-6 and base["optimise_feedback"] is True                 # later parent wins
+    assert base["hidden_rule"] == {"preset": "eprop_plus_proposed", "log_syn_sigma": 0.4}
+    from ml_genn.compilers.eprop import get_hidden_rule
+    r = get_hidden_rule(base["hidden_rule"])
+    assert r.eprop == 1.0 and r.drift == 1.0 and r.gradient == 1.0 and r.log_syn_sigma == 0.4
+
+
+def test_grid_studies_run_every_combination(env):
+    sweep.STUDIES["g"] = {**SMALL, "grid": True, "rungs": [2e5], "seeds": [1], "keep": 1.0,
+                          "base": {"hidden_rule": {"preset": "proposed"}},
+                          "space": {"gamma_env": ("choice", [0.5, 0.9]), "lr": ("choice", [1e-5, 2e-5])}}
+    assert sweep.study("g")["n"] == 4
+    sweep.run_study("g", env, jobs=2)
+    pts = json.loads((env / "g" / "points.json").read_text())["points"]
+    assert sorted((p["gamma_env"], p["lr"]) for p in pts) == [(0.5, 1e-5), (0.5, 2e-5), (0.9, 1e-5), (0.9, 2e-5)]
+    assert len(sweep.load_results(env / "g" / "results.jsonl")) == 4

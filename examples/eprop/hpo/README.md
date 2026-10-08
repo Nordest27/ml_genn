@@ -56,3 +56,24 @@ SNAKE_CONFIG=hpo/studies/proposed/best.json python run_headless.py   # or python
   - `runs/<key>/`: the config, log and CSV of each run
   - `best.json`: the winner
 - `tests/`: sweep logic against a fake trainer (`python -m pytest -q hpo/tests`).
+
+## snake_switch: plasticity under changing tasks
+
+With `"switch": {...}` in the config, the task is mangled whenever the agent's reward per move over the last `window`
+moves reaches `criterion`. Each mangle permutes the input channels and remaps the actions (optionally it also flips the
+view). Every mangled task is as learnable as the original, but what the network learned before stops working.
+- **Score:** the number of switches reached within the budget. A rule that keeps its plasticity scores higher.
+- **Per-task times:** `outputs/<prefix>(<rep>)_switches.csv` records how long each task took. If the times grow with
+  each switch, the rule is losing plasticity.
+- **Dead neurons:** `"monitor": true` writes `outputs/<prefix>(<rep>)_neurons.csv` with, per hidden population:
+  - plasticity-dead neurons (mean ψ < 0.01), split into silent and still-firing;
+  - mean ψ and firing rate;
+  - the fraction of last report's dead neurons that recovered.
+
+```bash
+python hpo/sweep.py run switch_proposed switch_gradient_only switch_gradient_only_homeostat   # after tuning
+python hpo/sweep.py report switch_proposed
+```
+
+These studies inherit each rule's tuned `best.json` and run it with 5 seeds at full length (no search). Set the
+criterion from your reward-rate curves. It should be reachable by good rules within a few million timesteps.

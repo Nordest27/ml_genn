@@ -21,3 +21,8 @@ while t < cfg["max_timesteps"]:
 with open(f"outputs/{cfg['csv_prefix']}({cfg['repetition']}).csv", "w") as f:
     f.write("episode,score,ep_steps,avg_abs_td_error,reward_rate,voltage,voltage_loss,frequency\n")
     f.write("\n".join(rows) + "\n")
+if cfg.get("switch"):
+    n_switches = 3 if cfg.get("lr", 1e-5) < 2e-5 else 1
+    with open(f"outputs/{cfg['csv_prefix']}({cfg['repetition']})_switches.csv", "w") as f:
+        f.write("switch,moves,moves_since_last,channels,actions,flip\n")
+        f.writelines(f"{k + 1},{(k + 1) * 100},100,0 1 2,0 1 2 3,00\n" for k in range(n_switches))

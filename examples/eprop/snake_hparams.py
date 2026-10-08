@@ -32,10 +32,15 @@ DEFAULTS = {
     "gamma_env": 0.5,
     "td_lambda_env": 0.8,
     "reward_decay_env": 0.1,
-    # architecture
+    # task and architecture
+    "board_size": 5,             # larger boards are harder (the view stays visible_range = 5)
     "hid_e": 20,
     "hid_i": 15,
     "fan_in": 300,
+    # snake_switch: performance-triggered task switches and the dead-neuron monitor (snake_switch.py)
+    "switch": None,              # e.g. {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"], "seed": 0}
+    "monitor": False,            # log dead / silent / firing-dead hidden neurons per population
+    "monitor_every": 10000,      # environment moves per monitor report
     # run
     "seed": None,                # None: unseeded (as before)
     "max_timesteps": 30e6,       # stop after this many simulation timesteps ...
@@ -46,13 +51,15 @@ DEFAULTS = {
 }
 
 
-def load():
-    hp = dict(DEFAULTS)
-    path = os.environ.get("SNAKE_CONFIG")
+def load(defaults=None, env_var="SNAKE_CONFIG"):
+    """Defaults updated with the json file named by `env_var` (other scripts pass their own defaults)."""
+    defaults = DEFAULTS if defaults is None else defaults
+    hp = dict(defaults)
+    path = os.environ.get(env_var)
     if path:
         with open(path) as f:
             user = json.load(f)
-        unknown = set(user) - set(DEFAULTS) - {"_meta"}
+        unknown = set(user) - set(defaults) - {"_meta"}
         if unknown:
             raise KeyError(f"{path}: unknown hyperparameters {sorted(unknown)}")
         hp.update(user)
