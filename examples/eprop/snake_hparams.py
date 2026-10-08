@@ -23,7 +23,9 @@ DEFAULTS = {
     "c_reg": 1e-4,               # firing-rate regulariser
     "f_target": 10.0,            # target rate (Hz) of the regulariser
     "node_sigma": 1e-2,          # membrane-noise s.d. (used by noise=NODE rules only)
-    "feedback_type": "random",   # "random" | "symmetric" | "adaptive" (adaptive e-prop)
+    "feedback_type": "random",   # "random" | "symmetric" | "adaptive"
+    "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
+    "optimiser": "adabelief",    # "adabelief" (beta 0.99/0.99999) | "adam" (beta 0.9/0.999, adaptive e-prop)
     "entropy_coeff": 1.0,
     "entropy_decay_env": 0.99999,    # per environment step
     # time constants, per environment step (raised to 1/WAIT_INC in the script)

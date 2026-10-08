@@ -1032,7 +1032,12 @@ def build_compiled_network(connectivity_type="fixed"):
         compiler_cls, rule_kwargs = EPropCompiler, {}
     else:
         from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
-        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"]}
+        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"],
+                                                           "optimise_feedback": HP["optimise_feedback"]}
+    if HP["optimiser"] == "adam":
+        optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999)
+    else:
+        optimiser = AdaBelief(HP["lr"], beta1=0.99, beta2=0.99999, l2_init_strength=1e-5)
     compiler = compiler_cls(
         **rule_kwargs,
         f_target=HP["f_target"],
@@ -1044,7 +1049,7 @@ def build_compiled_network(connectivity_type="fixed"):
                 "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=AdaBelief(HP["lr"], beta1=0.99, beta2=0.99999, l2_init_strength=1e-5), #, soft_grad_clip=10), 
+        optimiser=optimiser,
         # optimiser=Adam(7e-6, beta1=0.9, beta2=0.999, l2_init_strength=0.0*1e-5), #, soft_grad_clip=10), 
         c_reg=HP["c_reg"],
         # c_reg=1.0,

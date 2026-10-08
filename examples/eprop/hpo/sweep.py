@@ -18,10 +18,14 @@ Score of a run: reward per environment step over the last `window` fraction of i
 CSV the Snake script writes; independent of episode length). Runs are compared on common seeds.
 """
 import argparse
+import atexit
 import copy
+import fcntl
+import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -36,6 +40,9 @@ from studies import STUDIES, DEFAULT_SCHEDULE  # noqa: E402
 
 WAIT_INC = 30                     # simulation timesteps per environment step (snake.py)
 POLL_S = float(os.environ.get("HPO_POLL_S", "20"))
+BUILD_JOBS = os.environ.get("BUILD_JOBS", "4")   # parallel compile jobs per GeNN build
+CODE_DIR = "snakeEPropCompiler_CODE"              # GeNN build folder of snake.py (model name + compiler)
+RUNTIME_KEYS = {"max_timesteps", "min_episodes", "csv_prefix", "repetition", "trace_log", "_meta"}
 
 
 # ------------------------------------------------------------------------------------------------
@@ -172,10 +179,14 @@ class Job:
         self.csv = self.dir / "outputs" / f"{cfg['csv_prefix']}({cfg['repetition']}).csv"
         if self.csv.exists():
             self.csv.unlink()
-        env = dict(os.environ, SNAKE_CONFIG=str(self.dir / "config.json"), MPLBACKEND="Agg")
+        link_build_cache(self.dir, cfg)
+        env = dict(os.environ, SNAKE_CONFIG=str(self.dir / "config.json"), MPLBACKEND="Agg", BUILD_JOBS=BUILD_JOBS)
         self.log = open(self.dir / "log.txt", "w")
         self.t0 = time.time()
-        self.proc = subprocess.Popen(trainer_cmd(), cwd=self.dir, env=env, stdout=self.log, stderr=subprocess.STDOUT)
+        # own process group (stopped as a whole) and SIGTERM to the run if the sweep itself dies
+        self.proc = subprocess.Popen(trainer_cmd(), cwd=self.dir, env=env, stdout=self.log, stderr=subprocess.STDOUT,
+                                     start_new_session=True, preexec_fn=_die_with_parent)
+        RUNNING.add(self.proc)
         self.status = None
 
     def check(self):
@@ -195,14 +206,11 @@ class Job:
         if self.status is None and self.gates.get("timeout_s") and time.time() - self.t0 > self.gates["timeout_s"]:
             self.status = "timeout"
         if self.status is not None and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(60)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+            stop(self.proc)
         rc = self.proc.poll()
         if rc is None:
             return None
+        RUNNING.discard(self.proc)
         self.log.close()
         if self.status is None:
             self.status = "ok" if rc == 0 else f"failed (exit {rc})"
@@ -213,14 +221,76 @@ class Job:
         timesteps = float(data[1].sum()) if data is not None else 0.0
         score = float("-inf")
         if self.status == "ok" and data is not None:
-            if timesteps < 0.95 * self.budget:
-                self.status = f"failed (stopped at {timesteps:.0f} timesteps)"
-            else:
-                score = window_rate(data[0], data[1], self.budget, frac)
-                score = score if np.isfinite(score) else float("-inf")
+            # the run exits normally only after max_timesteps; the CSV's ep_steps add up to a few % less than
+            # the simulation's timesteps, so the window is placed on the CSV's own timeline
+            score = window_rate(data[0], data[1], timesteps, frac)
+            score = score if np.isfinite(score) else float("-inf")
         hz = float(data[2][-1]) if data is not None and len(data[2]) else float("nan")
         return {**self.meta, "key": self.key, "score": score, "status": self.status, "timesteps": timesteps,
                 "final_hz": hz, "wall_s": round(time.time() - self.t0, 1)}
+
+
+RUNNING = set()
+
+
+def _die_with_parent():
+    """In the child: receive SIGTERM when the sweep process dies (Linux), so no run is left orphaned."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)    # PR_SET_PDEATHSIG
+    except OSError:
+        pass
+
+
+def stop(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(60)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+@atexit.register
+def _stop_all():
+    for p in list(RUNNING):
+        if p.poll() is None:
+            stop(p)
+
+
+def _on_signal(signum, frame):
+    raise SystemExit(f"stopped by signal {signum}")    # runs atexit -> stops the runs
+
+
+def code_key(cfg):
+    """Configs that differ only in run-time keys generate the same GeNN code and can share a build."""
+    code = {k: v for k, v in cfg.items() if k not in RUNTIME_KEYS}
+    return hashlib.sha1(json.dumps(code, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def link_build_cache(run_dir, cfg):
+    """Point the run's GeNN build folder at a shared cache entry. A configuration promoted to the next rung
+    (same seed) or re-evaluated then reuses its build instead of compiling again. Concurrent runs never share
+    an entry: within a rung every run differs in configuration or seed."""
+    cache = run_dir.parents[2] / "_build" / code_key(cfg) if run_dir.parent.name == "runs" else None
+    if cache is None:
+        return
+    cache.mkdir(parents=True, exist_ok=True)
+    link = run_dir / CODE_DIR
+    if link.is_symlink() or link.exists():
+        return
+    link.symlink_to(cache, target_is_directory=True)
+
+
+def lock_root(root):
+    """Only one sweep per studies folder (runs are meant to go one at a time)."""
+    f = open(root / ".lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"another sweep is running on {root} (lock {root / '.lock'})")
+    return f
 
 
 def run_jobs(specs, jobs, results_path, frac):
@@ -428,6 +498,10 @@ def main(argv=None):
     p.add_argument("--jobs", type=int, default=1); p.add_argument("--timesteps", type=float, default=30e6)
     a = ap.parse_args(argv)
     a.root.mkdir(parents=True, exist_ok=True)
+    if a.cmd in ("run", "evaluate", "calibrate"):
+        _lock = lock_root(a.root)  # noqa: F841  (held until exit)
+        signal.signal(signal.SIGTERM, _on_signal)
+        signal.signal(signal.SIGHUP, _on_signal)
 
     if a.cmd == "plan":
         cal = a.root / "throughput.json"

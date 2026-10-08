@@ -62,7 +62,7 @@ def _compile(compiler_cls, name, policy_type, **kw):
     return compiler.compile(net, name), inp, hid, pol, val
 
 
-def _run(compiled, inp, pol, val, steps=200, inspect=None):
+def _run(compiled, inp, pol, val, steps=200, inspect=None, probe=None):
     """Scripted episode: fixed input rates, a fixed policy-gradient pattern after every action and an
     alternating reward. Returns the hidden-layer weights after every K steps."""
     cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled,
@@ -71,6 +71,8 @@ def _run(compiled, inp, pol, val, steps=200, inspect=None):
     pg = np.array([0.3, -0.7, 0.2, 0.2], np.float32)
     history = []
     with compiled:
+        if probe is not None:
+            probe(compiled, "start")
         cb.on_epoch_begin(0); cb.on_batch_begin(0)
         compiled.set_input({inp: rates})
         upd = 0
@@ -93,6 +95,8 @@ def _run(compiled, inp, pol, val, steps=200, inspect=None):
                 history.append(np.concatenate([w.ravel() for w in ws]))
             if inspect is not None:
                 _accumulate_activity(compiled, inspect)
+        if probe is not None:
+            probe(compiled, "end")
     return np.array(history)
 
 
@@ -186,3 +190,36 @@ def test_rule_dict_round_trip():
     assert hidden_rule_from_dict({"preset": "proposed_full", "local": None}).local is None
     with pytest.raises(ValueError):
         hidden_rule_from_dict({"preset": "proposed", "homeostatt": 1.0})
+
+
+def _feedback_weights(compiled, name):
+    for conn, pop in compiled.connection_populations.items():
+        if conn.is_feedback and conn.name.endswith(name):
+            pop.vars["g"].pull_from_device()
+            return pop.vars["g"].values.copy()
+    raise KeyError(name)
+
+
+def test_adaptive_feedback_learns_only_when_requested(request):
+    for flag in (False, True):
+        compiled, inp, hid, pol, val = _compile(EPropCompiler, f"{request.node.name}_{flag}", PolicyType.GENERIC,
+                                                hidden_rule="eprop", optimise_feedback=flag)
+        seen = {}
+        _run(compiled, inp, pol, val, steps=60,
+             probe=lambda c, when: seen.__setitem__(when, _feedback_weights(c, "policy_feedback")))
+        assert np.any(seen["end"] != seen["start"]) == flag
+
+
+def test_value_feedback_carries_bv_not_td_error(request):
+    """e-prop's critic signal is -c_V B^V (Bellec et al. 2020): VE must equal the feedback weight."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC, hidden_rule="eprop")
+    seen = {}
+
+    def probe(c, when):
+        if when == "end":
+            h = [p for p in c.neuron_populations if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)][0]
+            c.neuron_populations[h].vars["VE"].pull_from_device()
+            seen["ve"] = c.neuron_populations[h].vars["VE"].view.ravel().copy()
+            seen["bv"] = _feedback_weights(c, "value_feedback").ravel()
+    _run(compiled, inp, pol, val, steps=30, probe=probe)
+    np.testing.assert_allclose(seen["ve"], seen["bv"], rtol=1e-5)

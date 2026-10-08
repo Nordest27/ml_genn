@@ -195,9 +195,13 @@ class EPropCompiler(Compiler):
                                     "original", "drift_only", "gradient_only",
                                     "unbiased", "eprop", ...). Ignored outside
                                     the RL variant.
-        value_feedback_ret_e:        RetE of the value feedback connections
-                                    (1.0: feedback g * E, as in the original
-                                    implementation; 0.0: g).
+        value_feedback_ret_e:        RetE of the value feedback connections, which
+                                    deliver VE to the hidden neurons (used only by
+                                    the e-prop term). 0.0: VE = B^V, the critic
+                                    part of e-prop's learning signal (Bellec et al.
+                                    2020); 1.0: VE = B^V * TD error, as in the
+                                    original code, which makes the critic part
+                                    ~ delta^2 B^V e (a biased push, not a gradient).
         optimise_feedback:           Optimise adaptive feedback connections
                                     (False reproduces the original
                                     implementation, where they are not).
@@ -226,7 +230,7 @@ class EPropCompiler(Compiler):
                  policy_heads: Population = None,
                  value_head: Population = None,
                  hidden_rule="proposed",
-                 value_feedback_ret_e: float = 1.0,
+                 value_feedback_ret_e: float = 0.0,
                  optimise_feedback: bool = False,
                  value_reg: float = 0.0,
                  **genn_kwargs):

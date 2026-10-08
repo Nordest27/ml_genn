@@ -82,3 +82,30 @@ def test_crashing_configs_score_minus_inf(env, monkeypatch):
 def test_window_rate_is_per_env_step():
     score = np.array([1.0, -1.0, 2.0]); steps = np.array([300, 300, 600])
     assert sweep.window_rate(score, steps, 1200, 0.5) == pytest.approx(30 * 2.0 / 600)
+
+
+def test_promoted_runs_reuse_their_build(env):
+    sweep.run_study("toy", env, jobs=2)
+    links = {p.resolve() for p in (env / "toy" / "runs").glob(f"*/{sweep.CODE_DIR}")}
+    # rung 0: 8 configs x seed 0; rung 1: 2 configs x seeds 0, 1 -> seed 0 reuses rung 0's build
+    assert len(links) == 8 + 2
+    assert sweep.code_key({"lr": 1, "seed": 0, "max_timesteps": 5}) == sweep.code_key({"lr": 1, "seed": 0})
+    assert sweep.code_key({"lr": 1, "seed": 0}) != sweep.code_key({"lr": 1, "seed": 1})
+
+
+def test_second_sweep_on_same_root_is_refused(env):
+    held = sweep.lock_root(env)
+    with pytest.raises(SystemExit):
+        sweep.lock_root(env)
+    held.close()
+
+
+def test_runs_are_stopped_when_the_sweep_exits(env, monkeypatch):
+    import subprocess, time
+    monkeypatch.setenv("HPO_TRAINER", f"{sys.executable} -c import\\ time;time.sleep(60)")
+    monkeypatch.setattr(sweep, "trainer_cmd", lambda: [sys.executable, "-c", "import time; time.sleep(60)"])
+    j = sweep.Job("k", env / "r" / "k", {"csv_prefix": "k", "repetition": 0}, 1e6, {}, {})
+    assert j.proc.poll() is None
+    sweep._stop_all()
+    time.sleep(0.2)
+    assert j.proc.poll() is not None

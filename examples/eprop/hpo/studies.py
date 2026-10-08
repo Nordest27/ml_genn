@@ -43,7 +43,9 @@ STUDIES = {
         "space": {"lr": LR, "hidden_rule.log_syn_sigma": WEIGHT_NOISE},
     },
     "adaptive_eprop": {
-        "base": {"hidden_rule": {"preset": "eprop"}, "feedback_type": "adaptive"},
+        # learned feedback weights; AdaBelief like the other rules (set "optimiser": "adam", "lr": 7e-6 for the
+        # earlier hand-tuned Adam setting)
+        "base": {"hidden_rule": {"preset": "eprop"}, "feedback_type": "adaptive", "optimise_feedback": True},
         "space": {"lr": LR, "c_reg": ("log", 1e-5, 1e-3)},
     },
     "baseline_120hz": {
