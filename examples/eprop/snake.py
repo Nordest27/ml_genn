@@ -30,11 +30,14 @@ from ml_genn.compilers.eprop_compiler import default_params
 from collections import defaultdict
 
 from async_trace_logger import AsyncTraceLogger
+import snake_hparams
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 import os 
 import csv
+
+HP = snake_hparams.load()
 
 def compute_returns(rewards, gamma):
     """
@@ -484,8 +487,8 @@ INPUT_C = 3
 INPUT_SHAPE = (VISIBLE_RANGE*SCALE, VISIBLE_RANGE*SCALE, INPUT_C)
 DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
 UNIFIED_SHAPE = (30, 30, INPUT_C)
-HIDDEN_E_SHAPE = (20, 20, INPUT_C)
-HIDDEN_I_SHAPE = (15, 15, INPUT_C)
+HIDDEN_E_SHAPE = (HP["hid_e"], HP["hid_e"], INPUT_C)
+HIDDEN_I_SHAPE = (HP["hid_i"], HP["hid_i"], INPUT_C)
 INPUT_SIZE = np.prod(INPUT_SHAPE)
 NUM_HIDDEN_E = np.prod(HIDDEN_E_SHAPE)
 NUM_HIDDEN_I = np.prod(HIDDEN_I_SHAPE)
@@ -494,9 +497,9 @@ GAUSSIAN_TRACE_POLICY = False
 SIGMA_IN = 0.1
 SIGMA_H = 0.05
 
-DESIRED_FAN_IN_IN = 300
-DESIRED_FAN_IN_H1 = 300
-DESIRED_FAN_IN_H2 = 300
+DESIRED_FAN_IN_IN = HP["fan_in"]
+DESIRED_FAN_IN_H1 = DESIRED_FAN_IN_IN
+DESIRED_FAN_IN_H2 = DESIRED_FAN_IN_IN
 
 # FAN_IN_SCALE_IN = 0.25
 
@@ -597,13 +600,13 @@ if CHECKPOINT_BOARD_SIZE is not None:
 KERNEL_PROFILING = False
 
 
-reward_decay = 0.1 ** (1/WAIT_INC)
-gamma = 0.5 ** (1/WAIT_INC)
-td_lambda = 0.8 ** (1/WAIT_INC)
+reward_decay = HP["reward_decay_env"] ** (1/WAIT_INC)
+gamma = HP["gamma_env"] ** (1/WAIT_INC)
+td_lambda = HP["td_lambda_env"] ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
 
-entropy_coeff = 1e-0
-entropy_decay = 0.99999 ** (1/WAIT_INC)
+entropy_coeff = HP["entropy_coeff"]
+entropy_decay = HP["entropy_decay_env"] ** (1/WAIT_INC)
 entropy_coeff_min = 0.0 * 1e-7
 
 dale_l1_reg = 0.0
@@ -734,6 +737,7 @@ class EILayer:
             tau_refrac=cfg.tau_refrac,
             tau_adapt=cfg.tau_adapt,
             beta=cfg.beta,
+            perturbation_eps_std=HP["node_sigma"],
         )
 
         self.e = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.e_shape)
@@ -930,11 +934,13 @@ def build_compiled_network(connectivity_type="fixed"):
             ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
 
         policy_field = Population(
-            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300),
+            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
+                                       perturbation_eps_std=HP["node_sigma"]),
             HIDDEN_I_SHAPE
         )
         value_field = Population(
-            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300),
+            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
+                                       perturbation_eps_std=HP["node_sigma"]),
             HIDDEN_I_SHAPE
         )
 
@@ -1022,7 +1028,15 @@ def build_compiled_network(connectivity_type="fixed"):
         dale_l1_reg = 0.01/np.sqrt(max(INPUT_SIZE, NUM_HIDDEN_E))
     dale_l1_reg = 0
     print("L1 reg strength:", dale_l1_reg)
-    compiler = EPropCompiler(
+    if HP["hidden_rule"] is None:
+        compiler_cls, rule_kwargs = EPropCompiler, {}
+    else:
+        from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
+        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"]}
+    compiler = compiler_cls(
+        **rule_kwargs,
+        f_target=HP["f_target"],
+        rng_seed=0 if HP["seed"] is None else HP["seed"] + 1,   # GeNN: 0 = random seed
         example_timesteps=1,
         losses={
             policy: "mean_square_error" # "sparse_categorical_crossentropy" 
@@ -1030,14 +1044,14 @@ def build_compiled_network(connectivity_type="fixed"):
                 "mean_square_error",
             value: "mean_square_error"
         },
-        optimiser=AdaBelief(1e-5, beta1=0.99, beta2=0.99999, l2_init_strength=1e-5), #, soft_grad_clip=10), 
+        optimiser=AdaBelief(HP["lr"], beta1=0.99, beta2=0.99999, l2_init_strength=1e-5), #, soft_grad_clip=10), 
         # optimiser=Adam(7e-6, beta1=0.9, beta2=0.999, l2_init_strength=0.0*1e-5), #, soft_grad_clip=10), 
-        c_reg=1e-4,
+        c_reg=HP["c_reg"],
         # c_reg=1.0,
         # f_target=120,
         batch_size=1,
         kernel_profiling=KERNEL_PROFILING,
-        feedback_type="random",
+        feedback_type=HP["feedback_type"],
         reward_decay=reward_decay,
         gamma=gamma,
         td_lambda=td_lambda,
@@ -1506,8 +1520,8 @@ def start_visualizers():
     p_sigma.start()
     return manager, metrics_q, best_run_q, random_run_q, sigma_q, stop_event, p_plots, p_runs, p_sigma
 
-CSV_PREFIX = "x2"
-REPETITION = 5
+CSV_PREFIX = HP["csv_prefix"]
+REPETITION = HP["repetition"]
 CSV_OUTPUT = f"outputs/{CSV_PREFIX}({REPETITION}).csv"
 os.makedirs(os.path.dirname(CSV_OUTPUT), exist_ok=True)
 
@@ -1534,7 +1548,7 @@ os.makedirs(os.path.dirname(TRACE_LOG_PATH), exist_ok=True)
 if os.path.exists(TRACE_LOG_PATH):
     os.remove(TRACE_LOG_PATH)
 
-trace_logger = AsyncTraceLogger(TRACE_LOG_PATH)
+trace_logger = AsyncTraceLogger(TRACE_LOG_PATH) if HP["trace_log"] else snake_hparams.NullLogger()
 
 # --- Modify your train_snake_agent to send updates instead of internal plotting ---
 # Replace plt.ion() + figure creation in train_snake_agent with nothing and send updates to queues.
@@ -1584,7 +1598,7 @@ def train_snake_agent_with_ipc(episodes=10000,
         gamma_disc_reward = 0
         ep = 0
         # while compiled_net.genn_model.timestep < 30e6: 
-        while ep < 20000 or compiled_net.genn_model.timestep < 30e6:
+        while ep < HP["min_episodes"] or compiled_net.genn_model.timestep < HP["max_timesteps"]:
             ep += 1
             # if env.won:
             #     compiled_net.save_connectivity((BOARD_SIZE,), serialiser)

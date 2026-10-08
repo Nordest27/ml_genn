@@ -8,8 +8,9 @@ This replaces the large if/elif ladder that used to live inline in
 
 import numpy as np
 
-from .variants import FeedbackType, FeedbackRule, HiddenRule, OutputRule, RoutingMode
+from .variants import FeedbackType, FeedbackRule, HiddenRule, OutputRule
 from .models import get_hidden_model, get_output_model, get_feedback_model
+from .hidden_rule import build_td_hidden_model
 from ...neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrateFire
 from ...utils.model import WeightUpdateModel
 
@@ -73,7 +74,8 @@ def _build_rl_feedback_wum(conn, connect_snippet, compiler, compile_state,
 
     return WeightUpdateModel(
         model=get_feedback_model(FeedbackRule.VALUE_ADAPTIVE),
-        param_vals={"RetE": 1.0, "Alpha": alpha, "GammaLambda": compiler.gamma_lambda},
+        param_vals={"RetE": compiler.value_feedback_ret_e, "Alpha": alpha,
+                    "GammaLambda": compiler.gamma_lambda},
         var_vals={"g": connect_snippet.weight, "DeltaG": 0.0, "RLTrace": 0.0},
         pre_var_vals={"ZFilter": 0.0},
         post_neuron_var_refs={"E_post": "E", "ValReg_post": "ValReg", "F_post": post_var_name})
@@ -135,34 +137,13 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
             post_neuron_var_refs={"RefracTime_post": "RefracTime", "V_post": "V",
                                  "A_post": "A", "E_post": "E"})
 
-    post_neuron_var_refs = {
-        "RefracTime_post": "RefracTime", "Beta_post": "Beta",
-        "V_post": "V", "A_post": "A", "E_post": "E", "PG_post": "PG",
-        "VE_post": "VE", "TdE_post": "TdE", "PR_post": "PR", "VR_post": "VR",
-        "PGEps_post": "PGEps", "PRew_post": "PRew",
-        "Noise1": "Noise1", "Noise2": "Noise2",
-        "Noise3": "Noise3", "Noise4": "Noise4"}
-    if compiler.td_routing_mode is not RoutingMode.NONE:
-        # Only reachable once Sigma/PertEpsTrace are actually wired up on the
-        # hidden neuron - get_hidden_model raises before we get here otherwise.
-        post_neuron_var_refs.update({
-            "PertEpsTrace_post": "PertEpsTrace", "Sigma_post": "Sigma"})
-
-    return WeightUpdateModel(
-        model=get_hidden_model(HiddenRule.ALIF_TD_LAMBDA,
-                               noise_source=compiler.td_noise_source,
-                               gate=compiler.td_pseudo_derivative_gate,
-                               routing=compiler.td_routing_mode),
-        param_vals={**base_params, "Lambda": compiler.td_lambda},
-        var_vals={"g": connect_snippet.weight, "eFiltered": 0.0, "DeltaG": 0.0,
-                  "epsilonA": 0.0, "RLTrace": 0.0, "RLEpsTrace": 0.0,
-                  "NoiseTrace": 0.0, "RLNoiseTrace": 0.0, "LogSynSig": 0.0,
-                  "SynSig": 0.0, "SynSigTrace": 0.0, "UpdateCount": 0.0},
-        pre_var_vals={"ZFilter": 0.0},
-        post_var_vals={"Psi": 0.0, "FAvg": 0.0, "FAvgTrace": 0.0,
-                       "Z": 0.0, "NeuronNoiseTrace": 0.0},
-        pre_neuron_var_refs={"Noise1_pre": "Noise1"},
-        post_neuron_var_refs=post_neuron_var_refs)
+    kw = build_td_hidden_model(
+        compiler.hidden_rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho,
+        f_target=(compiler.f_target * compiler.dt) / 1000.0,
+        alpha_fav=np.exp(-compiler.dt / compiler.tau_reg),
+        v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda)
+    kw["var_vals"]["g"] = connect_snippet.weight
+    return WeightUpdateModel(**kw)
 
 
 def _register_symmetric_feedback(conn, compiler, compile_state, target_pop):

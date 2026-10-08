@@ -28,8 +28,8 @@ from ...utils.network import get_underlying_conn
 from ...utils.snippet import ConnectivitySnippet
 from ...utils.value import is_value_constant
 
-from .variants import (FeedbackType, PolicyType, NoiseSource,
-                       PseudoDerivativeGate, RoutingMode)
+from .variants import (FeedbackType, PolicyType, HiddenRuleConfig, NoisePlacement,
+                       get_hidden_rule, as_policy_type)
 from .models import GRADIENT_BATCH_REDUCE_MODEL
 from . import neuron_logic
 from . import connection_logic as conn_logic
@@ -188,23 +188,22 @@ class EPropCompiler(Compiler):
                                     when running the RL variant.
         value_head:                  The value-head readout Population,
                                     required when running the RL variant.
-        td_noise_source:             Where the RL/TD(lambda) ALIF variant's
-                                    perturbation noise comes from (see
-                                    :class:`.variants.NoiseSource`). Ignored
-                                    outside the RL variant.
-        td_pseudo_derivative_gate:   Whether the pseudo-derivative gates the
-                                    perturbation trace in the RL/TD(lambda)
-                                    ALIF variant (see
-                                    :class:`.variants.PseudoDerivativeGate`).
-                                    Ignored outside the RL variant.
-        td_routing_mode:             Optional structured routing of the local
-                                    policy-gradient estimator (see
-                                    :class:`.variants.RoutingMode`). Only
-                                    ``NONE`` is currently supported end to
-                                    end -- ``ADDITIVE``/``MULTIPLICATIVE``
-                                    raise ``NotImplementedError`` since their
-                                    Sigma/PertEps feedback channel isn't wired
-                                    up on the hidden neuron yet.
+        hidden_rule:                 Hidden-layer rule of the RL/TD(lambda)
+                                    variant: a :class:`.variants.HiddenRuleConfig`
+                                    or a preset name from
+                                    :data:`.variants.PRESETS` ("proposed",
+                                    "original", "drift_only", "gradient_only",
+                                    "unbiased", "eprop", ...). Ignored outside
+                                    the RL variant.
+        value_feedback_ret_e:        RetE of the value feedback connections
+                                    (1.0: feedback g * E, as in the original
+                                    implementation; 0.0: g).
+        optimise_feedback:           Optimise adaptive feedback connections
+                                    (False reproduces the original
+                                    implementation, where they are not).
+        value_reg:                   Weight of the value head's smoothness
+                                    regulariser (0.0 as in the original
+                                    implementation).
     """
     def __init__(self, example_timesteps: int, losses, optimiser="adam",
                  tau_reg: float = 500.0, c_reg: float = 0.001,
@@ -226,9 +225,10 @@ class EPropCompiler(Compiler):
                  entropy_coeff_min: float = 1e-6,
                  policy_heads: Population = None,
                  value_head: Population = None,
-                 td_noise_source: NoiseSource = NoiseSource.NODE,
-                 td_pseudo_derivative_gate: PseudoDerivativeGate = PseudoDerivativeGate.ENABLED,
-                 td_routing_mode: RoutingMode = RoutingMode.NONE,
+                 hidden_rule="proposed",
+                 value_feedback_ret_e: float = 1.0,
+                 optimise_feedback: bool = False,
+                 value_reg: float = 0.0,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -261,12 +261,14 @@ class EPropCompiler(Compiler):
         self.entropy_coeff = entropy_coeff
         self.entropy_coeff_decay = entropy_coeff_decay
         self.entropy_coeff_min = entropy_coeff_min
-        self.policy_heads = policy_heads
+        self.policy_heads = ({p: as_policy_type(t) for p, t in policy_heads.items()}
+                             if policy_heads is not None else None)
         self.value_head = value_head
-        self.td_noise_source = td_noise_source
-        self.td_pseudo_derivative_gate = td_pseudo_derivative_gate
-        self.td_routing_mode = td_routing_mode
-        self._configure_rl(gamma, td_lambda, policy_heads, value_head)
+        self.hidden_rule = get_hidden_rule(hidden_rule)
+        self.value_feedback_ret_e = value_feedback_ret_e
+        self.optimise_feedback = optimise_feedback
+        self.value_reg = value_reg
+        self._configure_rl(gamma, td_lambda, self.policy_heads, value_head)
 
     def _configure_rl(self, gamma, td_lambda, policy_heads, value_head):
         """Validate and derive RL-specific configuration. Either both gamma
@@ -340,7 +342,10 @@ class EPropCompiler(Compiler):
                 f"{type(target_neuron).__name__} neurons")
 
         compile_state.checkpoint_connection_vars.append((conn, "g"))
-        if not conn.is_feedback:
+        # adaptive feedback connections have DeltaG; they are optimised only on request
+        # (the original implementation never optimised them)
+        if not conn.is_feedback or (self.optimise_feedback and
+                                    "DeltaG" in [v[0] for v in wum.model["vars"]]):
             compile_state.weight_optimiser_connections.append(conn)
 
         return wum
@@ -376,6 +381,9 @@ class EPropCompiler(Compiler):
 
         if self.gamma_lambda is not None:
             neuron_logic.add_hidden_rl_input_refs(model_copy)
+            if (self.hidden_rule.noise is NoisePlacement.NODE
+                    and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire)):
+                neuron_logic.enable_node_noise(model_copy)
 
         if not isinstance(pop.neuron, (AdaptiveLeakyIntegrateFire, LeakyIntegrateFire)):
             raise NotImplementedError(f"E-prop compiler doesn't support "
@@ -408,10 +416,10 @@ class EPropCompiler(Compiler):
         optimiser_custom_updates = []
         deep_r_record_rewirings_ccus = []
         dale_rewiring_required = self._add_weight_optimisers(
-            connection_populations, compile_state, optimiser_custom_updates,
+            genn_model, connection_populations, compile_state, optimiser_custom_updates,
             deep_r_record_rewirings_ccus)
 
-        self._add_bias_optimisers(neuron_populations, compile_state,
+        self._add_bias_optimisers(genn_model, neuron_populations, compile_state,
                                   optimiser_custom_updates)
 
         for p, o, s in compile_state.softmax_populations:
@@ -461,7 +469,7 @@ class EPropCompiler(Compiler):
             for c in conns:
                 setattr(connection_populations[c], attr, target_var)
 
-    def _add_weight_optimisers(self, connection_populations, compile_state,
+    def _add_weight_optimisers(self, genn_model, connection_populations, compile_state,
                                optimiser_custom_updates, deep_r_record_rewirings_ccus):
         """Add Deep-R / Dale rewiring infrastructure and an optimiser custom
         update for every weight that needs one. Returns whether Dale
@@ -475,7 +483,7 @@ class EPropCompiler(Compiler):
             weight_var_ref = create_wu_var_ref(genn_pop, "g")
 
             if c in self.deep_r_conns:
-                deep_r_2_ccu = add_deep_r(genn_pop, connection_populations,
+                deep_r_2_ccu = add_deep_r(genn_pop, genn_model,
                                           self, self.deep_r_l1_strength,
                                           delta_g_var_ref, weight_var_ref)
                 if c in self.deep_r_record_rewirings:
@@ -485,18 +493,18 @@ class EPropCompiler(Compiler):
             if dale_sign is not None:
                 dale_rewiring_required = True
                 add_dale_rewiring(
-                    synapse_group=genn_pop, genn_model=connection_populations,
+                    synapse_group=genn_pop, genn_model=genn_model,
                     compiler=self, l1_strength=self.dale_rewiring_l1_strength,
                     sign=dale_sign, weight_var_ref=weight_var_ref)
 
             optimiser_custom_updates.append(
                 self._create_optimiser_custom_update(
                     f"Weight{i}", weight_var_ref, delta_g_var_ref,
-                    connection_populations, True))
+                    genn_model, True))
 
         return dale_rewiring_required
 
-    def _add_bias_optimisers(self, neuron_populations, compile_state,
+    def _add_bias_optimisers(self, genn_model, neuron_populations, compile_state,
                              optimiser_custom_updates):
         for i, p in enumerate(compile_state.bias_optimiser_populations):
             genn_pop = neuron_populations[p]
@@ -504,7 +512,7 @@ class EPropCompiler(Compiler):
                 self._create_optimiser_custom_update(
                     f"Bias{i}", create_var_ref(genn_pop, "Bias"),
                     create_var_ref(genn_pop, "DeltaBias"),
-                    neuron_populations, False))
+                    genn_model, False))
 
     def _build_callbacks(self, compile_state, optimiser_custom_updates,
                          deep_r_record_rewirings_ccus, dale_rewiring_required):

@@ -7,7 +7,7 @@ flavour is independently readable and testable.
 
 import numpy as np
 
-from .variants import PolicyType
+from .variants import PolicyType, as_policy_type
 
 
 def add_softmax_output_var(model_copy, compile_state, pop):
@@ -121,23 +121,18 @@ def add_generic_policy_code(model_copy):
     )
 
 
-def add_value_head_code(model_copy, gamma, reward_decay):
-    """TD-error / value-regularisation code for the value (critic) head."""
+def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0):
+    """TD error of the value (critic) head: E = gamma V_t + r_t - V_{t-1}, with the reward decaying by
+    reward_decay per step. value_reg > 0 adds a smoothness regulariser value_reg * (V_t - V_{t-1})
+    (ValReg, used by the value readout's update); 0 reproduces the original implementation."""
     model_copy.add_var("ValReg", "scalar", 0.0)
     model_copy.add_var("PrevVal", "scalar", 0.0)
-    model_copy.add_var("ValTrace", "scalar", 0.0)
-
+    out = model_copy.output_var_name
+    reg = f"ValReg = {value_reg!r} * ({out} - PrevVal);\n" if value_reg != 0 else ""
     model_copy.append_sim_code(
         f"""
-        ValTrace = ValTrace*0.5 + PrevVal*0.5;
-        E = {model_copy.output_var_name} * {gamma} + reward - PrevVal; // TdE
-
-        ValReg = (
-            0.000 * ({model_copy.output_var_name})
-            + 0.1 * ({model_copy.output_var_name} - PrevVal)
-            + 0.0 * ({model_copy.output_var_name} - PrevVal) * ({model_copy.output_var_name} - PrevVal)
-        );
-        PrevVal = {model_copy.output_var_name};
+        E = {out} * {gamma} + reward - PrevVal; // TD error
+        {reg}PrevVal = {out};
         reward *= {reward_decay};
         tdError = 0;
         """
@@ -159,13 +154,14 @@ def add_rl_output_head_code(model_copy, pop, compiler):
 
     policy_type = compiler.policy_heads.get(pop)
     if policy_type is not None:
+        policy_type = as_policy_type(policy_type)
         builder = _POLICY_HEAD_BUILDERS[policy_type]
         builder(model_copy,
                entropy_coeff=compiler.entropy_coeff,
                entropy_coeff_decay=compiler.entropy_coeff_decay,
                entropy_coeff_min=compiler.entropy_coeff_min)
     else:
-        add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay)
+        add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay, compiler.value_reg)
 
 
 def add_supervised_error_code(model_copy):
@@ -201,7 +197,7 @@ def add_hidden_feedback_code(model_copy):
         E = ISynFeedback;
         Ebase = Ebase * 0.999 + E * 0.001;
         Noise1 = gennrand_normal();
-        Noise2 = gennrand_normal();
+        Noise2 = gennrand_uniform();
         Noise3 = gennrand_normal();
         Noise4 = gennrand_normal();
         """
@@ -223,7 +219,8 @@ def add_hidden_rl_input_refs(model_copy):
     model_copy.add_var("PR", "scalar", 0.0)
     model_copy.add_var("VR", "scalar", 0.0)
     model_copy.add_var("PGEps", "scalar", 0.0)
-    model_copy.add_var("TdE", "scalar", 0.0)
+    if not model_copy.has_var("TdE"):          # the ALIF neuron model already declares TdE
+        model_copy.add_var("TdE", "scalar", 0.0)
 
     model_copy.append_sim_code(
         """
@@ -257,3 +254,20 @@ def add_input_noise_code(model_copy):
         Noise4 = gennrand_normal();
         """
     )
+
+
+# Switches in the ALIF neuron model (ml_genn.neurons.AdaptiveLeakyIntegrateFire) that keep membrane
+# noise off by default.
+_NODE_NOISE_SWITCHES = (("Sigma = 0.0 * exp(LogSigma);", "Sigma = exp(LogSigma);"),
+                        ("V = Alpha * V + Isyn + 0.0 * PertEps;", "V = Alpha * V + Isyn + PertEps;"))
+
+
+def enable_node_noise(model_copy):
+    """Turn on membrane ("node") noise in an ALIF hidden neuron: PertEps = Sigma * N(0, 1) is added to
+    the membrane and filtered into PertEpsTrace by the neuron model itself."""
+    sim = model_copy.model.get("sim_code", "")
+    for source, target in _NODE_NOISE_SWITCHES:
+        if source not in sim:
+            raise RuntimeError(f"node noise: '{source}' not found in the ALIF sim code; the neuron "
+                               "model changed, update _NODE_NOISE_SWITCHES")
+        model_copy.replace_sim_code(source, target)
