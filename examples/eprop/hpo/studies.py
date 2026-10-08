@@ -55,8 +55,9 @@ STUDIES = {
     # ---- additions to the proposed rule (start from its tuned values) ----------------------------
     "proposed_homeostat": {
         "inherit": "proposed",
-        "base": {"hidden_rule": {"preset": "proposed_homeostat"}},
-        "space": {"hidden_rule.homeostat": ("log", 0.5, 20.0), "hidden_rule.psi_target": ("lin", 0.03, 0.25)},
+        # strength 5 hurt fixed-task Snake and strength 1 handled task switches better (2026-10-08)
+        "base": {"hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0}},
+        "space": {"hidden_rule.homeostat": ("log", 0.1, 3.0), "hidden_rule.psi_target": ("lin", 0.03, 0.25)},
         "n": 12,
     },
     "proposed_full": {
@@ -104,10 +105,56 @@ for _name in ("proposed", "adaptive_eprop", "eprop_plus_proposed"):
 # ---- snake_switch: rules compared on performance-triggered task switches (score = switches reached) --------
 # Each study inherits a tuned rule and runs it 5 times at full length (no search). Set the criterion from your
 # reward-rate curves: reachable by the good rules in a few million timesteps, not trivially.
-SWITCH = {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"], "seed": 0}
+SWITCH = {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"]}   # sequence seed = run seed
 SWITCH_RUN = {"n": 1, "rungs": [30e6], "seeds": [5], "keep": 1.0}
+# random-feedback e-prop: adaptive e-prop's tuned settings with fixed random feedback weights
+STUDIES["switch_random_eprop"] = {"inherit": "adaptive_eprop",
+                                  "base": {"feedback_type": "random", "optimise_feedback": False,
+                                           "switch": SWITCH, "monitor": True},
+                                  "space": {}, **SWITCH_RUN}
 for _name in ("proposed", "proposed_homeostat", "gradient_only", "gradient_only_homeostat", "adaptive_eprop",
               "eprop_plus_proposed", "eprop_plus_gradient", "eprop_plus_drift", "eprop_plus_proposed_homeostat",
               "eprop_plus_homeostat"):
     STUDIES[f"switch_{_name}"] = {"inherit": _name, "base": {"switch": SWITCH, "monitor": True},
                                   "space": {}, **SWITCH_RUN}
+
+
+# ---- CPU test bed: small Snake network on GeNN's CPU backend (~1000 timesteps/s per run) --------------------
+# Same code and rules as the GPU runs, smaller hidden layers; several runs in parallel on a multicore machine.
+CPU_SMALL = {"hid_e": 6, "hid_i": 4, "fan_in": 50, "backend": "single_threaded_cpu"}
+CPU_VARIANTS = [
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "proposed_homeostat_centred"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}},
+    {"_meta": {"variant": "adaptive_eprop"}, "hidden_rule": {"preset": "eprop"}, "feedback_type": "adaptive",
+     "optimise_feedback": True},
+    {"_meta": {"variant": "random_eprop"}, "hidden_rule": {"preset": "eprop"}},
+]
+STUDIES["cpu_compare"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                          "space": {"*": ("choice", CPU_VARIANTS)}}
+
+# CPU snake_switch: the same rules under performance-triggered switches on the small network. The criterion is
+# set for the small network (chance ~-0.14 per move, proposed reaches -0.08 at ~1.3M timesteps).
+_ADAPTIVE = {"feedback_type": "adaptive", "optimise_feedback": True}
+CPU_SWITCH_VARIANTS = [
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "proposed_centred"}, "hidden_rule": {"preset": "proposed", "center_drift": True}},
+    {"_meta": {"variant": "proposed_homeo_centred"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}},
+    {"_meta": {"variant": "adaptive_eprop"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE},
+    {"_meta": {"variant": "adaptive+homeo"}, "hidden_rule": {"preset": "eprop_plus_homeostat", "homeostat": 1.0},
+     **_ADAPTIVE},
+    {"_meta": {"variant": "adaptive+prop_homeo_c"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "homeostat": 1.0, "center_drift": True},
+     **_ADAPTIVE},
+    # constant entropy bonus on the policy readout (helps the output adapt after a switch?)
+    {"_meta": {"variant": "prop_homeo_c+entropy"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}, "entropy_bonus": 0.03},
+    {"_meta": {"variant": "adaptive+entropy"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE,
+     "entropy_bonus": 0.03},
+]
+STUDIES["cpu_switch"] = {
+    "base": {**CPU_SMALL, "switch": {"criterion": -0.08, "window": 5000, "mangles": ["channels", "actions"]},
+             "monitor": True, "monitor_every": 5000},
+    "grid": True, "rungs": [10e6], "seeds": [2], "keep": 1.0,
+    "space": {"*": ("choice", CPU_SWITCH_VARIANTS)}}

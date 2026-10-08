@@ -1043,6 +1043,9 @@ def build_compiled_network(connectivity_type="fixed"):
         **rule_kwargs,
         f_target=HP["f_target"],
         rng_seed=0 if HP["seed"] is None else HP["seed"] + 1,   # GeNN: 0 = random seed
+        # the CPU backend compiles without optimisation unless asked
+        **({"backend": HP["backend"], "optimize_code": True} if HP["backend"] == "single_threaded_cpu"
+           else {"backend": HP["backend"]} if HP["backend"] else {}),
         example_timesteps=1,
         losses={
             policy: "mean_square_error" # "sparse_categorical_crossentropy" 
@@ -1628,6 +1631,12 @@ def train_snake_agent_with_ipc(episodes=10000,
         #     compiled_net.neuron_populations[hidden_layer].vars["Beta"].view[:] = betas * (0.2 > np.random.uniform(0.0, 1.0, betas.shape))
         #     compiled_net.neuron_populations[hidden_layer].vars["Beta"].push_to_device()
         
+        entropy_bonus = HP["entropy_bonus"]
+        # running mean of |TD error| (bias-corrected), for "entropy_scale": "abs_td"
+        abs_td_decay = HP["entropy_td_decay_env"] ** (1 / WAIT_INC)
+        abs_td_sum, abs_td_weight = 0.0, 0.0
+        policy_monitor = snake_switch.PolicyMonitor(f"outputs/{CSV_PREFIX}({REPETITION})_policy.csv")
+        ent_r = 0.0                        # entropy reward of the current decision (maximum-entropy RL)
         v_avg = 0
         v_reg_loss_avg = 0
         freq_avg = 0
@@ -1777,6 +1786,18 @@ def train_snake_agent_with_ipc(episodes=10000,
                         # Write into staging vars — sim code will move to PG/E next timestep
                         compiled_net.neuron_populations[policy].vars["pre_PG"].view[:] = PG.astype(np.float32)
                         compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
+                        abs_td_now = abs_td_sum / max(abs_td_weight, 1e-12)
+                        coeff_now, e_now = 0.0, None
+                        if HP["entropy_bonus"] > 0:
+                            coeff_now = entropy_bonus * (abs_td_now if HP["entropy_scale"] == "abs_td" else 1.0)
+                            e_now = snake_switch.entropy_error(probs, coeff_now)
+                            compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = e_now
+                            compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
+                            entropy_bonus *= HP["entropy_bonus_decay_env"]
+                        policy_monitor.decision(probs, PG, coeff_now, e_now, abs_td_now)
+                        if HP["entropy_reward"] > 0:
+                            ent_r = HP["entropy_reward"] * float(
+                                -(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
 
                         # compiled_net.neuron_populations[policy].vars["pre_PRew"].view[:] = -E.astype(np.float32)
                         # compiled_net.neuron_populations[policy].push_var_to_device("pre_PRew")
@@ -1804,8 +1825,15 @@ def train_snake_agent_with_ipc(episodes=10000,
                 reward_trace = reward_trace * reward_decay + reward * 1.0
                 if reward != 0:
                     compiled_net.losses[value].set_var(
-                        compiled_net.neuron_populations[value], "reward", reward * 1.0
+                        compiled_net.neuron_populations[value], "reward", reward * 1.0 + ent_r
                 )
+                elif ent_r != 0:
+                    # add the entropy reward to the value head's decaying reward trace (not replace it)
+                    _vpop = compiled_net.neuron_populations[value]
+                    _vpop.vars["reward"].pull_from_device()
+                    compiled_net.losses[value].set_var(
+                        _vpop, "reward", float(np.asarray(_vpop.vars["reward"].view).ravel()[0]) + ent_r)
+                ent_r = 0.0
                 
                 # frame_img = (obs*255).astype(int)
                 # if compress_frames:
@@ -1931,6 +1959,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                  
                 compiled_net.neuron_populations[value].vars["E"].pull_from_device() 
                 td_error_sum_abs += abs(compiled_net.neuron_populations[value].vars["E"].view[0])
+                abs_td_sum = abs_td_decay * abs_td_sum + abs(compiled_net.neuron_populations[value].vars["E"].view[0])
+                abs_td_weight = abs_td_decay * abs_td_weight + 1.0
                 ep_frames += 1
 
             compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
@@ -2046,6 +2076,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 avg = smoothing * avg + (1 - smoothing) * total_reward
             running_avg.append(avg)
 
+            policy_monitor.end_episode(ep, compiled_net.genn_model.timestep, getattr(env, "switches", 0))
             with open(CSV_OUTPUT, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([

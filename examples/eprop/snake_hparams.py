@@ -26,8 +26,16 @@ DEFAULTS = {
     "feedback_type": "random",   # "random" | "symmetric" | "adaptive"
     "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
     "optimiser": "adabelief",    # "adabelief" (beta 0.99/0.99999) | "adam" (beta 0.9/0.999, adaptive e-prop)
+    # entropy: used only by a categorical (on-device softmax) policy head. Snake's generic head takes its gradient
+    # from the script, which does not compute an entropy term, so these have no effect on Snake.
     "entropy_coeff": 1.0,
     "entropy_decay_env": 0.99999,    # per environment step
+    "entropy_bonus": 0.0,        # entropy bonus on Snake's (generic) policy readout; 0 = off, as in earlier runs
+    "entropy_bonus_decay_env": 1.0,  # per environment step (1 = constant, which suits task switches)
+    "entropy_scale": "none",     # "none": bonus = entropy_bonus; "abs_td": bonus = entropy_bonus * running |TD error|
+    "entropy_td_decay_env": 0.999,   # running |TD error| decay per environment step (~1000-step window)
+    "entropy_reward": 0.0,       # maximum-entropy RL: c * H(policy) added to the reward at every decision, so the TD
+                                 # error (and with it every layer) carries it; 0 = off. Game score / switches unaffected
     # time constants, per environment step (raised to 1/WAIT_INC in the script)
     "gamma_env": 0.5,
     "td_lambda_env": 0.8,
@@ -42,6 +50,7 @@ DEFAULTS = {
     "monitor": False,            # log dead / silent / firing-dead hidden neurons per population
     "monitor_every": 10000,      # environment moves per monitor report
     # run
+    "backend": None,             # None: GeNN's default (CUDA if available); "single_threaded_cpu" for CPU runs
     "seed": None,                # None: unseeded (as before)
     "max_timesteps": 30e6,       # stop after this many simulation timesteps ...
     "min_episodes": 20000,       # ... and at least this many episodes (both as before)
@@ -63,6 +72,9 @@ def load(defaults=None, env_var="SNAKE_CONFIG"):
         if unknown:
             raise KeyError(f"{path}: unknown hyperparameters {sorted(unknown)}")
         hp.update(user)
+    if path and env_var == "SNAKE_CONFIG" and ("entropy_coeff" in user or "entropy_decay_env" in user):
+        raise KeyError(f"{path}: 'entropy_coeff' / 'entropy_decay_env' have no effect on Snake's generic policy head; "
+                       "use 'entropy_bonus' (and 'entropy_scale', 'entropy_bonus_decay_env')")
     if hp["seed"] is not None:
         random.seed(hp["seed"])
         np.random.seed(hp["seed"])

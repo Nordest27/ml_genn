@@ -35,6 +35,7 @@ class SwitchingEnv:
         self.act = np.arange(self.n_actions)
         self.flip = (False, False)
         self.switches = 0
+        self.seen = {self._key(self.chan, self.act, self.flip)}   # mappings used so far (never repeated)
         self.moves = 0                     # environment moves (excluding the waiting steps)
         self.moves_at_switch = 0
         self.recent = deque(maxlen=self.window)
@@ -112,20 +113,26 @@ class SwitchingEnv:
     def ready(self):
         return len(self.recent) == self.window and self.rate() >= self.criterion
 
-    def _new_perm(self, current):
-        while True:
-            p = self.rng.permutation(len(current))
-            if not np.array_equal(p, current):
-                return p
+    @staticmethod
+    def _key(chan, act, flip):
+        return (tuple(int(c) for c in chan), tuple(int(a) for a in act), tuple(flip))
+
+    def _draw(self):
+        chan = self.rng.permutation(self.n_channels) if "channels" in self.mangles else self.chan
+        act = self.rng.permutation(self.n_actions) if "actions" in self.mangles else self.act
+        flip = (tuple(bool(x) for x in self.rng.integers(0, 2, 2)) if "flip" in self.mangles else self.flip)
+        return chan, act, flip
 
     def _switch(self):
-        if "channels" in self.mangles:
-            self.chan = self._new_perm(self.chan)
-        if "actions" in self.mangles:
-            self.act = self._new_perm(self.act)
-        if "flip" in self.mangles:
-            options = [f for f in ((False, True), (True, False), (True, True), (False, False)) if f != self.flip]
-            self.flip = options[self.rng.integers(len(options))]
+        """A uniformly random mapping the agent has not seen before (once all are used, any other than the
+        current one), so improvements across tasks cannot come from remembering an earlier mapping."""
+        for attempt in range(10000):
+            chan, act, flip = self._draw()
+            key = self._key(chan, act, flip)
+            if key not in self.seen or (attempt > 5000 and key != self._key(self.chan, self.act, self.flip)):
+                break
+        self.chan, self.act, self.flip = np.asarray(chan), np.asarray(act), flip
+        self.seen.add(key)
         self.switches += 1
         since = self.moves - self.moves_at_switch
         self.moves_at_switch = self.moves
@@ -203,4 +210,55 @@ class NeuronMonitor:
         self.samples = 0
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])
+        return row
+
+
+def entropy_error(probs, coeff):
+    """Error signal E for the policy readout that raises the policy's entropy.
+
+    The readout descends along ZFilter * E (E plays the role of dLoss/dlogit), so E is the gradient of -coeff * H
+    with respect to the logits: d(-H)/dz_k = p_k (log p_k + H), with H = -sum p log p."""
+    p = np.asarray(probs, dtype=np.float64)
+    logp = np.log(np.clip(p, 1e-8, 1.0))
+    h = -(p * logp).sum()
+    return (coeff * p * (logp + h)).astype(np.float32)
+
+
+class PolicyMonitor:
+    """Per-episode log of the policy: mean entropy (nats; uniform over 4 actions = 1.386), mean max probability,
+    the effective entropy coefficient, the running |TD error| and the size of the entropy term relative to the
+    reward-driven policy-gradient term, ||E|| / (|delta| * ||PG||): ~0.01 = negligible, ~1 = as strong."""
+    COLUMNS = ["episode", "timestep", "switch", "decisions", "entropy", "max_prob", "entropy_coeff", "abs_td",
+               "entropy_vs_pg"]
+
+    def __init__(self, log_path):
+        self.log_path = log_path
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        with open(log_path, "w", newline="") as f:
+            csv.writer(f).writerow(self.COLUMNS)
+        self._reset()
+
+    def _reset(self):
+        self.n, self.h, self.maxp, self.coeff, self.e_norm, self.pg_norm, self.abs_td = 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    def decision(self, probs, pg, coeff=0.0, e=None, abs_td=0.0):
+        p = np.asarray(probs, dtype=np.float64)
+        self.n += 1
+        self.h += float(-(p * np.log(np.clip(p, 1e-8, 1.0))).sum())
+        self.maxp += float(p.max())
+        self.coeff += coeff
+        self.abs_td += abs_td
+        if e is not None:
+            self.e_norm += float(np.linalg.norm(e))
+        self.pg_norm += abs_td * float(np.linalg.norm(pg))
+
+    def end_episode(self, episode, timestep, switch=0):
+        if self.n == 0:
+            return None
+        ratio = self.e_norm / self.pg_norm if self.pg_norm > 0 else float("nan")
+        row = [episode, int(timestep), switch, self.n, self.h / self.n, self.maxp / self.n, self.coeff / self.n,
+               self.abs_td / self.n, ratio]
+        with open(self.log_path, "a", newline="") as f:
+            csv.writer(f).writerow([f"{x:.5g}" if isinstance(x, float) else x for x in row])
+        self._reset()
         return row

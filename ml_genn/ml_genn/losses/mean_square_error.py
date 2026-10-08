@@ -20,7 +20,8 @@ class MeanSquareError(Loss):
         # Add sim-code to read out correct yTrue value 
         model.append_sim_code(
             f"""
-            const unsigned int timestep = (int)round(t / dt);
+            // wrapped, so continuing (never reset) RL runs with example_timesteps = 1 stay inside YTrue
+            const unsigned int timestep = ((unsigned int)round(t / dt)) % {example_timesteps};
             const unsigned int index = (batch * {example_timesteps} * num_neurons)
                                        + (timestep * num_neurons) + id;
             const scalar yTrue = YTrue[index];

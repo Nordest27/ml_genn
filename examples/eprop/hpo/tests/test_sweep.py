@@ -107,7 +107,10 @@ def test_runs_are_stopped_when_the_sweep_exits(env, monkeypatch):
     j = sweep.Job("k", env / "r" / "k", {"csv_prefix": "k", "repetition": 0}, 1e6, {}, {})
     assert j.proc.poll() is None
     sweep._stop_all()
-    time.sleep(0.2)
+    for _ in range(50):                      # the machine may be busy: allow up to 5 s
+        if j.proc.poll() is not None:
+            break
+        time.sleep(0.1)
     assert j.proc.poll() is not None
 
 
@@ -144,3 +147,37 @@ def test_grid_studies_run_every_combination(env):
     pts = json.loads((env / "g" / "points.json").read_text())["points"]
     assert sorted((p["gamma_env"], p["lr"]) for p in pts) == [(0.5, 1e-5), (0.5, 2e-5), (0.9, 1e-5), (0.9, 2e-5)]
     assert len(sweep.load_results(env / "g" / "results.jsonl")) == 4
+
+
+def test_whole_variant_grid(env):
+    variants = [{"_meta": {"variant": "a"}, "hidden_rule": {"preset": "proposed"}},
+                {"_meta": {"variant": "b"}, "hidden_rule": {"preset": "eprop"}, "optimise_feedback": True}]
+    sweep.STUDIES["v"] = {**SMALL, "grid": True, "rungs": [2e5], "seeds": [1], "keep": 1.0, "base": {"lr": 1e-5},
+                          "space": {"*": ("choice", variants)}}
+    sweep.run_study("v", env, jobs=2)
+    cfgs = [json.loads(p.read_text()) for p in sorted((env / "v" / "runs").glob("*/config.json"))]
+    assert {c["hidden_rule"]["preset"] for c in cfgs} == {"proposed", "eprop"}
+    assert any(c.get("optimise_feedback") for c in cfgs) and all(c["lr"] == 1e-5 for c in cfgs)
+    path = env / "cfg.json"; path.write_text(json.dumps(cfgs[0]))
+    import os; os.environ["SNAKE_CONFIG"] = str(path)
+    try:
+        snake_hparams.load()                                 # _meta is accepted by the Snake script
+    finally:
+        del os.environ["SNAKE_CONFIG"]
+
+
+def test_switch_sequence_follows_the_run_seed():
+    base = {"switch": {"criterion": 0.1, "seed": 99}}
+    a, b = sweep.run_config(base, None, 0, 1e5, "a"), sweep.run_config(base, None, 3, 1e5, "b")
+    assert a["switch"]["seed"] == 0 and b["switch"]["seed"] == 3 and base["switch"]["seed"] == 99
+
+
+def test_peek_blocks_are_per_block(env, capsys):
+    d = env / "pk" / "runs" / "r0"; (d / "outputs").mkdir(parents=True)
+    (d / "config.json").write_text(json.dumps({"csv_prefix": "p", "repetition": 0}))
+    rows = ["episode,score,ep_steps,avg_abs_td_error,reward_rate,voltage,voltage_loss,frequency"]
+    rows += [f"{k},{-1 if k < 10 else 1},100,0,0,0,0,0.01" for k in range(20)]       # first half -1, second +1
+    (d / "outputs" / "p(0).csv").write_text("\n".join(rows) + "\n")
+    sweep.peek("pk", env, block=1000)
+    out = capsys.readouterr().out
+    assert "-0.300 +0.300" in out                         # 30 * (-10 / 1000) and 30 * (+10 / 1000)

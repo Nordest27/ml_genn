@@ -143,11 +143,22 @@ def grid_points(space):
     return [dict(zip(keys, combo)) for combo in itertools.product(*(space[k][1] for k in keys))]
 
 
-def run_config(base, point, seed, budget, prefix):
-    cfg = copy.deepcopy(base)
+def apply_point(cfg, point):
+    """Set the sampled values; the key "*" holds a whole override dict (compare complete variants)."""
     for k, v in (point or {}).items():
-        set_path(cfg, k, v)
+        if k == "*":
+            cfg = deep_merge(cfg, v)
+        else:
+            set_path(cfg, k, v)
+    return cfg
+
+
+def run_config(base, point, seed, budget, prefix):
+    cfg = apply_point(copy.deepcopy(base), point)
     cfg.update(seed=seed, max_timesteps=budget, min_episodes=0, csv_prefix=prefix, repetition=0, trace_log=False)
+    if isinstance(cfg.get("switch"), dict):
+        # paired design: within a seed every rule gets the same sequence of task switches; seeds get different ones
+        cfg["switch"] = {**cfg["switch"], "seed": seed}
     return cfg
 
 
@@ -391,9 +402,7 @@ def run_study(name, root, jobs, retry_failed=False):
         run_jobs(specs, jobs, res_path, s["window"])
     final = rung_scores(load_results(res_path), len(s["rungs"]) - 1)
     best = max(alive, key=lambda c: final.get(c, float("-inf")))
-    cfg = copy.deepcopy(base)
-    for k, v in (points[best] or {}).items():
-        set_path(cfg, k, v)
+    cfg = apply_point(copy.deepcopy(base), points[best])
     cfg["_meta"] = {"study": name, "config": best, "point": points[best], "final_rung_score": final.get(best),
                     "rungs": s["rungs"], "seeds": s["seeds"]}
     (sdir / "best.json").write_text(json.dumps(cfg, indent=1))
@@ -416,12 +425,34 @@ def report(name, root):
                    key=lambda c: tuple(-per_rung[r].get(c, float("-inf")) for r in reversed(range(len(s["rungs"])))))
     for c in order:
         p = points[c] or {}
-        cells = "  ".join(f"{p[k] if k in p else '(base)':>14}" for k in keys)
+        show = lambda v: v.get("_meta", {}).get("variant", "variant") if isinstance(v, dict) else v
+        cells = "  ".join(f"{show(p[k]) if k in p else '(base)':>14}" for k in keys)
         sc = "".join(f"  {per_rung[r][c]:>18.4f}" if c in per_rung[r] else f"  {'':>18s}" for r in range(len(s["rungs"])))
         print(f"  {c:>6d}  {cells}{sc}")
     bad = [r for r in results.values() if r["status"] != "ok"]
     if bad:
         print(f"  not ok: " + ", ".join(f"{r['key']} ({r['status']})" for r in bad))
+
+
+def peek(name, root, block=2e5):
+    """Progress of every run of a study, finished or not, from the CSVs written so far."""
+    runs = sorted((root / name / "runs").glob("*/config.json"))
+    if not runs:
+        print(f"[{name}] no runs yet"); return
+    for cfg_path in runs:
+        cfg = json.loads(cfg_path.read_text())
+        d = read_csv(cfg_path.parent / "outputs" / f"{cfg['csv_prefix']}({cfg['repetition']}).csv")
+        label = cfg.get("_meta", {}).get("variant", cfg_path.parent.name)
+        if d is None or len(np.atleast_1d(d[1])) < 2:
+            print(f"  {cfg_path.parent.name:14s} {label:28s} no episodes yet"); continue
+        score, steps, hz = (np.atleast_1d(x) for x in d)
+        t = np.cumsum(steps)
+        blocks = [window_rate(score, steps, (i + 1) * block, 1.0 / (i + 1)) for i in range(int(t[-1] // block))]
+        sw = cfg_path.parent / "outputs" / f"{cfg['csv_prefix']}({cfg['repetition']})_switches.csv"
+        n_sw = max(sum(1 for _ in open(sw)) - 1, 0) if sw.exists() else None
+        print(f"  {cfg_path.parent.name:14s} {label:28s} {t[-1] / 1e6:5.2f}M ts {hz[-1]:5.0f} Hz"
+              + (f" {n_sw} switches" if n_sw is not None else "")
+              + " | per " + format(block, ".2g") + ": " + " ".join(f"{b:+.3f}" for b in blocks[-8:]))
 
 
 def evaluate(name, root, seeds, jobs, budget):
@@ -516,6 +547,7 @@ def main(argv=None):
     p = sub.add_parser("run"); p.add_argument("studies", nargs="+"); p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--retry-failed", action="store_true")
     p = sub.add_parser("report"); p.add_argument("studies", nargs="+")
+    p = sub.add_parser("peek"); p.add_argument("studies", nargs="+"); p.add_argument("--block", type=float, default=2e5)
     p = sub.add_parser("evaluate"); p.add_argument("study"); p.add_argument("--seeds", default="100-104")
     p.add_argument("--jobs", type=int, default=1); p.add_argument("--timesteps", type=float, default=30e6)
     a = ap.parse_args(argv)
@@ -549,6 +581,9 @@ def main(argv=None):
     elif a.cmd == "report":
         for name in a.studies:
             report(name, a.root)
+    elif a.cmd == "peek":
+        for name in a.studies:
+            peek(name, a.root, a.block)
     elif a.cmd == "evaluate":
         evaluate(a.study, a.root, parse_seeds(a.seeds), a.jobs, a.timesteps)
 

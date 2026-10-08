@@ -131,3 +131,54 @@ def test_frame_shows_agent_view_and_probs_use_real_directions():
     real = env.env_probs(probs)
     for k in range(4):
         assert real[env.act[k]] == probs[k]                      # index k moves in direction act[k]
+
+
+def test_mappings_never_repeat_until_exhausted():
+    env = S.SwitchingEnv(FakeSnake(), mangles=("channels", "actions"), seed=0)
+    keys = [env._key(env.chan, env.act, env.flip)]
+    for _ in range(143):                                   # 6 x 24 = 144 mappings in total
+        env._switch()
+        keys.append(env._key(env.chan, env.act, env.flip))
+    assert len(set(keys)) == 144
+    env._switch()                                          # all used: still changes
+    assert env._key(env.chan, env.act, env.flip) != keys[-1]
+
+
+def test_entropy_error_raises_entropy_when_descended():
+    rng = np.random.default_rng(0)
+    H = lambda z: -(np.exp(z) / np.exp(z).sum() * np.log(np.exp(z) / np.exp(z).sum())).sum()
+    for _ in range(20):
+        z = rng.normal(0, 2, 4)
+        p = np.exp(z - z.max()); p /= p.sum()
+        e = S.entropy_error(p, 1.0)
+        # matches the numerical gradient of -H
+        num = np.array([-(H(z + 1e-5 * np.eye(4)[k]) - H(z - 1e-5 * np.eye(4)[k])) / 2e-5 for k in range(4)])
+        np.testing.assert_allclose(e, num, atol=1e-4)
+        assert H(z - 0.1 * e) > H(z)                     # a descent step increases the entropy
+    assert np.allclose(S.entropy_error(np.full(4, 0.25), 1.0), 0)   # uniform policy: nothing to do
+
+
+def test_policy_monitor_reports_entropy_and_relative_strength(tmp_path):
+    m = S.PolicyMonitor(str(tmp_path / "p.csv"))
+    p = np.array([0.7, 0.1, 0.1, 0.1]); pg = p - np.eye(4)[0]
+    e = S.entropy_error(p, 0.05)
+    for _ in range(3):
+        m.decision(p, pg, 0.05, e, abs_td=0.2)
+    row = m.end_episode(1, 300, 0)
+    h = -(p * np.log(p)).sum()
+    assert row[4] == pytest.approx(h) and row[5] == pytest.approx(0.7)
+    assert row[8] == pytest.approx(np.linalg.norm(e) / (0.2 * np.linalg.norm(pg)))
+    assert m.end_episode(2, 400) is None                      # nothing logged without decisions
+    m.decision(np.full(4, 0.25), np.zeros(4))                  # bonus off: ratio undefined, entropy logged
+    assert np.isnan(m.end_episode(3, 500)[8])
+
+
+def test_old_entropy_key_is_rejected_for_snake(tmp_path, monkeypatch):
+    import json
+    import snake_hparams
+    path = tmp_path / "c.json"; path.write_text(json.dumps({"entropy_coeff": 100.0}))
+    monkeypatch.setenv("SNAKE_CONFIG", str(path))
+    with pytest.raises(KeyError, match="entropy_bonus"):
+        snake_hparams.load()
+    path.write_text(json.dumps({"entropy_bonus": 0.3}))
+    assert snake_hparams.load()["entropy_bonus"] == 0.3
