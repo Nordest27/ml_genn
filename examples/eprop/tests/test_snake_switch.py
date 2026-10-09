@@ -108,7 +108,7 @@ def test_monitor_classifies_dead_neurons(tmp_path):
         @property
         def view(self): return self.f()
     vars_ = {"V": Var(lambda: v), "A": Var(lambda: np.zeros(3)), "RefracTime": Var(lambda: refrac_seq[state["i"] % 2])}
-    net = SimpleNamespace(neuron_populations={pop: SimpleNamespace(vars=vars_)})
+    net = SimpleNamespace(neuron_populations={pop: SimpleNamespace(vars=vars_)}, connection_populations={})
     m = S.NeuronMonitor(net, [pop], ["h"], str(tmp_path / "n.csv"), report_every=10)
     for k in range(10):
         state["i"] = k
@@ -242,3 +242,32 @@ def test_memory_and_switching_compose():
     view = env.agent_view()
     assert view.sum() == 0                                   # the apple is hidden, whatever the channel order
     assert env.img(scale=2).shape[1] == 8 + 4 + 8            # one board, one agent view (no double panel)
+
+
+def test_monitor_tracks_weight_change_per_connection(tmp_path):
+    class Pop:
+        shape, name = (2,), "h"
+        neuron = SimpleNamespace(beta=0.0, v_thresh=0.61, tau_refrac=3.0)
+    class Src:
+        name = "inp"
+    pop, src = Pop(), Src()
+    w = {"g": np.array([1.0, 2.0, 2.0])}
+
+    class G:
+        def pull_from_device(self): pass
+        @property
+        def values(self): return w["g"]
+    class Conn:
+        is_feedback = False
+        def target(self): return pop
+        def source(self): return src
+    conn = Conn()
+    sg = SimpleNamespace(vars={"g": G()})
+    state = SimpleNamespace(view=np.zeros(2), pull_from_device=lambda: None)
+    vars_ = {k: state for k in ("V", "A", "RefracTime")}
+    net = SimpleNamespace(neuron_populations={pop: SimpleNamespace(vars=vars_)}, connection_populations={conn: sg})
+    m = S.NeuronMonitor(net, [pop], ["h"], str(tmp_path / "n.csv"), report_every=1)
+    w["g"] = np.array([1.0, 2.0, 0.0])                      # one weight moved by 2; ||W0|| = 3
+    m.sample(0, 0)
+    rows = list(csv.DictReader(open(tmp_path / "n.csv")))
+    assert float(rows[0]["dW|inp->h"]) == pytest.approx(2 / 3, abs=1e-3)

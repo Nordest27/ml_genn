@@ -132,6 +132,9 @@ def test_presets_compile_and_train(preset, request):
     acc = {}
     h = _run(compiled, inp, pol, val, steps=100, inspect=acc)
     assert np.all(np.isfinite(h))
+    if preset == "reservoir":                     # no hidden learning by design
+        assert np.all(h[-1] == h[0]), "reservoir hidden weights changed"
+        return
     assert np.any(h[-1] != h[0]), "hidden weights did not change"
     rule = PRESETS[preset]
     # noise is injected exactly where the configuration says
@@ -357,3 +360,22 @@ def test_symmetric_hybrid_homeostat_keeps_fields_alive_with_eprop_signal():
     assert "RLTrace" in code and "AbsTd * (PsiBar" in code and "RLNoiseGtrace" not in code
     core_rule = rule_for_population(rule, core, {pol: None}, val)
     assert core_rule.eprop == 0 and core_rule.drift == 1 and core_rule.homeostat == 1
+
+
+def test_population_rules_override_the_global_rule(request):
+    net, inp, core, pf, vf, pol, val = _hybrid_network()
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="symmetric", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="eprop",
+        population_rules={core: {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}})
+    assert compiler.rule_for(core).homeostat == 1.0 and compiler.rule_for(pf).eprop == 1.0
+    compiled = compiler.compile(net, request.node.name)
+    pops = {(c.source(), c.target()): p for c, p in compiled.connection_populations.items() if not c.is_feedback}
+    core_in, field_in = pops[(inp, core)], pops[(core, pf)]
+    assert "RLNoisePtrace" in core_in.vars and "RLTrace" not in core_in.vars      # perturbation rule + homeostat
+    assert "RLTrace" in field_in.vars and "NoiseTrace" not in field_in.vars       # e-prop (global rule)

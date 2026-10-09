@@ -32,6 +32,7 @@ from collections import defaultdict
 from async_trace_logger import AsyncTraceLogger
 import snake_hparams
 import snake_switch
+import snake_network
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
@@ -616,413 +617,14 @@ serialiser = Numpy("snake_checkpoints_unified")
 network = Network(default_params)
 hidden_layers = {}
 
-def make_connectivity(
-    connectivity_type,
-    src_shape,
-    desired_fan_in=None,
-    fan_in_scale=None,
-    p=None,
-    sigma=None,
-    sign=None,
-    mean_scale=0.1,
-    sd_scale=0.05
-):
-    if connectivity_type == "fixed":
-
-        if p is None:
-            raise ValueError("Fixed connectivity requires p")
-        
-        if sign is None:
-            sd_scale = 1.0
-        
-        fan_in = p * np.prod(src_shape)
-
-        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
-        sd = sd_scale / np.sqrt(fan_in)
-
-        return FixedProbability(
-            p,
-            Normal(mean=mean, sd=sd)
-        )
-
-    elif connectivity_type == "toroidal":
-
-        if sigma is None:
-            raise ValueError("Toroidal connectivity requires sigma")
-
-        if desired_fan_in is None:
-            raise ValueError("Toroidal connectivity requires desired_fan_in")
-
-        # compute p_max automatically
-        # p_max = compute_p_max(desired_fan_in, sigma, src_shape, dst_shape)
-        fan_in = desired_fan_in
-
-        if sign == -1:
-            mean_scale *= 3
-        elif sign is None:
-            sd_scale = 1.0
-
-        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
-            
-        sd = sd_scale / np.sqrt(fan_in)
-
-        return ToroidalGaussian2D(
-            sigma=sigma,
-            fan_in=desired_fan_in,
-            fan_in_scale=fan_in_scale,
-            weight=Normal(mean=mean, sd=sd)
-        )
-
-    else:
-        raise ValueError(f"Unknown connectivity_type: {connectivity_type}")
-
-@dataclass
-class EILayerConfig:
-    """Configuration for a single EI layer."""
-    e_shape: Tuple[int, ...]
-    i_shape: Tuple[int, ...]
-    
-    # Neuron params
-    v_thresh: float = 0.61
-    tau_mem: float = 10.0
-    tau_refrac: float = 3.0
-    tau_adapt: float = 300.0
-    beta: float = 0.0174
-    
-    # Connectivity
-    connectivity_type: str = "toroidal"   # "toroidal" | "fixed"
-    sigma: float = 0.05
-    desired_fan_in_ee: int = 100
-    desired_fan_in_ei: int = 100
-    desired_fan_in_ie: int = 100
-    desired_fan_in_ii: int = 100
-    p_ee: float = 0.005  # used only if connectivity_type == "fixed"
-    p_ei: float = 0.005
-    p_ie: float = 0.005
-    p_ii: float = 0.005
-
-    # Weight init scales
-    mean_scale: float = 0.1
-    sd_scale: float = 0.05
-
-
-class EILayer:
-    """
-    A single Excitatory-Inhibitory layer.
-    
-    Creates E and I populations and wires all four internal
-    connections (E→E, E→I, I→E, I→I) using Dale's law signs.
-    
-    External connections (input→layer, layer→output) are handled
-    by connect_input() / connect_output(), keeping the EI layer
-    self-contained but composable.
-    """
-
-    def __init__(self, cfg: EILayerConfig, name: str = ""):
-        self.cfg = cfg
-        self.name = name
-        self.e: Optional[Population] = None
-        self.i: Optional[Population] = None
-        self._internal_connections: list = []
-
-    # ------------------------------------------------------------------
-    # Build populations + internal wiring (call inside `with network:`)
-    # ------------------------------------------------------------------
-    def build(self):
-        cfg = self.cfg
-        suffix = f"_{self.name}" if self.name else ""
-
-        neuron_kwargs = dict(
-            v_thresh=cfg.v_thresh,
-            tau_mem=cfg.tau_mem,
-            tau_refrac=cfg.tau_refrac,
-            tau_adapt=cfg.tau_adapt,
-            beta=cfg.beta,
-            perturbation_eps_std=HP["node_sigma"],
-        )
-
-        self.e = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.e_shape)
-        self.i = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.i_shape)
-
-        # Wire all four internal connections
-        internal = [
-            # (pre,    post,   src_shape,    fan_in,              p,          sign)
-            (self.e, self.e, cfg.e_shape, cfg.desired_fan_in_ee, cfg.p_ee,  +1),
-            (self.e, self.i, cfg.e_shape, cfg.desired_fan_in_ei, cfg.p_ei,  +1),
-            (self.i, self.e, cfg.i_shape, cfg.desired_fan_in_ie, cfg.p_ie,  -1),
-            (self.i, self.i, cfg.i_shape, cfg.desired_fan_in_ii, cfg.p_ii,  -1),
-        ]
-
-        for pre, post, src_shape, fan_in, p, sign in internal:
-            conn = Connection(
-                pre, post,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=cfg.sigma,
-                    desired_fan_in=fan_in,
-                    sign=sign,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=sign,
-            )
-            self._internal_connections.append(conn)
-
-        return self  # allow chaining: layer = EILayer(cfg).build()
-
-    # ------------------------------------------------------------------
-    # External connectivity helpers
-    # ------------------------------------------------------------------
-    def connect_from(
-        self,
-        source: Population,
-        src_shape: Tuple,
-        connectivity_type: str = None,
-        desired_fan_in: int = 100,
-        p: float = 0.01,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        """
-        Connect an external source population into both E and I
-        populations of this layer (always excitatory input).
-        """
-        cfg = self.cfg
-        c_type = connectivity_type or cfg.connectivity_type
-        sig    = sigma or cfg.sigma
-
-        for target in (self.e, self.i):
-            Connection(
-                source, target,
-                make_connectivity(
-                    connectivity_type=c_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=desired_fan_in,
-                    fan_in_scale=fan_in_scale,
-                    sign=+1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=+1,
-            )
-
-    def connect_to_next(
-        self,
-        next_layer: "EILayer",
-        p: float = 0.01,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        cfg = self.cfg
-        sig = sigma or cfg.sigma
-
-        for target in (next_layer.e, next_layer.i):
-            Connection(
-                self.e, target,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=cfg.e_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=cfg.desired_fan_in_ee,
-                    fan_in_scale=fan_in_scale,
-                    sign=+1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=+1,
-            )
-
-        for target in (next_layer.e, next_layer.i):
-            Connection(
-                self.i, target,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=cfg.i_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=cfg.desired_fan_in_ie,
-                    fan_in_scale=fan_in_scale,
-                    sign=-1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=-1,
-            )
-
-    def connect_to_field(
-        self,
-        field: Population,
-        p: float = 0.5,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        cfg = self.cfg
-        sig = sigma or cfg.sigma
-
-        for src, sign, src_shape, fan_in in (
-            (self.e, +1, cfg.e_shape, cfg.desired_fan_in_ee),
-            (self.i, -1, cfg.i_shape, cfg.desired_fan_in_ie),
-        ):
-            Connection(
-                src, field,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=fan_in,
-                    fan_in_scale=fan_in_scale,
-                    sign=sign,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=sign,
-            )
-
-    def connect_feedback(
-        self,
-        output_pop: Population,
-        feedback_name: str,
-        p: float = 0.5,
-        n_output: int = 4,
-    ):
-        """
-        Wire both E and I populations as feedback sources to an
-        output head, respecting Dale's law.
-        """
-        for hidden, sign in ((self.e, +1), (self.i, -1)):
-            Connection(
-                hidden, output_pop,
-                FixedProbability(p, Normal(sd=1.0 / np.sqrt(n_output))),
-                feedback_name=feedback_name,
-                exc_inh_sign=sign,
-            )
-    
-    def populations(self):
-        """Return (e, i) tuple — useful for iterating over all hidden pops."""
-        return self.e, self.i
+# The network is built by snake_network.py from the "network" config (see snake_hparams.py).
 
 
 def build_compiled_network(connectivity_type="fixed"):
     global dale_l1_reg
-    network = Network(default_params)
-    hidden_layers = {}
-
-    ei_cfg = EILayerConfig(
-        e_shape=HIDDEN_E_SHAPE,
-        i_shape=HIDDEN_I_SHAPE,
-        connectivity_type=connectivity_type,
-        sigma=SIGMA_H,
-        desired_fan_in_ee=DESIRED_FAN_IN_H1,
-        desired_fan_in_ei=DESIRED_FAN_IN_H1,
-        desired_fan_in_ie=DESIRED_FAN_IN_H2,
-        desired_fan_in_ii=DESIRED_FAN_IN_H2,
-    )
-
-    with network:
-        # PoissonInput generates the spikes on-device from the current rate image.
-        # The host therefore only needs to push one float32 rate per pixel whenever
-        # the observation frame changes.
-        input_pop = Population(PoissonInput(), INPUT_SHAPE)
-
-        ei_layers = []
-        for i in range(HP["ei_layers"]):
-            ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
-
-        policy_field = Population(
-            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
-                                       perturbation_eps_std=HP["node_sigma"]),
-            HIDDEN_I_SHAPE
-        )
-        value_field = Population(
-            AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
-                                       perturbation_eps_std=HP["node_sigma"]),
-            HIDDEN_I_SHAPE
-        )
-
-        # policy_field = EILayer(ei_cfg, name=f"policy_field").build()
-        # value_field = EILayer(ei_cfg, name=f"value_field").build()
-
-        policy = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), NUM_OUTPUT)
-        value  = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
-
-        # Input → first EI layer (excitatory only, using full connectivity_type)
-        ei_layers[0].connect_from(
-            input_pop, INPUT_SHAPE,
-            connectivity_type=connectivity_type,
-            desired_fan_in=DESIRED_FAN_IN_IN,
-            sigma=SIGMA_IN,
-            # fan_in_scale=FAN_IN_SCALE_IN,
-        )
-
-        # Stack EI layers
-        for i in range(len(ei_layers) - 1):
-            ei_layers[i].connect_to_next(ei_layers[i+1])
-
-        # Last EI layer → field layers
-        ei_layers[-1].connect_to_field(policy_field, p=CONN_P["H-H"])
-        ei_layers[-1].connect_to_field(value_field,  p=CONN_P["H-H"])
-
-        # Field layers → output heads (forward + feedback)
-        for field, head, feedback_name in (
-            (policy_field, policy, "policy_feedback"),
-            (value_field,  value,  "value_feedback"),
-        ):
-            # for pop in field.populations():
-            Connection(
-                field, head,
-                make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=0.99999, sign=None),
-                exc_inh_sign=None
-            )
-            if HP["explicit_feedback"]:
-                Connection(
-                    field, head,
-                    FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                    feedback_name=feedback_name,
-                    exc_inh_sign=None
-                )
-           
-        # for pop in ei_layers[-1].populations():
-        #     Connection(
-        #         pop, policy,
-        #         make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=CONN_P["H-P"], sign=None),
-        #         exc_inh_sign=None
-        #     )
-        #     Connection(
-        #         pop, value,
-        #         make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=CONN_P["H-V"], sign=None),
-        #         exc_inh_sign=None
-        #     )
-
-        # tde_transport from policy, all EI pops, and both fields
-        Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
-        for layer in ei_layers:
-            for pop in layer.populations():
-                Connection(pop, value, Dense(weight=1.0), feedback_name="tde_transport")
-        for field in (policy_field, value_field):
-            # for pop in field.populations():
-            Connection(field, value, Dense(weight=1.0), feedback_name="tde_transport")
-
-        # policy/value feedback from EI layers
-        for layer in (ei_layers if HP["explicit_feedback"] else []):
-            for pop in layer.populations():
-                Connection(
-                    pop, policy,
-                    FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                    feedback_name="policy_feedback",
-                    exc_inh_sign=None
-                )
-                Connection(
-                    pop, value,
-                    FixedProbability(CONN_P["F"], Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                    feedback_name="value_feedback",
-                    exc_inh_sign=None
-                )
+    spec = snake_network.spec_from_hparams(HP, INPUT_SHAPE, NUM_OUTPUT, channels=INPUT_C)
+    built = snake_network.build_network(spec, default_params)
+    network, input_pop, policy, value = built.network, built.input, built.policy, built.value
 
     # ================= COMPILER =================
     dale_l1_reg = 0.0001/np.sqrt(DESIRED_FAN_IN_IN)
@@ -1035,7 +637,9 @@ def build_compiled_network(connectivity_type="fixed"):
     else:
         from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
         compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"],
-                                                           "optimise_feedback": HP["optimise_feedback"]}
+                                                           "optimise_feedback": HP["optimise_feedback"],
+                                                           "train_readout": HP["train_readout"],
+                                                           "population_rules": built.population_rules}
     if HP["optimiser"] == "adam":
         optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999)
     else:
@@ -1085,9 +689,9 @@ def build_compiled_network(connectivity_type="fixed"):
     compiled_net = compiler.compile(network)
 
     # return compiled_net, network, input_pop, hidden_layers, policy, value
-    return compiled_net, network, input_pop, {i: l for i, l in enumerate(ei_layers[0].populations())}, policy, value
+    return compiled_net, network, input_pop, {i: l for i, l in enumerate(built.layers[0])}, policy, value, built
 
-compiled_net, network, input_pop, hidden_layers, policy, value = \
+compiled_net, network, input_pop, hidden_layers, policy, value, built = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
 
 train_callback_list = CallbackList(
@@ -1603,16 +1207,15 @@ def train_snake_agent_with_ipc(episodes=10000,
                                             log_path=f"outputs/{CSV_PREFIX}({REPETITION})_switches.csv")
         monitor = None
         if HP["monitor"]:
-            alif = [p for p in compiled_net.neuron_populations
-                    if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
-            n_layers = HP["ei_layers"]
-            labels = ([f"L{k + 1}_{x}" for k in range(n_layers) for x in ("E", "I")] + ["policy_field", "value_field"]
-                      if len(alif) == 2 * n_layers + 2 else [p.name for p in alif])
-            if n_layers == 1 and len(alif) == 4:
-                labels = ["E", "I", "policy_field", "value_field"]
+            alif = built.hidden
+            labels = [built.labels[p] for p in alif]
             monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
                                                  f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
                                                  report_every=HP["monitor_every"])
+        probe = None
+        if HP["probe"]:
+            probe = snake_switch.ProbeRecorder(compiled_net, built.hidden, [built.labels[p] for p in built.hidden],
+                                               **HP["probe"])
         best_reward = -np.inf
         shown_task = 0                     # snake_switch: task whose best run the viewers show
         best_run = []
@@ -1869,6 +1472,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 if monitor is not None and env.wait_count == env.wait_inc:
                     monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
+                if probe is not None and env.wait_count == env.wait_inc and not done:
+                    probe.sample(env)
 
                 if env.wait_count == env.wait_inc:
                     for conn_pop in list(compiled_net.connection_populations.values())[::-1]:
@@ -2138,6 +1743,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                 )
 
             # optional checkpoint / early stop etc.
+
+        if probe is not None:
+            probe.dump(f"outputs/{CSV_PREFIX}({REPETITION})_probe.npz")
 
         # After training finished, send sentinel None to visualizers so they stop cleanly
         if best_run_q is not None:

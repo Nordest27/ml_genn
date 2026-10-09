@@ -1,0 +1,13 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "hidden_rule": {
+  "preset": "eprop"
+ },
+ "ei_layers": 3,
+ "probe": {
+  "moves": 5000
+ },
+ "f_target": 100.0,
+ "c_reg": 0.001
+}

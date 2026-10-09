@@ -225,3 +225,97 @@ STUDIES["cpu_memory"] = {"base": {**CPU_SMALL, "memory": {"visible_moves": 2}}, 
 # CPU depth: 1-3 stacked EI layers, fully visible task
 STUDIES["cpu_depth"] = {"base": CPU_SMALL, "grid": True, "rungs": [3e6], "seeds": [2], "keep": 1.0,
                         "space": {"*": ("choice", CPU_MEMORY_RULES), "ei_layers": ("choice", [2, 3])}}
+
+# CPU features: does the hidden-layer rule create features? Frozen reservoir vs learning rules, linear probes on the
+# hidden state at the start and the end of the run (probe_analyse.py)
+CPU_FEATURE_RULES = [
+    {"_meta": {"variant": "reservoir"}, "hidden_rule": {"preset": "reservoir"}},
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "prop_homeo_c"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}},
+    {"_meta": {"variant": "random_eprop"}, "hidden_rule": {"preset": "eprop"}},
+]
+STUDIES["cpu_features"] = {"base": {**CPU_SMALL, "probe": {"moves": 5000}}, "grid": True, "rungs": [2e6],
+                           "seeds": [2], "keep": 1.0, "space": {"*": ("choice", CPU_FEATURE_RULES)}}
+
+# CPU: why is the perturbation rule fast at depth, and how to strengthen it (3 EI layers, monitor + probes)
+_HC = {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}
+CPU_DEPTH_WHY_VARIANTS = [
+    {"_meta": {"variant": "prop_homeo_c"}, "hidden_rule": _HC},
+    {"_meta": {"variant": "drift_homeo_c"}, "hidden_rule": {**_HC, "gradient": 0.0}},
+    {"_meta": {"variant": "grad_homeo"}, "hidden_rule": {"preset": "gradient_only_homeostat", "homeostat": 1.0}},
+    {"_meta": {"variant": "prop_homeo_c_frozen_ro"}, "hidden_rule": _HC, "train_readout": False},
+    {"_meta": {"variant": "random_frozen_ro"}, "hidden_rule": {"preset": "eprop"}, "train_readout": False},
+    {"_meta": {"variant": "random"}, "hidden_rule": {"preset": "eprop"}},
+    {"_meta": {"variant": "random+drift+homeo"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.0, "homeostat": 1.0,
+                     "center_drift": True}},
+    {"_meta": {"variant": "node+backprop0.3"}, "hidden_rule": {"preset": "node_proposed", "backprop": 0.3}},
+    # what the dropped depth screen still had pending at 3 layers
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "adaptive"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE},
+]
+STUDIES["cpu_depth_why"] = {"base": {**CPU_SMALL, "ei_layers": 3, "monitor": True, "monitor_every": 5000,
+                                     "probe": {"moves": 5000}},
+                            "grid": True, "rungs": [3e6], "seeds": [2], "keep": 1.0,
+                            "space": {"*": ("choice", CPU_DEPTH_WHY_VARIANTS)}}
+
+# CPU: e-prop at 3 layers with a high firing-rate target, to keep the deep layers active
+CPU_DEPTH_EPROP_REG_VARIANTS = [
+    {"_meta": {"variant": "random_f100"}, "hidden_rule": {"preset": "eprop"}, "f_target": 100.0, "c_reg": 1e-3},
+    {"_meta": {"variant": "adaptive_f100"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE, "f_target": 100.0,
+     "c_reg": 1e-3},
+]
+STUDIES["cpu_depth_eprop_reg"] = {"base": {**CPU_SMALL, "ei_layers": 3, "monitor": True, "monitor_every": 5000,
+                                           "probe": {"moves": 5000}},
+                                  "grid": True, "rungs": [3e6], "seeds": [2], "keep": 1.0,
+                                  "space": {"*": ("choice", CPU_DEPTH_EPROP_REG_VARIANTS)}}
+
+# CPU: the depth-mechanism study with activity-matched networks (the 10 Hz target starved the deep layers of the small
+# network): perturbation variants at 40 Hz, e-prop-based variants at 100 Hz (both with c_reg 1e-3)
+_F40 = {"f_target": 40.0, "c_reg": 1e-3}
+_F100 = {"f_target": 100.0, "c_reg": 1e-3}
+CPU_DEPTH_WHY_ACTIVE_VARIANTS = [
+    {"_meta": {"variant": "prop_homeo_c_f40"}, "hidden_rule": _HC, **_F40},
+    {"_meta": {"variant": "drift_homeo_c_f40"}, "hidden_rule": {**_HC, "gradient": 0.0}, **_F40},
+    {"_meta": {"variant": "grad_homeo_f40"}, "hidden_rule": {"preset": "gradient_only_homeostat", "homeostat": 1.0},
+     **_F40},
+    {"_meta": {"variant": "prop_homeo_c_frozen_ro_f40"}, "hidden_rule": _HC, "train_readout": False, **_F40},
+    {"_meta": {"variant": "proposed_f40"}, "hidden_rule": {"preset": "proposed"}, **_F40},
+    {"_meta": {"variant": "node+backprop0.3_f40"}, "hidden_rule": {"preset": "node_proposed", "backprop": 0.3}, **_F40},
+    {"_meta": {"variant": "random_frozen_ro_f100"}, "hidden_rule": {"preset": "eprop"}, "train_readout": False, **_F100},
+    {"_meta": {"variant": "random+drift+homeo_f100"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.0, "homeostat": 1.0,
+                     "center_drift": True}, **_F100},
+]
+STUDIES["cpu_depth_why_active"] = {"base": {**CPU_SMALL, "ei_layers": 3, "monitor": True, "monitor_every": 5000,
+                                            "probe": {"moves": 5000}},
+                                   "grid": True, "rungs": [3e6], "seeds": [2], "keep": 1.0,
+                                   "space": {"*": ("choice", CPU_DEPTH_WHY_ACTIVE_VARIANTS)}}
+
+# CPU depth on an active network: exact toroidal sampling (now the default), excitation-dominated feedforward between
+# layers and into the fields (all layers fire from the start, no dead neurons); every rule at its default settings
+_ACTIVE_FIELDS = {"conn": {"mean_scale": 0.5}, "conn_i": {"mean_scale": 0.033}}
+_ACTIVE_LAYER = {"to_next": {"mean_scale": 0.5}, "to_next_i": {"mean_scale": 0.033}}
+_NET3 = {"layers": [_ACTIVE_LAYER, _ACTIVE_LAYER, {}], "fields": _ACTIVE_FIELDS}
+_NET1 = {"layers": [{}], "fields": _ACTIVE_FIELDS}
+_DEPTH_RULES = [
+    {"_meta": {"variant": "prop_homeo_c"}, "hidden_rule": _HC},
+    {"_meta": {"variant": "drift_homeo_c"}, "hidden_rule": {**_HC, "gradient": 0.0}},
+    {"_meta": {"variant": "grad_homeo"}, "hidden_rule": {"preset": "gradient_only_homeostat", "homeostat": 1.0}},
+    {"_meta": {"variant": "prop_homeo_c_frozen_ro"}, "hidden_rule": _HC, "train_readout": False},
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "node+backprop0.3"}, "hidden_rule": {"preset": "node_proposed", "backprop": 0.3}},
+    {"_meta": {"variant": "random"}, "hidden_rule": {"preset": "eprop"}},
+    {"_meta": {"variant": "random_frozen_ro"}, "hidden_rule": {"preset": "eprop"}, "train_readout": False},
+    {"_meta": {"variant": "adaptive"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE},
+    {"_meta": {"variant": "random+drift+homeo"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.0, "homeostat": 1.0,
+                     "center_drift": True}},
+]
+_DEPTH_BASE = {**CPU_SMALL, "monitor": True, "monitor_every": 5000, "probe": {"moves": 5000}}
+STUDIES["cpu_depth3"] = {"base": {**_DEPTH_BASE, "ei_layers": 3, "network": _NET3}, "grid": True, "rungs": [2e6],
+                         "seeds": [2], "keep": 1.0, "space": {"*": ("choice", _DEPTH_RULES)}}
+STUDIES["cpu_depth1_ref"] = {"base": {**_DEPTH_BASE, "ei_layers": 1, "network": _NET1}, "grid": True, "rungs": [2e6],
+                             "seeds": [2], "keep": 1.0,
+                             "space": {"*": ("choice", [_DEPTH_RULES[i] for i in (0, 4, 6, 8)])}}

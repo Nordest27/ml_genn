@@ -208,6 +208,8 @@ PRESETS = {
     "eprop_plus_homeostat": HiddenRuleConfig(drift=0.0, gradient=0.0, homeostat=5.0, eprop=1.0),
     # hidden layer learns only the firing-rate regulariser (the "baseline"; set f_target in the compiler)
     "baseline": HiddenRuleConfig(noise=NoisePlacement.NONE, drift=0.0, gradient=0.0),
+    # reservoir: no hidden learning at all (the weights stay at their initial values); only the readout learns
+    "reservoir": HiddenRuleConfig(noise=NoisePlacement.NONE, drift=0.0, gradient=0.0, fire_rate_gradient=False),
 }
 
 

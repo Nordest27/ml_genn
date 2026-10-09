@@ -24,7 +24,8 @@ DEFAULTS = {
     "f_target": 10.0,            # target rate (Hz) of the regulariser
     "node_sigma": 1e-2,          # membrane-noise s.d. (used by noise=NODE rules only)
     "feedback_type": "random",   # "random" | "symmetric" | "adaptive"
-    "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
+    "optimise_feedback": False,
+    "train_readout": True,       # False: the readout weights stay at their initial values (modular compiler only)  # learn the feedback weights (adaptive e-prop; modular compiler only)
     "explicit_feedback": True,   # random/adaptive feedback connections from the core and fields to the heads; False
                                  # with feedback_type "symmetric" leaves the forward readout weights as the only
                                  # e-prop signal (the "symmetric_hybrid" rule)
@@ -46,14 +47,22 @@ DEFAULTS = {
     # task and architecture
     "board_size": 5,             # larger boards are harder (the view stays visible_range = 5)
     "ei_layers": 1,              # stacked EI layers between the input and the fields (depth)
+    "network": None,             # overrides of the network spec (snake_network.py), e.g.
+                                 # {"layers": [{"e": 30}, {"e": 20}, {"e": 10, "rule": {"preset": "eprop"}}],
+                                 #  "fields": {"shape": 6}, "input": {"fan_in": 200}}; "fields": null = no fields
     "memory": None,              # disappearing apple, e.g. {"visible_moves": 3} (snake_switch.MemoryEnv)
     "hid_e": 20,
     "hid_i": 15,
     "fan_in": 300,
+    "toroidal": "exact",         # "legacy": original sampler (realised fan-in ~45-147 of the requested 300, uneven
+                                 # torus); "exact": the requested fan-in on a proper torus (2-7x more input per neuron
+                                 # with the same 1/sqrt(fan_in) weights: retune before comparing)
     # snake_switch: performance-triggered task switches and the dead-neuron monitor (snake_switch.py)
     "switch": None,              # e.g. {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"], "seed": 0}
     "monitor": False,            # log dead / silent / firing-dead hidden neurons per population
     "monitor_every": 10000,      # environment moves per monitor report
+    "probe": None,               # e.g. {"moves": 5000}: record hidden state + task variables for the first and last
+                                 # moves of the run (outputs/<prefix>(<rep>)_probe.npz) for linear probes
     # run
     "backend": None,             # None: GeNN's default (CUDA if available); "single_threaded_cpu" for CPU runs
     "seed": None,                # None: unseeded (as before)

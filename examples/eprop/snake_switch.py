@@ -224,8 +224,10 @@ def pseudo_derivative(v, a, beta, v_thresh, refrac):
 
 class NeuronMonitor:
     def __init__(self, compiled_net, populations, labels, log_path, report_every=10000, psi_eps=0.01,
-                 silent_hz=0.5, dt_ms=1.0):
-        """populations: hidden ALIF ml_genn Populations; labels: their names in the log."""
+                 silent_hz=0.5, dt_ms=1.0, weights=True):
+        """populations: hidden ALIF ml_genn Populations; labels: their names in the log.
+        weights: also log, per connection group into a hidden population, how far its weights have moved from
+        their initial values (||W - W0|| / ||W0||), to see which layers learn when."""
         self.net, self.pops, self.labels = compiled_net, list(populations), list(labels)
         self.report_every, self.psi_eps, self.silent_hz, self.dt_ms = int(report_every), psi_eps, silent_hz, dt_ms
         self.log_path = log_path
@@ -236,10 +238,21 @@ class NeuronMonitor:
         self.samples, self.moves = 0, 0
         self.prev_dead = [None] * len(self.pops)
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        name_of = {p: l for p, l in zip(self.pops, self.labels)}
+        self.weight_groups = []
+        if weights:
+            for c, sg in compiled_net.connection_populations.items():
+                if c.is_feedback or c.target() not in name_of:
+                    continue
+                sg.vars["g"].pull_from_device()
+                w0 = np.asarray(sg.vars["g"].values, dtype=np.float64).copy()
+                src = name_of.get(c.source(), c.source().name)
+                self.weight_groups.append((f"{src}->{name_of[c.target()]}", sg, w0, np.linalg.norm(w0) + 1e-12))
         cols = ["timestep", "moves", "switch"]
         for l in self.labels:
             cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
                      f"{l}_recovered", f"{l}_vloss"]
+        cols += [f"dW|{name}" for name, *_ in self.weight_groups]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
 
@@ -283,6 +296,9 @@ class NeuronMonitor:
             self.prev_dead[i] = dead
             self.psi_sum[i][:] = 0
             self.spikes[i][:] = 0
+        for name, sg, w0, n0 in self.weight_groups:
+            sg.vars["g"].pull_from_device()
+            row.append(float(np.linalg.norm(np.asarray(sg.vars["g"].values, dtype=np.float64) - w0) / n0))
         self.samples = 0
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])
@@ -338,3 +354,52 @@ class PolicyMonitor:
             csv.writer(f).writerow([f"{x:.5g}" if isinstance(x, float) else x for x in row])
         self._reset()
         return row
+
+
+class ProbeRecorder:
+    """Records, at every move, the hidden populations' membrane potentials and refractory state together with the
+    task variables (apple relative to the head, danger in each direction, heading). Keeps the first `moves` and the
+    last `moves` samples of the run, for linear-probe analysis of what the hidden layer represents."""
+    DIRS = {"left": (0, -1), "up": (-1, 0), "right": (0, 1), "down": (1, 0)}
+
+    def __init__(self, compiled_net, populations, labels, moves=5000):
+        from collections import deque
+        self.net, self.pops, self.labels, self.moves = compiled_net, list(populations), list(labels), int(moves)
+        self.first, self.last = [], deque(maxlen=self.moves)
+
+    @staticmethod
+    def task_variables(env):
+        """Board-level variables, read through any wrappers (they delegate attribute access)."""
+        hy, hx = env.snake[0]
+        ay, ax = env.apples[0] if env.apples else (hy, hx)
+        danger = []
+        for dy, dx in ProbeRecorder.DIRS.values():
+            y, x = hy + dy, hx + dx
+            danger.append(float(y < 0 or y >= env.size or x < 0 or x >= env.size or (y, x) in env.snake[:-1]))
+        heading = list(ProbeRecorder.DIRS).index(env.direction)
+        return np.array([ay - hy, ax - hx, *danger, heading], dtype=np.float32)
+
+    def sample(self, env):
+        feats = []
+        for p in self.pops:
+            npop = self.net.neuron_populations[p]
+            for v in ("V", "RefracTime"):
+                npop.vars[v].pull_from_device()
+            feats.append(np.asarray(npop.vars["V"].view, dtype=np.float32).ravel().copy())
+            feats.append((np.asarray(npop.vars["RefracTime"].view).ravel() > 0).astype(np.float32))
+        row = (np.concatenate(feats), self.task_variables(env))
+        if len(self.first) < self.moves:
+            self.first.append(row)
+        self.last.append(row)
+
+    def dump(self, path):
+        def stack(rows):
+            if not rows:
+                return np.zeros((0, 0), np.float32), np.zeros((0, 7), np.float32)
+            return np.stack([r[0] for r in rows]), np.stack([r[1] for r in rows])
+        fx, fy = stack(self.first)
+        lx, ly = stack(list(self.last))
+        sizes = [int(np.prod(p.shape)) for p in self.pops]
+        np.savez(path, first_x=fx, first_y=fy, last_x=lx, last_y=ly, sizes=np.array(sizes),
+                 labels=np.array(self.labels), variables=np.array(["apple_dy", "apple_dx", "danger_left", "danger_up",
+                                                                   "danger_right", "danger_down", "heading"]))

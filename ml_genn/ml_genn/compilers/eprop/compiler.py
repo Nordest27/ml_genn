@@ -203,6 +203,10 @@ class EPropCompiler(Compiler):
                                     2020); 1.0: VE = B^V * TD error, as in the
                                     original code, which makes the critic part
                                     ~ delta^2 B^V e (a biased push, not a gradient).
+        population_rules:            {Population: rule} learning rules for individual hidden populations
+                                    (presets, dicts or HiddenRuleConfig); others use hidden_rule
+        train_readout:               False keeps the readout (policy / value) weights at their
+                                    initial values, to test what the hidden rule learns on its own
         optimise_feedback:           Optimise adaptive feedback connections
                                     (False reproduces the original
                                     implementation, where they are not).
@@ -233,6 +237,8 @@ class EPropCompiler(Compiler):
                  hidden_rule="proposed",
                  value_feedback_ret_e: float = 0.0,
                  optimise_feedback: bool = False,
+                 train_readout: bool = True,
+                 population_rules: dict = None,
                  value_reg: float = 0.0,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
@@ -270,8 +276,11 @@ class EPropCompiler(Compiler):
                              if policy_heads is not None else None)
         self.value_head = value_head
         self.hidden_rule = get_hidden_rule(hidden_rule)
+        # per-population rules (e.g. perturbation-based in wide layers, e-prop in narrow ones); they take precedence
+        self.population_rules = {p: get_hidden_rule(r) for p, r in (population_rules or {}).items()}
         self.value_feedback_ret_e = value_feedback_ret_e
         self.optimise_feedback = optimise_feedback
+        self.train_readout = train_readout
         self.value_reg = value_reg
         self._configure_rl(gamma, td_lambda, self.policy_heads, value_head)
 
@@ -349,7 +358,10 @@ class EPropCompiler(Compiler):
         compile_state.checkpoint_connection_vars.append((conn, "g"))
         # adaptive feedback connections have DeltaG; they are optimised only on request
         # (the original implementation never optimised them)
-        if not conn.is_feedback or (self.optimise_feedback and
+        readout_conn = (not conn.is_feedback and target_neuron.readout is not None)
+        if readout_conn and not self.train_readout:
+            pass                               # frozen readout: the readout weights keep their initial values
+        elif not conn.is_feedback or (self.optimise_feedback and
                                     "DeltaG" in [v[0] for v in wum.model["vars"]]):
             compile_state.weight_optimiser_connections.append(conn)
 
@@ -385,8 +397,9 @@ class EPropCompiler(Compiler):
         neuron_logic.add_hidden_feedback_code(model_copy)
 
         if self.gamma_lambda is not None:
-            neuron_logic.add_hidden_rl_input_refs(model_copy, backprop=self.hidden_rule.backprop != 0)
-            pop_rule = rule_for_population(self.hidden_rule, pop, self.policy_heads, self.value_head)
+            any_backprop = any(r.backprop != 0 for r in [self.hidden_rule, *self.population_rules.values()])
+            neuron_logic.add_hidden_rl_input_refs(model_copy, backprop=any_backprop)
+            pop_rule = self.rule_for(pop)
             if (pop_rule.noise is NoisePlacement.NODE
                     and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire)):
                 neuron_logic.enable_node_noise(model_copy)
@@ -406,6 +419,13 @@ class EPropCompiler(Compiler):
         compile_state.tau_mem = pop.neuron.tau_mem
         if isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             compile_state.tau_adapt = pop.neuron.tau_adapt
+
+    def rule_for(self, pop):
+        """The hidden rule of the synapses targeting `pop`: its own rule if given in population_rules, else the
+        global rule (split by EpropScope if that is set)."""
+        if pop in self.population_rules:
+            return self.population_rules[pop]
+        return rule_for_population(self.hidden_rule, pop, self.policy_heads, self.value_head)
 
     # ------------------------------------------------------------------
     # Network assembly

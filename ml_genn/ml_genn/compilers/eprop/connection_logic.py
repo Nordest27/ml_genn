@@ -120,8 +120,7 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
     # AdaptiveLeakyIntegrateFire
     # A synapse group has one presynaptic target. Hidden -> hidden synapses that send the backward gradient
     # signal target ISynBack; all others keep ISynPertEps (the hidden rule sends nothing there).
-    rule = (rule_for_population(compiler.hidden_rule, conn.target(), compiler.policy_heads, compiler.value_head)
-            if compiler.gamma_lambda is not None else compiler.hidden_rule)
+    rule = compiler.rule_for(conn.target()) if compiler.gamma_lambda is not None else compiler.hidden_rule
     send_back = (compiler.gamma_lambda is not None and rule.backprop != 0
                  and isinstance(conn.source().neuron, AdaptiveLeakyIntegrateFire))
     if send_back:

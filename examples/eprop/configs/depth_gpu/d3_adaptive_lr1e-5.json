@@ -1,0 +1,14 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "hidden_rule": {
+  "preset": "eprop"
+ },
+ "feedback_type": "adaptive",
+ "optimise_feedback": true,
+ "ei_layers": 3,
+ "lr": 1e-05,
+ "probe": {
+  "moves": 5000
+ }
+}
