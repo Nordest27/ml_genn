@@ -25,6 +25,9 @@ DEFAULTS = {
     "node_sigma": 1e-2,          # membrane-noise s.d. (used by noise=NODE rules only)
     "feedback_type": "random",   # "random" | "symmetric" | "adaptive"
     "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
+    "explicit_feedback": True,   # random/adaptive feedback connections from the core and fields to the heads; False
+                                 # with feedback_type "symmetric" leaves the forward readout weights as the only
+                                 # e-prop signal (the "symmetric_hybrid" rule)
     "optimiser": "adabelief",    # "adabelief" (beta 0.99/0.99999) | "adam" (beta 0.9/0.999, adaptive e-prop)
     # entropy: used only by a categorical (on-device softmax) policy head. Snake's generic head takes its gradient
     # from the script, which does not compute an entropy term, so these have no effect on Snake.

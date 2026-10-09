@@ -8,7 +8,7 @@ This replaces the large if/elif ladder that used to live inline in
 
 import numpy as np
 
-from .variants import FeedbackType, FeedbackRule, HiddenRule, OutputRule
+from .variants import FeedbackType, FeedbackRule, HiddenRule, OutputRule, rule_for_population
 from .models import get_hidden_model, get_output_model, get_feedback_model
 from .hidden_rule import build_td_hidden_model
 from ...neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrateFire
@@ -118,7 +118,15 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
                                  "E_post": "E", "Ebase_post": "Ebase", "Noise": "Noise"})
 
     # AdaptiveLeakyIntegrateFire
-    if compiler.gamma_lambda is not None:
+    # A synapse group has one presynaptic target. Hidden -> hidden synapses that send the backward gradient
+    # signal target ISynBack; all others keep ISynPertEps (the hidden rule sends nothing there).
+    rule = (rule_for_population(compiler.hidden_rule, conn.target(), compiler.policy_heads, compiler.value_head)
+            if compiler.gamma_lambda is not None else compiler.hidden_rule)
+    send_back = (compiler.gamma_lambda is not None and rule.backprop != 0
+                 and isinstance(conn.source().neuron, AdaptiveLeakyIntegrateFire))
+    if send_back:
+        compile_state.backprop_connections.append(conn)
+    elif compiler.gamma_lambda is not None:
         compile_state.pert_eps_transport_connections.append(conn)
     rho = np.exp(-compiler.dt / compile_state.tau_adapt)
     base_params = {"CReg": compiler.c_reg, "Alpha": alpha, "Rho": rho,
@@ -138,10 +146,10 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
                                  "A_post": "A", "E_post": "E"})
 
     kw = build_td_hidden_model(
-        compiler.hidden_rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho,
+        rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho,
         f_target=(compiler.f_target * compiler.dt) / 1000.0,
         alpha_fav=np.exp(-compiler.dt / compiler.tau_reg),
-        v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda)
+        v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda, send_back=send_back)
     kw["var_vals"]["g"] = connect_snippet.weight
     return WeightUpdateModel(**kw)
 

@@ -29,7 +29,7 @@ from ...utils.snippet import ConnectivitySnippet
 from ...utils.value import is_value_constant
 
 from .variants import (FeedbackType, PolicyType, HiddenRuleConfig, NoisePlacement,
-                       get_hidden_rule, as_policy_type)
+                       get_hidden_rule, as_policy_type, rule_for_population)
 from .models import GRADIENT_BATCH_REDUCE_MODEL
 from . import neuron_logic
 from . import connection_logic as conn_logic
@@ -74,6 +74,7 @@ class CompileState:
         self.tde_transport_connections = []
         self.policy_reward_connections = []
         self.pert_eps_transport_connections = []
+        self.backprop_connections = []           # hidden -> hidden synapses sending the backward signal
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
         self.value_regularisation_connections = []
@@ -384,8 +385,9 @@ class EPropCompiler(Compiler):
         neuron_logic.add_hidden_feedback_code(model_copy)
 
         if self.gamma_lambda is not None:
-            neuron_logic.add_hidden_rl_input_refs(model_copy)
-            if (self.hidden_rule.noise is NoisePlacement.NODE
+            neuron_logic.add_hidden_rl_input_refs(model_copy, backprop=self.hidden_rule.backprop != 0)
+            pop_rule = rule_for_population(self.hidden_rule, pop, self.policy_heads, self.value_head)
+            if (pop_rule.noise is NoisePlacement.NODE
                     and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire)):
                 neuron_logic.enable_node_noise(model_copy)
 
@@ -468,6 +470,7 @@ class EPropCompiler(Compiler):
             (compile_state.policy_regularisation_connections, "pre_target_var", "ISynPolicyRegularisation"),
             (compile_state.value_feedback_connections, "pre_target_var", "ISynValueError"),
             (compile_state.value_regularisation_connections, "pre_target_var", "ISynValueRegularisation"),
+            (compile_state.backprop_connections, "pre_target_var", "ISynBack"),
         ]
         for conns, attr, target_var in target_map:
             for c in conns:

@@ -158,3 +158,24 @@ STUDIES["cpu_switch"] = {
              "monitor": True, "monitor_every": 5000},
     "grid": True, "rungs": [10e6], "seeds": [2], "keep": 1.0,
     "space": {"*": ("choice", CPU_SWITCH_VARIANTS)}}
+
+# CPU: backward propagation of the perturbation gradient, with and without (fixed task, small network)
+CPU_BACKPROP_VARIANTS = [
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "proposed+backprop"}, "hidden_rule": {"preset": "proposed_backprop"}},
+    {"_meta": {"variant": "prop_homeo_c"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}},
+    {"_meta": {"variant": "prop_homeo_c+backprop"}, "hidden_rule": {"preset": "proposed_homeostat_backprop"}},
+]
+STUDIES["cpu_backprop"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                           "space": {"*": ("choice", CPU_BACKPROP_VARIANTS)}}
+
+# CPU: symmetric e-prop where the readout gradient reaches (the fields) + the perturbation rule elsewhere (the core),
+# against symmetric e-prop alone (the core then gets no learning signal)
+_SYMMETRIC = {"feedback_type": "symmetric", "explicit_feedback": False}
+CPU_HYBRID_VARIANTS = [
+    {"_meta": {"variant": "symmetric_eprop"}, "hidden_rule": {"preset": "eprop", "eprop_value": 1.0}, **_SYMMETRIC},
+    {"_meta": {"variant": "symmetric_hybrid"}, "hidden_rule": {"preset": "symmetric_hybrid"}, **_SYMMETRIC},
+]
+STUDIES["cpu_hybrid"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                         "space": {"*": ("choice", CPU_HYBRID_VARIANTS)}}

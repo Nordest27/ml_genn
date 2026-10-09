@@ -124,6 +124,8 @@ def compiled_hidden_name(compiled):
 
 @pytest.mark.parametrize("preset", sorted(PRESETS))
 def test_presets_compile_and_train(preset, request):
+    if preset == "symmetric_hybrid":
+        pytest.skip("needs a core/field network: test_symmetric_hybrid_splits_the_network")
     compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name.replace("[", "_").replace("]", ""),
                                             PolicyType.GENERIC, hidden_rule=preset,
                                             f_target=120.0 if preset == "baseline" else 10.0)
@@ -223,3 +225,121 @@ def test_value_feedback_carries_bv_not_td_error(request):
             seen["bv"] = _feedback_weights(c, "value_feedback").ravel()
     _run(compiled, inp, pol, val, steps=30, probe=probe)
     np.testing.assert_allclose(seen["ve"], seen["bv"], rtol=1e-5)
+
+
+def test_backprop_wiring_and_signal(request):
+    """Hidden -> hidden synapses send the backward gradient signal to ISynBack; input -> hidden synapses send
+    nothing; the hidden neurons' Back is non-zero with backprop and absent without it."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    rule = PRESETS["proposed_backprop"]
+    sender = build_td_hidden_model(rule, send_back=True, **kw)["model"]["synapse_dynamics_code"]
+    receiver = build_td_hidden_model(rule, send_back=False, **kw)["model"]["synapse_dynamics_code"]
+    assert "addToPre(g * (-PsiBar * normXi))" in sender and "addToPre" not in receiver
+    assert "RLBackTrace" in sender and "RLBackTrace" in receiver           # both learn from the signal
+    assert "addToPre" not in build_td_hidden_model(PRESETS["proposed"], send_back=True, **kw)["model"]["synapse_dynamics_code"]
+
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule="proposed_backprop")
+    targets = {(c.source().name, c.target().name): p.pre_target_var
+               for c, p in compiled.connection_populations.items() if not c.is_feedback}
+    assert targets[(hid.name, hid.name)] == "ISynBack"
+    assert targets[(inp.name, hid.name)] != "ISynBack"
+    seen = {}
+
+    def probe(c, when):
+        if when == "end":
+            c.neuron_populations[hid].vars["Back"].pull_from_device()
+            seen["back"] = np.asarray(c.neuron_populations[hid].vars["Back"].view).copy()
+    h = _run(compiled, inp, pol, val, steps=60, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(seen["back"] != 0)
+
+    plain, *_ = _compile(EPropCompiler, request.node.name + "_off", PolicyType.GENERIC, hidden_rule="proposed")
+    hid_pop = [p for p in plain.neuron_populations if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)][0]
+    with plain:
+        assert "Back" not in plain.neuron_populations[hid_pop].vars
+
+
+def _hybrid_network(seed=0):
+    """Snake-like: input -> recurrent core -> policy / value fields -> heads; no explicit feedback connections."""
+    rng = np.random.default_rng(seed)
+    w = lambda shape, mean, sd: (mean + sd * rng.standard_normal(shape)).astype(np.float32)
+    alif = lambda: AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        core = Population(alif(), N_HID)
+        pf, vf = Population(alif(), 6), Population(alif(), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, core, Dense(w((N_IN, N_HID), 0.15, 0.05)))
+        Connection(core, core, Dense(w((N_HID, N_HID), 0.0, 0.05)))
+        Connection(core, pf, Dense(w((N_HID, 6), 0.2, 0.05)))
+        Connection(core, vf, Dense(w((N_HID, 6), 0.2, 0.05)))
+        Connection(pf, pol, Dense(w((6, 4), 0.0, 0.5)))
+        Connection(vf, val, Dense(w((6, 1), 0.0, 0.5)))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for p in (core, pf, vf):
+            Connection(p, val, Dense(weight=1.0), feedback_name="tde_transport")
+    return net, inp, core, pf, vf, pol, val
+
+
+def test_symmetric_hybrid_splits_the_network(request):
+    from ml_genn.compilers.eprop import receives_eprop_signal, rule_for_population, EpropScope
+    net, inp, core, pf, vf, pol, val = _hybrid_network()
+    rule = PRESETS["symmetric_hybrid"]
+    assert rule.eprop_scope is EpropScope.SIGNAL_RECIPIENTS
+    assert not receives_eprop_signal(core, {pol: None}, val)
+    assert receives_eprop_signal(pf, {pol: None}, val) and receives_eprop_signal(vf, {pol: None}, val)
+    core_rule = rule_for_population(rule, core, {pol: None}, val)
+    field_rule = rule_for_population(rule, pf, {pol: None}, val)
+    assert core_rule.eprop == 0 and core_rule.drift == 1 and core_rule.homeostat == 1 and core_rule.center_drift
+    assert field_rule.eprop == 1 and field_rule.drift == 0 and field_rule.gradient == 0
+    assert field_rule.noise is NoisePlacement.NONE
+
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiled = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="symmetric", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="symmetric_hybrid").compile(net, request.node.name)
+    pops = compiled.connection_populations
+    by_pair = {(c.source(), c.target()): pops[c] for c in pops if not c.is_feedback}
+    core_in = by_pair[(inp, core)]
+    field_in = by_pair[(core, pf)]
+    assert "NoiseTrace" in core_in.vars and "RLTrace" not in core_in.vars          # perturbation rule only
+    assert "RLTrace" in field_in.vars and "NoiseTrace" not in field_in.vars        # e-prop only, no noise
+    seen = {}
+
+    def probe(c, when):
+        snap = {}
+        for key, pop in (("core", by_pair[(inp, core)]), ("pf", by_pair[(core, pf)]), ("vf", by_pair[(core, vf)])):
+            pop.vars["g"].pull_from_device(); snap[key] = pop.vars["g"].values.copy()
+        if when == "end":
+            for name, p in (("PG", pf), ("VE", vf)):
+                c.neuron_populations[p].vars[name].pull_from_device()
+                snap[name] = np.asarray(c.neuron_populations[p].vars[name].view).copy()
+        seen[when] = snap
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    rates = np.linspace(0.2, 0.8, N_IN).astype(np.float32)
+    with compiled:
+        probe(compiled, "start")
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: rates})
+        upd = 0
+        for t in range(100):
+            if t % K == K - 1:
+                p = compiled.neuron_populations[pol]
+                p.vars["pre_PG"].view[:] = np.array([0.3, -0.7, 0.2, 0.2], np.float32); p.push_var_to_device("pre_PG")
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0 if (t // K) % 2 else -1.0)
+            compiled.step_time(cb)
+            compiled.genn_model.custom_update("GradientLearn")
+            for o, cus in compiled.optimisers:
+                for cu in cus:
+                    upd += 1; o.set_step(cu, upd)
+            if t == 98:
+                probe(compiled, "end")
+    for key in ("core", "pf", "vf"):
+        assert np.all(np.isfinite(seen["end"][key])) and np.any(seen["end"][key] != seen["start"][key]), key
+    assert np.any(seen["end"]["VE"] != 0)                     # the value field receives B^V through the readout

@@ -60,8 +60,13 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 
 def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, rho: float,
-                          f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float):
-    """Return the keyword arguments of a ``WeightUpdateModel`` (model dict and initial values)."""
+                          f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float,
+                          send_back: bool = False):
+    """Return the keyword arguments of a ``WeightUpdateModel`` (model dict and initial values).
+
+    send_back: this synapse's presynaptic neuron is a hidden neuron that receives the backward signal
+    (``ISynBack``); the synapse then adds ``g * score_post`` to it with ``addToPre``. Only valid when the
+    compiler sets the connection's ``pre_target_var`` to ``ISynBack``."""
     weight_noise = cfg.noise in (NoisePlacement.WEIGHT_SHARED, NoisePlacement.WEIGHT_INDEPENDENT)
     node_noise = cfg.noise is NoisePlacement.NODE
     exact = cfg.estimator is Estimator.EXACT
@@ -76,7 +81,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     use_P = needs_split and (cfg.drift != 0 or cfg.homeostat != 0)
     use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE)
     use_combined = (not needs_split) and (cfg.drift != 0 or cfg.gradient != 0)
-    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact)
+    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back
                    or (use_combined and cfg.drift + cfg.gradient != 0)
                    or (route is LocalRoute.GRADIENT_INSTANT and not exact))
     use_eprop = cfg.eprop != 0
@@ -87,7 +92,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     rate_w = (c_reg if local is None or local.rate is None else local.rate)
     use_rate_local = local is not None and rate_w != 0
     use_favg = cfg.fire_rate_gradient or use_rate_local
-    use_efiltered = cfg.fire_rate_gradient or use_eprop
+    use_backprop = cfg.backprop != 0
+    send_back = send_back and use_backprop
+    use_efiltered = cfg.fire_rate_gradient or use_eprop or use_backprop
 
     # --- normalised noise trace and the two scores -------------------------------------------------
     kappa = "(1.0 - Alpha * Alpha) * " if cfg.kappa else ""
@@ -125,7 +132,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     if exact:
         vars_.append(("FreshEps", "scalar")); var_vals["FreshEps"] = 0.0
     for name, used in (("RLNoiseTrace", use_combined), ("RLNoisePtrace", use_P),
-                       ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop)):
+                       ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
 
@@ -146,6 +153,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         post_refs.update({"PertEpsTrace_post": "PertEpsTrace", "Sigma_post": "Sigma"})
     if use_eprop:
         post_refs.update({"PG_post": "PG", "VE_post": "VE"})
+    if use_backprop:
+        post_refs["Back_post"] = "Back"
     pre_refs = {"Noise1_pre": "Noise1"} if cfg.noise is NoisePlacement.WEIGHT_INDEPENDENT else {}
 
     # post spike / dynamics code
@@ -220,6 +229,8 @@ else {
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * (PsiBar - {_f(cfg.psi_target)}) * RLNoisePtrace")
     if use_eprop:
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
+    if use_backprop:
+        dg.append(_scaled(cfg.backprop, "reward * RLBackTrace"))
     if route is LocalRoute.WHOLE_TRACE:
         # original implementation: local rewards computed here (after the reset) on the whole trace
         whole = ("RLNoiseTrace" if use_combined else
@@ -239,6 +250,10 @@ else {
         dg.append("(LocR - LocMean) * RLNoiseGtrace")
     if dg:
         syn.append("DeltaG += " + "\n    + ".join(dg) + ";")
+    if send_back:
+        # the postsynaptic neuron's gradient score (the gradient part without the presynaptic factor), sent back
+        # through this synapse's own weight: the presynaptic neuron receives sum_post g * score_post
+        syn.append("addToPre(g * (-PsiBar * normXi));")
     syn.append("const scalar e = Psi * ZFilter - Psi * Beta_post * epsA;")
     syn.append("epsilonA = Psi * ZFilter + (Rho * epsA) - Psi * Beta_post * epsA;")
     if use_efiltered:
@@ -260,6 +275,8 @@ else {
         syn.append(f"RLNoiseGtrace = Lambda * RLNoiseGtrace + {g_score};")
     if use_eprop:
         syn.append(f"RLTrace = Lambda * RLTrace + eFiltered * (PG_post - {_f(cfg.eprop_value)} * VE_post);")
+    if use_backprop:
+        syn.append("RLBackTrace = Lambda * RLBackTrace + eFiltered * Back_post;")
     if weight_noise and not exact:
         syn.append("NoiseTrace *= Alpha;")
 

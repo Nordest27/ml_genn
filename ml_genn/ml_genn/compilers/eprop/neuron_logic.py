@@ -204,7 +204,7 @@ def add_hidden_feedback_code(model_copy):
     )
 
 
-def add_hidden_rl_input_refs(model_copy):
+def add_hidden_rl_input_refs(model_copy, backprop=False):
     """RL-specific additional input vars/state for a hidden neuron, plus
     the sim-code that unpacks each ISyn* channel into its named variable.
     """
@@ -233,6 +233,11 @@ def add_hidden_rl_input_refs(model_copy):
         PGEps = ISynPertEps;
         """
     )
+    if backprop:
+        # backward gradient signal: sum over this neuron's postsynaptic hidden neurons of g * score_post
+        model_copy.add_additional_input_var("ISynBack", "scalar", 0.0)
+        model_copy.add_var("Back", "scalar", 0.0)
+        model_copy.append_sim_code("Back = ISynBack;")
 
 
 def add_input_noise_code(model_copy):

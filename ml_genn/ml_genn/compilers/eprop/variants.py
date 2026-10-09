@@ -98,6 +98,15 @@ class LocalRoute(Enum):
     WHOLE_TRACE = auto()       # the rule's whole trace (the original implementation; legacy)
 
 
+class EpropScope(Enum):
+    """Which hidden populations use the e-prop term."""
+    ALL = auto()                # every hidden synapse combines e-prop with the perturbation terms (eprop_plus_*)
+    SIGNAL_RECIPIENTS = auto()  # populations that receive an e-prop learning signal (a forward connection to a policy
+                                # or value head under symmetric feedback, or a feedback connection to one) learn with
+                                # e-prop only and without noise; all other hidden populations with the perturbation
+                                # rule only (no e-prop)
+
+
 class DVMode(Enum):
     """Definition of the |dV| term."""
     RESET = auto()     # |PrevV - V| with PrevV stored before the reset: the reset jump (original code)
@@ -126,6 +135,9 @@ class HiddenRuleConfig:
     psi_target: float = 0.1
     eprop: float = 0.0               # e-prop learning signal: lambda-trace of eFiltered * (PG - eprop_value * VE)
     eprop_value: float = 0.1
+    eprop_scope: "EpropScope" = None     # None = EpropScope.ALL
+    backprop: float = 0.0            # c_B: TD error x lambda-trace of eFiltered * L, where L is the backward projection
+                                     # of the downstream hidden neurons' gradient scores through the forward weights
     local: Optional[LocalObjectives] = None
     fire_rate_gradient: bool = True  # e-prop-style firing-rate regulariser c_reg (F - F*) eFiltered
     kappa: bool = True               # multiply the score by 1 - Alpha^2
@@ -144,6 +156,13 @@ class HiddenRuleConfig:
                 raise ValueError("the exact estimator has no drift: use drift=0, homeostat=0")
             if self.noise is NoisePlacement.NODE:
                 raise ValueError("the exact estimator is implemented for weight noise only")
+        if self.eprop_scope is EpropScope.SIGNAL_RECIPIENTS and (
+                self.eprop == 0 or (self.drift == 0 and self.gradient == 0)):
+            raise ValueError("eprop_scope=SIGNAL_RECIPIENTS splits the network between e-prop and the perturbation "
+                             "rule: it needs eprop != 0 and a drift or gradient part")
+        if self.backprop != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
+            raise ValueError("backprop propagates the trace estimator's gradient score: it needs noise and "
+                             "estimator=TRACE")
         if self.center_drift and self.drift == 0:
             raise ValueError("center_drift needs drift != 0")
 
@@ -166,6 +185,15 @@ PRESETS = {
     # e-prop (feedback learning signal, no noise) and its combination with the perturbation gradient
     "eprop": HiddenRuleConfig(noise=NoisePlacement.NONE, drift=0.0, gradient=0.0, eprop=1.0),
     "eprop_plus_gradient": HiddenRuleConfig(drift=0.0, gradient=1.0, eprop=1.0),
+    # backward propagation of the perturbation gradient through the forward weights (hidden -> hidden)
+    "proposed_backprop": HiddenRuleConfig(drift=1.0, gradient=1.0, backprop=1.0),
+    # symmetric e-prop where the readout gradient reaches (populations connected to the heads), the proposed rule
+    # with the homeostat (centred) everywhere else; compile with feedback_type="symmetric" and no explicit feedback
+    # connections, so that the forward readout weights are the only e-prop signal
+    "symmetric_hybrid": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=1.0, center_drift=True, eprop=1.0,
+                                         eprop_value=1.0, eprop_scope=EpropScope.SIGNAL_RECIPIENTS),
+    "proposed_homeostat_backprop": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=1.0, center_drift=True,
+                                                    backprop=1.0),
     "eprop_plus_drift": HiddenRuleConfig(drift=1.0, gradient=0.0, eprop=1.0),
     "eprop_plus_proposed": HiddenRuleConfig(drift=1.0, gradient=1.0, eprop=1.0),
     "eprop_plus_proposed_homeostat": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=5.0, eprop=1.0),
@@ -173,6 +201,30 @@ PRESETS = {
     # hidden layer learns only the firing-rate regulariser (the "baseline"; set f_target in the compiler)
     "baseline": HiddenRuleConfig(noise=NoisePlacement.NONE, drift=0.0, gradient=0.0),
 }
+
+
+def receives_eprop_signal(pop, policy_heads, value_head) -> bool:
+    """Whether a hidden population receives an e-prop learning signal: it has a connection (forward or feedback,
+    not the TD-error transport) to a policy or value head."""
+    heads = set(policy_heads or ()) | ({value_head} if value_head is not None else set())
+    for ref in pop.outgoing_connections:
+        conn = ref()
+        if conn is None or conn.target() not in heads:
+            continue
+        if conn.is_feedback and not (conn.name.endswith("policy_feedback") or conn.name.endswith("value_feedback")):
+            continue
+        return True
+    return False
+
+
+def rule_for_population(rule: HiddenRuleConfig, pop, policy_heads, value_head) -> HiddenRuleConfig:
+    """The rule used by the synapses targeting `pop` (EpropScope.SIGNAL_RECIPIENTS splits the network)."""
+    if rule.eprop_scope is not EpropScope.SIGNAL_RECIPIENTS:
+        return rule
+    if receives_eprop_signal(pop, policy_heads, value_head):
+        return replace(rule, noise=NoisePlacement.NONE, drift=0.0, gradient=0.0, homeostat=0.0,
+                       center_drift=False, backprop=0.0, local=None, eprop_scope=None)
+    return replace(rule, eprop=0.0, eprop_scope=None)
 
 
 def get_hidden_rule(rule) -> HiddenRuleConfig:
@@ -187,7 +239,8 @@ def get_hidden_rule(rule) -> HiddenRuleConfig:
         raise ValueError(f"unknown hidden rule preset '{rule}'; available: {sorted(PRESETS)}")
 
 
-_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "dv_mode": DVMode}
+_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "dv_mode": DVMode,
+                "eprop_scope": EpropScope}
 
 
 def _from_plain(cls, d):

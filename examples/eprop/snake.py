@@ -979,12 +979,13 @@ def build_compiled_network(connectivity_type="fixed"):
                 make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE, p=0.99999, sign=None),
                 exc_inh_sign=None
             )
-            Connection(
-                field, head,
-                FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
-                feedback_name=feedback_name,
-                exc_inh_sign=None
-            )
+            if HP["explicit_feedback"]:
+                Connection(
+                    field, head,
+                    FixedProbability(0.99999, Normal(sd=1.0 / np.sqrt(NUM_OUTPUT))),
+                    feedback_name=feedback_name,
+                    exc_inh_sign=None
+                )
            
         # for pop in ei_layers[-1].populations():
         #     Connection(
@@ -1008,7 +1009,7 @@ def build_compiled_network(connectivity_type="fixed"):
             Connection(field, value, Dense(weight=1.0), feedback_name="tde_transport")
 
         # policy/value feedback from EI layers
-        for layer in ei_layers:
+        for layer in (ei_layers if HP["explicit_feedback"] else []):
             for pop in layer.populations():
                 Connection(
                     pop, policy,
