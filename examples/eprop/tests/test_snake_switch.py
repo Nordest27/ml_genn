@@ -184,3 +184,61 @@ def test_old_entropy_key_is_rejected_for_snake(tmp_path, monkeypatch):
         snake_hparams.load()
     path.write_text(json.dumps({"entropy_bonus": 0.3}))
     assert snake_hparams.load()["entropy_bonus"] == 0.3
+
+
+class AppleSnake:
+    """Fake board: the apple is drawn in channel 2 of the observation; action 1 eats it (new apple appears)."""
+    inp_shape = (4, 4, 3)
+
+    def __init__(self, wait_inc=1):
+        self.wait_inc, self.wait_count, self.apples, self.n = wait_inc, 0, [(1, 1)], 0
+
+    def get_local_img_observation(self):
+        o = np.zeros(self.inp_shape)
+        for (y, x) in self.apples:
+            o[y, x, 2] = 1.0
+        return o
+
+    def reset(self):
+        self.apples = [(1, 1)]; self.wait_count = self.wait_inc
+        return self.get_local_img_observation()
+
+    def step(self, action):
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self.get_local_img_observation(), 0.0, False
+        self.wait_count = self.wait_inc
+        if action == 1:
+            self.n += 1; self.apples = [((self.n * 2) % 4, 3)]
+            return self.get_local_img_observation(), 1.0, False
+        return self.get_local_img_observation(), 0.0, False
+
+    def img(self, scale=1):
+        return np.full((4 * scale, 4 * scale, 3), 100, np.uint8)
+
+
+def test_apple_disappears_after_visible_moves_and_reappears_when_respawned():
+    env = S.MemoryEnv(AppleSnake(), visible_moves=2)
+    o = env.reset()
+    assert o[..., 2].sum() == 1                               # visible at spawn
+    seen = []
+    for _ in range(4):                                       # 2 env steps per move (wait_inc = 1)
+        env.step(0); o, r, d = env.step(0)
+        seen.append(o[..., 2].sum())
+    assert seen == [1, 0, 0, 0]                              # visible for 2 moves (spawn + 1), then hidden
+    assert env.env.apples                                    # still on the board
+    env.step(1); o, r, d = env.step(1)
+    assert r == 1.0 and o[..., 2].sum() == 1                 # eaten while hidden; the new apple is visible
+    frame = env.img(scale=2)
+    assert frame.shape == (20 + 8, 8 + 4 + 8, 3)
+
+
+def test_memory_and_switching_compose():
+    env = S.SwitchingEnv(S.MemoryEnv(AppleSnake(), visible_moves=1), mangles=("channels",), seed=0)
+    env.reset()
+    env._switch()
+    for _ in range(2):
+        env.step(0)
+    view = env.agent_view()
+    assert view.sum() == 0                                   # the apple is hidden, whatever the channel order
+    assert env.img(scale=2).shape[1] == 8 + 4 + 8            # one board, one agent view (no double panel)

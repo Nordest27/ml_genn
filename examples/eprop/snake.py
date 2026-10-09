@@ -931,7 +931,7 @@ def build_compiled_network(connectivity_type="fixed"):
         input_pop = Population(PoissonInput(), INPUT_SHAPE)
 
         ei_layers = []
-        for i in range(1):  # increase to stack more layers
+        for i in range(HP["ei_layers"]):
             ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
 
         policy_field = Population(
@@ -1596,6 +1596,8 @@ def train_snake_agent_with_ipc(episodes=10000,
     opt_updt = 0
     with compiled_net:
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
+        if HP["memory"]:
+            env = snake_switch.MemoryEnv(env, **HP["memory"])
         if HP["switch"]:
             env = snake_switch.SwitchingEnv(env, **HP["switch"], wait_inc=WAIT_INC,
                                             log_path=f"outputs/{CSV_PREFIX}({REPETITION})_switches.csv")
@@ -1603,7 +1605,11 @@ def train_snake_agent_with_ipc(episodes=10000,
         if HP["monitor"]:
             alif = [p for p in compiled_net.neuron_populations
                     if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
-            labels = ["E", "I", "policy_field", "value_field"] if len(alif) == 4 else [p.name for p in alif]
+            n_layers = HP["ei_layers"]
+            labels = ([f"L{k + 1}_{x}" for k in range(n_layers) for x in ("E", "I")] + ["policy_field", "value_field"]
+                      if len(alif) == 2 * n_layers + 2 else [p.name for p in alif])
+            if n_layers == 1 and len(alif) == 4:
+                labels = ["E", "I", "policy_field", "value_field"]
             monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
                                                  f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
                                                  report_every=HP["monitor_every"])

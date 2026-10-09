@@ -188,3 +188,40 @@ CPU_NODE_BACKPROP_VARIANTS = [
 ]
 STUDIES["cpu_node_backprop"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                                 "space": {"*": ("choice", CPU_NODE_BACKPROP_VARIANTS)}}
+
+# CPU switch: e-prop provides the gradient, the perturbation parts act as regulators. Which addition helps?
+_RAND = {}                                               # random feedback (snake default), fixed
+CPU_COMBO_SWITCH_VARIANTS = [
+    {"_meta": {"variant": "adaptive"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE},
+    {"_meta": {"variant": "adaptive+homeo1"},
+     "hidden_rule": {"preset": "eprop_plus_homeostat", "homeostat": 1.0}, **_ADAPTIVE},
+    {"_meta": {"variant": "adaptive+all0.1"},            # the GPU run: drift, gradient and homeostat at 0.1, centred
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.1, "homeostat": 0.1,
+                     "center_drift": True}, **_ADAPTIVE},
+    {"_meta": {"variant": "adaptive+dg0.1+homeo1"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.1, "homeostat": 1.0,
+                     "center_drift": True}, **_ADAPTIVE},
+    {"_meta": {"variant": "random"}, "hidden_rule": {"preset": "eprop"}, **_RAND},
+    {"_meta": {"variant": "random+dg0.1+homeo1"},
+     "hidden_rule": {"preset": "eprop_plus_proposed_homeostat", "drift": 0.1, "gradient": 0.1, "homeostat": 1.0,
+                     "center_drift": True}, **_RAND},
+]
+STUDIES["cpu_combo_switch"] = {
+    "base": {**CPU_SMALL, "switch": {"criterion": -0.08, "window": 5000, "mangles": ["channels", "actions"]},
+             "monitor": True, "monitor_every": 5000},
+    "grid": True, "rungs": [6e6], "seeds": [2], "keep": 1.0,
+    "space": {"*": ("choice", CPU_COMBO_SWITCH_VARIANTS)}}
+
+# CPU memory: disappearing apple (visible for 2 moves after it spawns). Compare with cpu_compare (fully visible).
+CPU_MEMORY_RULES = [
+    {"_meta": {"variant": "random_eprop"}, "hidden_rule": {"preset": "eprop"}},
+    {"_meta": {"variant": "adaptive_eprop"}, "hidden_rule": {"preset": "eprop"}, **_ADAPTIVE},
+    {"_meta": {"variant": "proposed"}, "hidden_rule": {"preset": "proposed"}},
+    {"_meta": {"variant": "prop_homeo_c"},
+     "hidden_rule": {"preset": "proposed_homeostat", "homeostat": 1.0, "center_drift": True}},
+]
+STUDIES["cpu_memory"] = {"base": {**CPU_SMALL, "memory": {"visible_moves": 2}}, "grid": True, "rungs": [3e6],
+                         "seeds": [2], "keep": 1.0, "space": {"*": ("choice", CPU_MEMORY_RULES)}}
+# CPU depth: 1-3 stacked EI layers, fully visible task
+STUDIES["cpu_depth"] = {"base": CPU_SMALL, "grid": True, "rungs": [3e6], "seeds": [2], "keep": 1.0,
+                        "space": {"*": ("choice", CPU_MEMORY_RULES), "ei_layers": ("choice", [2, 3])}}

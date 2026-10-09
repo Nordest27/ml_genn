@@ -93,7 +93,7 @@ class SwitchingEnv:
     def img(self, scale=10):
         """Frame for the viewers: the real board, what the agent sees, and the current task in a header."""
         import cv2
-        board = self.env.img(scale=scale)
+        board = (self.env.board_img if hasattr(self.env, "board_img") else self.env.img)(scale=scale)
         h = board.shape[0]
         view = cv2.resize(self.agent_view(), (h, h), interpolation=cv2.INTER_NEAREST)
         sep = np.full((h, 4, 3), 255, np.uint8)
@@ -144,6 +144,76 @@ class SwitchingEnv:
             with open(self.log_path, "a", newline="") as f:
                 csv.writer(f).writerow([self.switches, self.moves, since, " ".join(map(str, self.chan)),
                                         " ".join(map(str, self.act)), "".join("1" if x else "0" for x in self.flip)])
+
+
+class MemoryEnv:
+    """Snake with a disappearing apple: a new apple is visible to the agent for `visible_moves` moves, then it is
+    removed from the agent's observation (it stays on the board and can still be eaten). The view is centred on the
+    head, so the agent has to remember where the apple was and track how its own moves shift it. Fewer visible moves
+    = more memory needed. Composes with SwitchingEnv (wrap this one first)."""
+
+    def __init__(self, env, visible_moves=3):
+        self.env, self.visible_moves = env, int(visible_moves)
+        self.moves_since_spawn = 0
+        self._apples = list(env.apples)
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def __setattr__(self, name, value):
+        if name in ("wait_count",):
+            setattr(self.env, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    @property
+    def hidden(self):
+        return self.moves_since_spawn >= self.visible_moves
+
+    def get_local_img_observation(self):
+        if not self.hidden:
+            return self.env.get_local_img_observation()
+        saved = self.env.apples
+        self.env.apples = []
+        try:
+            return self.env.get_local_img_observation()
+        finally:
+            self.env.apples = saved
+
+    def _track(self, moved):
+        if list(self.env.apples) != self._apples:           # new apple (eaten and respawned, or reset)
+            self._apples = list(self.env.apples)
+            self.moves_since_spawn = 0
+        elif moved:
+            self.moves_since_spawn += 1
+
+    def reset(self):
+        self.env.reset()
+        self._apples = None
+        self._track(False)
+        return self.get_local_img_observation()
+
+    def step(self, action):
+        moving = self.env.wait_count == 0
+        _, reward, done = self.env.step(action)
+        self._track(moving)
+        return self.get_local_img_observation(), reward, done
+
+    def board_img(self, scale=10):
+        return self.env.img(scale=scale)
+
+    def img(self, scale=10):
+        """The real board (apple drawn), what the agent sees, and whether the apple is hidden."""
+        import cv2
+        board = self.env.img(scale=scale)
+        h = board.shape[0]
+        view = cv2.resize((np.clip(self.get_local_img_observation(), 0, 1) * 255).astype(np.uint8), (h, h),
+                          interpolation=cv2.INTER_NEAREST)
+        frame = np.concatenate([board, np.full((h, 4, 3), 255, np.uint8), view], axis=1)
+        header = np.zeros((20, frame.shape[1], 3), np.uint8)
+        cv2.putText(header, f"apple {'hidden' if self.hidden else 'visible'} ({self.moves_since_spawn} moves)",
+                    (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        return np.concatenate([header, frame], axis=0)
 
 
 def pseudo_derivative(v, a, beta, v_thresh, refrac):

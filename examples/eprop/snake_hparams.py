@@ -45,6 +45,8 @@ DEFAULTS = {
     "reward_decay_env": 0.1,
     # task and architecture
     "board_size": 5,             # larger boards are harder (the view stays visible_range = 5)
+    "ei_layers": 1,              # stacked EI layers between the input and the fields (depth)
+    "memory": None,              # disappearing apple, e.g. {"visible_moves": 3} (snake_switch.MemoryEnv)
     "hid_e": 20,
     "hid_i": 15,
     "fan_in": 300,
