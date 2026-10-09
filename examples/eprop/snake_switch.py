@@ -161,6 +161,7 @@ class NeuronMonitor:
         self.log_path = log_path
         self.psi_sum = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
         self.spikes = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
+        self.vloss = [0.0 for _ in self.pops]
         self.prev_spike_count = [None] * len(self.pops)
         self.samples, self.moves = 0, 0
         self.prev_dead = [None] * len(self.pops)
@@ -168,7 +169,7 @@ class NeuronMonitor:
         cols = ["timestep", "moves", "switch"]
         for l in self.labels:
             cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
-                     f"{l}_recovered"]
+                     f"{l}_recovered", f"{l}_vloss"]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
 
@@ -185,6 +186,9 @@ class NeuronMonitor:
         for i, p in enumerate(self.pops):
             v, a, refrac = self._vars(p, ("V", "A", "RefracTime"))
             self.psi_sum[i] += pseudo_derivative(v, a, p.neuron.beta, p.neuron.v_thresh, refrac)
+            # the voltage-regularisation loss snake.py logs for the first core population, here per population
+            thr = p.neuron.v_thresh + p.neuron.beta * a
+            self.vloss[i] += float(np.mean(np.maximum(v - thr, 0.0) + np.maximum(-v - thr, 0.0)))
             # a neuron fired since the last sample if it is (or was recently) refractory
             self.spikes[i] += refrac > 0
         self.samples += 1
@@ -203,7 +207,9 @@ class NeuronMonitor:
             silent = dead & (hz < self.silent_hz)
             rec = (float(np.mean(~dead[self.prev_dead[i]])) if self.prev_dead[i] is not None
                    and self.prev_dead[i].any() else float("nan"))
-            row += [dead.mean(), silent.mean(), (dead & ~silent).mean(), psi.mean(), hz.mean(), rec]
+            row += [dead.mean(), silent.mean(), (dead & ~silent).mean(), psi.mean(), hz.mean(), rec,
+                    self.vloss[i] / max(self.samples, 1)]
+            self.vloss[i] = 0.0
             self.prev_dead[i] = dead
             self.psi_sum[i][:] = 0
             self.spikes[i][:] = 0

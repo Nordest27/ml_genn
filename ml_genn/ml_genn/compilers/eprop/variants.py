@@ -136,6 +136,11 @@ class HiddenRuleConfig:
     eprop: float = 0.0               # e-prop learning signal: lambda-trace of eFiltered * (PG - eprop_value * VE)
     eprop_value: float = 0.1
     eprop_scope: "EpropScope" = None     # None = EpropScope.ALL
+    diagnose_gradients: bool = False     # diagnostic: synapses with an e-prop term (and noise) also accumulate
+                                         # AccE = sum delta * e-prop trace, AccG = sum delta * gradient-part trace
+                                         # (gate -PsiBar) and AccG1 (gate -1), without using G or G1 to learn
+    recipient_homeostat: bool = False    # SIGNAL_RECIPIENTS: the e-prop populations keep the noise and the homeostat
+                                         # (keeps them alive; their learning signal stays e-prop only)
     backprop: float = 0.0            # c_B: TD error x lambda-trace of eFiltered * L, where L is the backward projection
                                      # of the downstream hidden neurons' gradient scores through the forward weights
     local: Optional[LocalObjectives] = None
@@ -192,6 +197,9 @@ PRESETS = {
     # connections, so that the forward readout weights are the only e-prop signal
     "symmetric_hybrid": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=1.0, center_drift=True, eprop=1.0,
                                          eprop_value=1.0, eprop_scope=EpropScope.SIGNAL_RECIPIENTS),
+    "symmetric_hybrid_homeostat": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=1.0, center_drift=True,
+                                                   eprop=1.0, eprop_value=1.0, recipient_homeostat=True,
+                                                   eprop_scope=EpropScope.SIGNAL_RECIPIENTS),
     "proposed_homeostat_backprop": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=1.0, center_drift=True,
                                                     backprop=1.0),
     "eprop_plus_drift": HiddenRuleConfig(drift=1.0, gradient=0.0, eprop=1.0),
@@ -222,9 +230,15 @@ def rule_for_population(rule: HiddenRuleConfig, pop, policy_heads, value_head) -
     if rule.eprop_scope is not EpropScope.SIGNAL_RECIPIENTS:
         return rule
     if receives_eprop_signal(pop, policy_heads, value_head):
+        if rule.diagnose_gradients:       # keep the noise so that both estimators can be compared
+            return replace(rule, drift=0.0, gradient=0.0, homeostat=0.0, center_drift=False, backprop=0.0,
+                           local=None, eprop_scope=None, recipient_homeostat=False)
+        if rule.recipient_homeostat and rule.homeostat != 0:
+            return replace(rule, drift=0.0, gradient=0.0, center_drift=False, backprop=0.0, local=None,
+                           eprop_scope=None, recipient_homeostat=False)
         return replace(rule, noise=NoisePlacement.NONE, drift=0.0, gradient=0.0, homeostat=0.0,
-                       center_drift=False, backprop=0.0, local=None, eprop_scope=None)
-    return replace(rule, eprop=0.0, eprop_scope=None)
+                       center_drift=False, backprop=0.0, local=None, eprop_scope=None, recipient_homeostat=False)
+    return replace(rule, eprop=0.0, eprop_scope=None, diagnose_gradients=False)
 
 
 def get_hidden_rule(rule) -> HiddenRuleConfig:

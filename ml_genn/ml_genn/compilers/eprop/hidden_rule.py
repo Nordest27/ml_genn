@@ -72,6 +72,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     exact = cfg.estimator is Estimator.EXACT
     local = cfg.local
     route = local.route if local is not None else None
+    diag = cfg.diagnose_gradients and cfg.eprop != 0 and cfg.noise is not NoisePlacement.NONE and not exact
 
     # --- which traces ---------------------------------------------------------------------------
     # A single combined trace suffices when drift and gradient share the TD-error modulator and no
@@ -81,7 +82,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     use_P = needs_split and (cfg.drift != 0 or cfg.homeostat != 0)
     use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE)
     use_combined = (not needs_split) and (cfg.drift != 0 or cfg.gradient != 0)
-    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back
+    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back or diag
                    or (use_combined and cfg.drift + cfg.gradient != 0)
                    or (route is LocalRoute.GRADIENT_INSTANT and not exact))
     use_eprop = cfg.eprop != 0
@@ -132,7 +133,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     if exact:
         vars_.append(("FreshEps", "scalar")); var_vals["FreshEps"] = 0.0
     for name, used in (("RLNoiseTrace", use_combined), ("RLNoisePtrace", use_P),
-                       ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop)):
+                       ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop),
+                       ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
 
@@ -231,6 +233,8 @@ else {
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
     if use_backprop:
         dg.append(_scaled(cfg.backprop, "reward * RLBackTrace"))
+    if diag:   # same timing as the learning terms: accumulate with the traces before this step's update
+        syn.append("AccE += reward * RLTrace;\nAccG += reward * DiagGtrace;\nAccG1 += reward * DiagG1trace;")
     if route is LocalRoute.WHOLE_TRACE:
         # original implementation: local rewards computed here (after the reset) on the whole trace
         whole = ("RLNoiseTrace" if use_combined else
@@ -277,6 +281,9 @@ else {
         syn.append(f"RLTrace = Lambda * RLTrace + eFiltered * (PG_post - {_f(cfg.eprop_value)} * VE_post);")
     if use_backprop:
         syn.append("RLBackTrace = Lambda * RLBackTrace + eFiltered * Back_post;")
+    if diag:
+        syn.append(f"DiagGtrace = Lambda * DiagGtrace - PsiBar * {pre} * normXi;")
+        syn.append(f"DiagG1trace = Lambda * DiagG1trace - {pre} * normXi;")
     if weight_noise and not exact:
         syn.append("NoiseTrace *= Alpha;")
 

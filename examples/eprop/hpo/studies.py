@@ -179,3 +179,12 @@ CPU_HYBRID_VARIANTS = [
 ]
 STUDIES["cpu_hybrid"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                          "space": {"*": ("choice", CPU_HYBRID_VARIANTS)}}
+
+# CPU: backprop with node noise (each neuron sends its full membrane-noise score, not one synapse's share)
+CPU_NODE_BACKPROP_VARIANTS = [
+    {"_meta": {"variant": "node_proposed"}, "hidden_rule": {"preset": "node_proposed"}},
+    {"_meta": {"variant": "node+backprop1"}, "hidden_rule": {"preset": "node_proposed", "backprop": 1.0}},
+    {"_meta": {"variant": "node+backprop0.3"}, "hidden_rule": {"preset": "node_proposed", "backprop": 0.3}},
+]
+STUDIES["cpu_node_backprop"] = {"base": CPU_SMALL, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                "space": {"*": ("choice", CPU_NODE_BACKPROP_VARIANTS)}}

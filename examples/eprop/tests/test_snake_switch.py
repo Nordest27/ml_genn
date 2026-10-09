@@ -117,6 +117,8 @@ def test_monitor_classifies_dead_neurons(tmp_path):
     assert float(rows[0]["h_dead"]) == pytest.approx(2 / 3, abs=1e-3)
     assert float(rows[0]["h_dead_silent"]) == pytest.approx(1 / 3, abs=1e-3)
     assert float(rows[0]["h_dead_firing"]) == pytest.approx(1 / 3, abs=1e-3)
+    # voltage loss: neuron 2 sits at 5.0, i.e. 5.0 - 0.61 above threshold; the others inside the band
+    assert float(rows[0]["h_vloss"]) == pytest.approx((5.0 - vth) / 3, abs=1e-3)
 
 
 def test_frame_shows_agent_view_and_probs_use_real_directions():

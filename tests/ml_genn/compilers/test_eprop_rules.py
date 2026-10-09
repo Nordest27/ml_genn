@@ -124,7 +124,7 @@ def compiled_hidden_name(compiled):
 
 @pytest.mark.parametrize("preset", sorted(PRESETS))
 def test_presets_compile_and_train(preset, request):
-    if preset == "symmetric_hybrid":
+    if preset.startswith("symmetric_hybrid"):
         pytest.skip("needs a core/field network: test_symmetric_hybrid_splits_the_network")
     compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name.replace("[", "_").replace("]", ""),
                                             PolicyType.GENERIC, hidden_rule=preset,
@@ -343,3 +343,17 @@ def test_symmetric_hybrid_splits_the_network(request):
     for key in ("core", "pf", "vf"):
         assert np.all(np.isfinite(seen["end"][key])) and np.any(seen["end"][key] != seen["start"][key]), key
     assert np.any(seen["end"]["VE"] != 0)                     # the value field receives B^V through the readout
+
+
+def test_symmetric_hybrid_homeostat_keeps_fields_alive_with_eprop_signal():
+    from ml_genn.compilers.eprop import rule_for_population
+    net, inp, core, pf, vf, pol, val = _hybrid_network()
+    rule = PRESETS["symmetric_hybrid_homeostat"]
+    field = rule_for_population(rule, pf, {pol: None}, val)
+    assert field.eprop == 1 and field.drift == 0 and field.gradient == 0 and field.homeostat == 1
+    assert field.noise is NoisePlacement.WEIGHT_SHARED                      # the homeostat needs the noise trace
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    code = build_td_hidden_model(field, **kw)["model"]["synapse_dynamics_code"]
+    assert "RLTrace" in code and "AbsTd * (PsiBar" in code and "RLNoiseGtrace" not in code
+    core_rule = rule_for_population(rule, core, {pol: None}, val)
+    assert core_rule.eprop == 0 and core_rule.drift == 1 and core_rule.homeostat == 1
