@@ -319,3 +319,39 @@ STUDIES["cpu_depth3"] = {"base": {**_DEPTH_BASE, "ei_layers": 3, "network": _NET
 STUDIES["cpu_depth1_ref"] = {"base": {**_DEPTH_BASE, "ei_layers": 1, "network": _NET1}, "grid": True, "rungs": [2e6],
                              "seeds": [2], "keep": 1.0,
                              "space": {"*": ("choice", [_DEPTH_RULES[i] for i in (0, 4, 6, 8)])}}
+
+# CPU: does the proposed rule still compress the representation with local / small-world connectivity?
+# (compare with cpu_features: same small network and length, legacy connectivity). Local mode defaults: excitatory-only
+# feedforward, field_gain 0.25. On the 6x6 grid sigma 1.75 cells already covers ~45% of a layer, so the medium
+# network (12/9, ~13%) is where local vs global differs.
+_CONN = {"local": {"toroidal": "local"},
+         "global": {"toroidal": "local", "local": {"p_global": 0.1}},
+         "global_med": {"toroidal": "local", "local": {"p_global": 0.03}},
+         "legacy": {"toroidal": "legacy"}}
+
+
+def _rule_x_conn(rules, conns):
+    return [{**r, **_CONN[c], "_meta": {"variant": f"{r['_meta']['variant']}|{c.split('_')[0]}"}}
+            for c in conns for r in rules]
+
+
+STUDIES["cpu_features_local"] = {"base": {**CPU_SMALL, "probe": {"moves": 5000}, "monitor": True,
+                                          "monitor_every": 20000},
+                                 "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                 "space": {"*": ("choice", _rule_x_conn(CPU_FEATURE_RULES, ["local", "global"]))}}
+STUDIES["cpu_features_local_med"] = {"base": {**CPU_SMALL, "hid_e": 12, "hid_i": 9, "probe": {"moves": 5000},
+                                              "monitor": True, "monitor_every": 20000},
+                                     "grid": True, "rungs": [2e6], "seeds": [1], "keep": 1.0,
+                                     "space": {"*": ("choice", _rule_x_conn([CPU_FEATURE_RULES[i] for i in (2, 3)],
+                                                                            ["legacy", "local", "global_med"]))}}
+
+# The two studies above are superseded (too slow, and on the small network the local rule pooled ~2/3 of the input into
+# every first-layer neuron). Small network with locality scaled to the grid: sigma 1 cell (~17% of a 6x6 layer), the
+# input sampled (sigma in input cells, fan-in ~118), p_global 0.1 = ~10 long-range inputs on top of ~18 local ones.
+_SMALL_LOCAL = {"sigma_cells": 1.0, "input_sigma_ref": "source"}
+_CONN["local_s"] = {"toroidal": "local", "local": _SMALL_LOCAL}
+_CONN["global_s"] = {"toroidal": "local", "local": {**_SMALL_LOCAL, "p_global": 0.1}}
+STUDIES["cpu_features_small"] = {"base": {**CPU_SMALL, "probe": {"moves": 5000}, "monitor": True,
+                                          "monitor_every": 20000},
+                                 "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                 "space": {"*": ("choice", _rule_x_conn(CPU_FEATURE_RULES, ["local_s", "global_s"]))}}

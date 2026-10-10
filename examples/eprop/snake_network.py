@@ -44,8 +44,14 @@ class ConnSpec:
                                      # weights are scaled by the expected fan-in
     sigma_cells: Optional[float] = None     # ... sigma in cells (None: sigma * grid side)
     sigma_ref: str = "coarser"       # ... cells of the coarser of the two grids (big -> small: pooling, every source
-                                     # used) or "source" (big -> small: subsampling)
+                                     # used), "source" (big -> small: subsampling) or "sheet" (cells of the layers'
+                                     # sheets = their E grids: the coarser sheet sets the neighbourhood, E and I of a
+                                     # layer cover the same area, a sparser I population contributes fewer inputs)
     p_global: float = 0.0            # ... plus this probability for every pair: random long-range connections
+    mean_norm: str = "sqrt"          # ... mean weight mean_scale / sqrt(K) ("sqrt": total mean input grows as sqrt(K),
+                                     # so pooling connections over-drive their targets) or mean_scale * sqrt(K_ref) / K
+                                     # ("mean_field": total mean input independent of K; K_ref = the fan-in of the same
+                                     # connection between equal-size grids, so equal-size connections are unchanged)
 
 
 @dataclass
@@ -140,7 +146,8 @@ def legacy_fan_in(src_shape, tgt_shape, sigma, fan_in, same):
     return _LEGACY_FAN_IN[key]
 
 
-def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_shape=None, same=False):
+def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_shape=None, same=False,
+                 src_sheet=None, tgt_sheet=None):
     """The connectivity object of one connection (same weight scaling as snake.py's make_connectivity)."""
     mean_scale, sd_scale = conn.mean_scale, conn.sd_scale
     if conn.type == "fixed":
@@ -161,13 +168,26 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
     if conn.p_max is not None:
         if tgt_shape is None:
             raise ValueError("p_max connectivity needs the target shape")
-        kw = dict(sigma=sig, fan_in=0, p_max=conn.p_max, sigma_cells=conn.sigma_cells, sigma_ref=conn.sigma_ref,
+        sigma_cells, sigma_ref = conn.sigma_cells, conn.sigma_ref
+        if conn.sigma_ref == "sheet" and sigma_cells is not None:
+            # sigma in cells of the sheets (a layer's E grid), on the coarser of the two sheets; every population samples
+            # that neighbourhood at its own density (an I population sparser than its sheet gets fewer inputs)
+            src_sheet, tgt_sheet = src_sheet or src_shape, tgt_sheet or tgt_shape
+            sheet_sigma = sigma_cells * max(1.0, src_sheet[0] / tgt_sheet[0])
+            sigma_cells, sigma_ref = sheet_sigma * src_shape[0] / src_sheet[0], "source"
+        kw = dict(sigma=sig, fan_in=0, p_max=conn.p_max, sigma_cells=sigma_cells, sigma_ref=sigma_ref,
                   p_global=conn.p_global)
+        probe = ToroidalGaussian2D(weight=0.0, **kw)
         w_fan = conn.weight_fan_in
         if w_fan is None:
-            w_fan = max(1.0, ToroidalGaussian2D(weight=0.0, **kw).expected_fan_in(src_shape, tgt_shape))
-        return ToroidalGaussian2D(weight=Normal(mean=(sign or 0) * mean_scale / np.sqrt(w_fan),
-                                                sd=sd_scale / np.sqrt(w_fan)), **kw)
+            w_fan = max(1.0, probe.expected_fan_in(src_shape, tgt_shape))
+        mean = mean_scale / np.sqrt(w_fan)
+        if conn.mean_norm == "mean_field":
+            k_ref = max(1.0, probe.expected_fan_in(src_shape, src_shape[:2]))
+            mean = mean_scale * np.sqrt(k_ref) / w_fan
+        elif conn.mean_norm != "sqrt":
+            raise ValueError(f"mean_norm must be 'sqrt' or 'mean_field', not {conn.mean_norm!r}")
+        return ToroidalGaussian2D(weight=Normal(mean=(sign or 0) * mean, sd=sd_scale / np.sqrt(w_fan)), **kw)
     w_fan = conn.weight_fan_in if conn.weight_fan_in is not None else fan
     sample_fan, exact = fan, conn.exact
     if conn.match_legacy:
@@ -196,7 +216,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
                 Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
-                                                   same=pre is post), exc_inh_sign=sign)
+                                                   same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
+                           exc_inh_sign=sign)
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
@@ -218,7 +239,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         first = spec.layers[0]
         for target in layers[0]:
             Connection(inp, target, connectivity(spec.input, spec.input_shape, +1, first.fan_in_e, first.sigma,
-                                                 tgt_shape=target.shape), exc_inh_sign=+1)
+                                                 tgt_shape=target.shape, tgt_sheet=first.e_shape), exc_inh_sign=+1)
         # layer k -> layer k+1
         for k in range(len(layers) - 1):
             ls = spec.layers[k]
@@ -227,7 +248,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 if conn.type == "none":
                     continue
                 for target in layers[k + 1]:
-                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape),
+                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape,
+                                                         src_sheet=ls.e_shape, tgt_sheet=spec.layers[k + 1].e_shape),
                                exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
         if fields is not None:
@@ -238,7 +260,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                          fs.conn_i or fs.conn)):
                     if conn.type == "none":
                         continue
-                    Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape),
+                    Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape,
+                                                      src_sheet=last_spec.e_shape, tgt_sheet=fs.shape),
                                exc_inh_sign=sign)
             for fld, head, name in ((fields[0], policy, "policy_feedback"), (fields[1], value, "value_feedback")):
                 Connection(fld, head, connectivity(ConnSpec(type="fixed", p=fs.readout_p), fs.shape, None),
@@ -309,8 +332,26 @@ def _merge(obj, d):
 # feedforward_inhibition False (default): projections between layers and into the fields come from the E populations
 # only (long-range projections excitatory, inhibition local, as in cortex). With inhibitory feedforward at x3 weight
 # and I rates >= E rates, every layer after the first and the fields start silent (legacy networks included).
+# ff_gain / field_gain: mean_scale of the excitatory projections between layers / into the fields (weights
+# gain / sqrt(fan-in); the recurrent connections keep 0.1). At 0.1 activity fades with depth (3 layers: L2 < 1 Hz, L3
+# and the fields silent); ff_gain 0.5-0.6 keeps every layer at ~10-15 Hz. The fields have no inhibitory population of
+# their own, so they need a lower gain (0.6 drives them to ~70 Hz).
+# sigma_ref "sheet" (default): sigma is in cells of the layers' sheets (their E grids). With "coarser" the 15x15 I
+# population pooled the 20x20 input and E layer as if it were a coarser layer: ~1.5x the excitatory drive of legacy,
+# I at ~30 Hz holding E at ~12 Hz (legacy E ~ I ~ 30 Hz); with sheet-referenced sigma E ~ I ~ 20 Hz.
+# input_sigma_ref "source": the input projection samples the input (sigma in input cells) instead of pooling it; a
+# 6x6 layer under a 20x20 input otherwise reads ~2/3 of the whole input per neuron (fan-in ~770).
+# weight_fan_in: scale every weight by 1/sqrt(weight_fan_in) instead of the expected fan-in. 300 = the legacy weight
+# scale (legacy scaled by the requested 300 but realised 45-147 inputs: ~2.3x weaker synapses than "local", with the
+# fixed-size weight noise correspondingly larger relative to the weights).
+# mean_norm "mean_field": each neuron's total mean input does not depend on its fan-in. Not the default: with "sqrt"
+# pooling connections over-drive their targets (a 20 -> 8 input puts an 8x8 layer at ~40 Hz), but the E/I balance of
+# the standard 20/15 layers relies on it (E 20x20 -> I 15x15 pools); "mean_field" weakens I and every layer runs hotter.
 LOCAL_DEFAULTS = {"p_max": 1.0, "sigma_cells": 1.75, "input_sigma_cells": 2.5, "p_max_decay": 1.0, "sigma_decay": 1.0,
-                  "p_global": 0.0, "feedforward_inhibition": False}
+                  "p_global": 0.0, "feedforward_inhibition": False, "ff_gain": 0.5,
+                  "field_gain": 0.25, "mean_norm": "sqrt",
+                  "input_sigma_ref": "coarser", "weight_fan_in": None,
+                  "sigma_ref": "sheet"}
 
 
 def spec_from_hparams(hp, input_shape, num_actions, channels=3):
@@ -329,12 +370,18 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         if unknown:
             raise KeyError(f"local: unknown keys {sorted(unknown)} (keys: {sorted(LOCAL_DEFAULTS)})")
 
-        def conn(k, **kw):        # connections into depth k (0: the first layer): p_max * p_max_decay^k
+        def conn(k, ff=False, **kw):   # connections into depth k (0: the first layer): p_max * p_max_decay^k
+            if ff:
+                kw["mean_scale"] = loc["field_gain" if ff == "field" else "ff_gain"]
             return ConnSpec(p_max=loc["p_max"] * loc["p_max_decay"] ** k,
-                            sigma_cells=loc["sigma_cells"] * loc["sigma_decay"] ** k, p_global=loc["p_global"], **kw)
-        input_conn = ConnSpec(p_max=loc["p_max"], sigma_cells=loc["input_sigma_cells"])
+                            sigma_cells=loc["sigma_cells"] * loc["sigma_decay"] ** k, p_global=loc["p_global"],
+                            mean_norm=loc["mean_norm"], weight_fan_in=loc["weight_fan_in"], sigma_ref=loc["sigma_ref"], **kw)
+        input_conn = ConnSpec(p_max=loc["p_max"], sigma_cells=loc["input_sigma_cells"], mean_norm=loc["mean_norm"],
+                              sigma_ref=loc["input_sigma_ref"], weight_fan_in=loc["weight_fan_in"])
+        if loc["input_sigma_ref"] == "coarser" and loc["sigma_ref"] == "sheet":
+            input_conn = replace(input_conn, sigma_ref="sheet")
     else:
-        def conn(k, **kw):
+        def conn(k, ff=False, **kw):
             return ConnSpec(exact=exact, match_legacy=matched, **kw)
         input_conn = ConnSpec(fan_in=hp["fan_in"], sigma=0.1, exact=exact, match_legacy=matched)
 
@@ -344,11 +391,11 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
 
     def base_layer(k):
         return LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
-                         fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), to_next=conn(k + 1),
+                         fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), to_next=conn(k + 1, ff=True),
                          to_next_i=ff_i)
     spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions, input=input_conn,
                        layers=[base_layer(k) for k in range(hp["ei_layers"])],
-                       fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], p=0.005),
+                       fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], ff="field", p=0.005),
                                         conn_i=ff_i),
                        explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"])
     net = dict(hp.get("network") or {})

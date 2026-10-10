@@ -109,3 +109,15 @@ def test_local_mode_expanding_and_contracting_stacks_use_every_source():
     assert any(c.source() is b.layers[0][1] and c.target() is b.layers[1][0] for c in b.network.connections)
     b = build(toroidal="local", ei_layers=2, network={"layers": [{"to_next_i": {"mean_scale": 0.03}}, {}]})
     assert any(c.source() is b.layers[0][1] and c.target() is b.layers[1][0] for c in b.network.connections)
+
+
+def test_sheet_sigma_keeps_e_and_i_of_a_layer_on_the_same_neighbourhood():
+    np.random.seed(0)
+    b = build(toroidal="local", hid_e=20, hid_i=15)
+    e, i = b.layers[0]
+    def fan(src, tgt):
+        c = next(c for c in b.network.connections if c.source() is src and c.target() is tgt).connectivity
+        return np.bincount(c.post_ind).mean()
+    assert fan(e, i) == pytest.approx(fan(e, e), rel=0.1)                 # I does not pool its own layer
+    assert fan(i, e) == pytest.approx(fan(e, e) * (15 / 20) ** 2, rel=0.15)  # sparser I: fewer inputs, same area
+    assert fan(b.input, i) == pytest.approx(fan(b.input, e), rel=0.1)
