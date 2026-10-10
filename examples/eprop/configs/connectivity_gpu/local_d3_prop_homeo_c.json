@@ -1,0 +1,14 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": {
+  "preset": "proposed_homeostat",
+  "homeostat": 1.0,
+  "center_drift": true
+ },
+ "toroidal": "local",
+ "ei_layers": 3
+}

@@ -54,9 +54,15 @@ DEFAULTS = {
     "hid_e": 20,
     "hid_i": 15,
     "fan_in": 300,
-    "toroidal": "exact",         # "legacy": original sampler (realised fan-in ~45-147 of the requested 300, uneven
-                                 # torus); "exact": the requested fan-in on a proper torus (2-7x more input per neuron
-                                 # with the same 1/sqrt(fan_in) weights: retune before comparing)
+    "toroidal": "exact",         # "legacy": original sampler (realised fan-in ~45-147 of the requested 300, local
+                                 # and sparse, uneven torus); "exact": the requested fan-in on a proper torus (at 300
+                                 # it must reach far into the Gaussian tails: dense, near-global, 2-7x more input);
+                                 # "matched": exact sampler with the legacy realised fan-in and weight scale (the
+                                 # legacy network's density and drive, without its sampling artefacts); "local":
+                                 # distance-dependent connectivity, fan-in a consequence of the neighbourhood
+    "local": None,               # "local" mode settings, e.g. {"sigma_cells": 1.75, "p_max": 1.0, "input_sigma_cells":
+                                 # 2.5, "p_max_decay": 1.0, "sigma_decay": 1.0} (defaults; decays < 1: descending fan-in
+                                 # with depth; snake_network.LOCAL_DEFAULTS)
     # snake_switch: performance-triggered task switches and the dead-neuron monitor (snake_switch.py)
     "switch": None,              # e.g. {"criterion": 0.08, "window": 20000, "mangles": ["channels", "actions"], "seed": 0}
     "monitor": False,            # log dead / silent / firing-dead hidden neurons per population

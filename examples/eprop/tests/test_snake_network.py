@@ -61,3 +61,51 @@ def test_inhibitory_feedforward_override():
     conn = next(c for c in b.network.connections if c.source() is i1 and c.target() is e2)
     assert conn.connectivity.weight.mean == pytest.approx(-3 * 0.033 / np.sqrt(50))
     assert conn.connectivity.exact is True                     # inherited from the layer's to_next settings
+
+
+def test_matched_mode_reproduces_legacy_density_and_weights():
+    np.random.seed(0)
+    legacy = build(toroidal="legacy", hid_e=8, hid_i=6)
+    np.random.seed(0)
+    matched = build(toroidal="matched", hid_e=8, hid_i=6)
+    def fan(b, src_pop, tgt_pop):
+        c = next(c for c in b.network.connections if c.source() is src_pop and c.target() is tgt_pop)
+        return np.bincount(c.connectivity.post_ind).mean(), c.connectivity.weight.mean, c.connectivity.exact
+    for k in (0, 1):                                    # E->E and I->E of the first layer
+        lf, lw, lex = fan(legacy, legacy.layers[0][k], legacy.layers[0][0])
+        mf, mw, mex = fan(matched, matched.layers[0][k], matched.layers[0][0])
+        assert abs(mf - lf) <= 1.0 and mw == pytest.approx(lw) and mex is True and lex is False
+    with pytest.raises(ValueError):
+        build(toroidal="uneven")
+
+
+def test_local_mode_descending_fan_in_and_expected_fan_in_weights():
+    np.random.seed(0)
+    b = build(toroidal="local", hid_e=10, hid_i=8, ei_layers=2, local={"p_max_decay": 0.5})
+    def conn(src, tgt):
+        return next(c for c in b.network.connections if c.source() is src and c.target() is tgt).connectivity
+    l1, l2 = conn(b.layers[0][0], b.layers[0][0]), conn(b.layers[1][0], b.layers[1][0])
+    f1, f2 = np.bincount(l1.post_ind).mean(), np.bincount(l2.post_ind).mean()
+    assert f2 == pytest.approx(f1 / 2, rel=0.15)                         # p_max halves at depth 1
+    assert l1.weight.mean == pytest.approx(0.1 / np.sqrt(l1.expected_fan_in((10, 10, 3), (10, 10, 3))))
+    assert conn(b.layers[0][0], b.layers[1][0]).p_max == pytest.approx(0.5)   # feedforward into depth 1
+    with pytest.raises(KeyError):
+        build(toroidal="local", local={"pmax": 1.0})
+
+
+def test_local_mode_expanding_and_contracting_stacks_use_every_source():
+    for sizes in ((6, 12, 20), (20, 10, 4)):
+        np.random.seed(0)
+        b = build(toroidal="local", ei_layers=3, network={"layers": [{"e": n} for n in sizes]})
+        for k in range(2):
+            src = b.layers[k][0]                                 # E: the only feedforward source by default
+            for tgt in b.layers[k + 1]:
+                c = next(c for c in b.network.connections if c.source() is src and c.target() is tgt).connectivity
+                out = np.bincount(c.pre_ind, minlength=int(np.prod(src.shape)))
+                assert np.all(out > 0), (sizes, k)
+            assert not any(c.source() is b.layers[k][1] and c.target() in b.layers[k + 1] for c in b.network.connections)
+    np.random.seed(0)                                            # inhibitory feedforward on request
+    b = build(toroidal="local", ei_layers=2, local={"feedforward_inhibition": True})
+    assert any(c.source() is b.layers[0][1] and c.target() is b.layers[1][0] for c in b.network.connections)
+    b = build(toroidal="local", ei_layers=2, network={"layers": [{"to_next_i": {"mean_scale": 0.03}}, {}]})
+    assert any(c.source() is b.layers[0][1] and c.target() is b.layers[1][0] for c in b.network.connections)

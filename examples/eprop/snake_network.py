@@ -28,13 +28,24 @@ Shape = Tuple[int, int, int]
 @dataclass
 class ConnSpec:
     """How one population connects to another (sign given by the source: E +1, I -1, readout None)."""
-    type: str = "toroidal"           # "toroidal" | "fixed"
+    type: str = "toroidal"           # "toroidal" | "fixed" | "none" (no connection; e.g. to_next_i, conn_i)
     fan_in: Optional[float] = None   # toroidal: requested fan-in (None: the layer's default)
     sigma: Optional[float] = None    # toroidal: Gaussian width in units of the grid (None: the layer's sigma)
     p: float = 0.01                  # fixed: connection probability
     mean_scale: float = 0.1          # weight mean = sign * mean_scale / sqrt(fan_in) (x3 for inhibitory, toroidal)
     sd_scale: float = 0.05           # weight s.d. = sd_scale / sqrt(fan_in)  (1 / sqrt(fan_in) without a sign)
     exact: bool = True               # toroidal sampler (ToroidalGaussian2D exact)
+    weight_fan_in: Optional[float] = None   # fan-in used for the 1/sqrt(fan_in) weight scale (None: the fan-in)
+    match_legacy: bool = False       # exact sampler with the fan-in the legacy sampler actually realised for this
+                                     # connection, weights scaled by the requested fan-in: the legacy network's
+                                     # density, locality and drive on an even torus without duplicates
+    p_max: Optional[float] = None    # distance-dependent connectivity: each pair connected with probability
+                                     # p_max * exp(-d^2 / 2 sigma^2); fan_in is then a consequence (ignored) and the
+                                     # weights are scaled by the expected fan-in
+    sigma_cells: Optional[float] = None     # ... sigma in cells (None: sigma * grid side)
+    sigma_ref: str = "coarser"       # ... cells of the coarser of the two grids (big -> small: pooling, every source
+                                     # used) or "source" (big -> small: subsampling)
+    p_global: float = 0.0            # ... plus this probability for every pair: random long-range connections
 
 
 @dataclass
@@ -105,7 +116,31 @@ class Built:
 
 
 # --------------------------------------------------------------------------------------------------------------
-def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None):
+_LEGACY_FAN_IN = {}
+
+
+def legacy_fan_in(src_shape, tgt_shape, sigma, fan_in, same):
+    """Mean fan-in the legacy sampler realises for this connection (estimated once, with the global numpy random
+    state saved and restored so that seeded network construction is unaffected)."""
+    import contextlib, io
+    from types import SimpleNamespace
+    key = (tuple(src_shape), tuple(tgt_shape), float(sigma), float(fan_in), bool(same))
+    if key not in _LEGACY_FAN_IN:
+        state = np.random.get_state()
+        try:
+            np.random.seed(12345)
+            c = ToroidalGaussian2D(sigma=sigma, fan_in=fan_in, weight=0.0, exact=False)
+            src = SimpleNamespace(shape=tuple(src_shape))
+            tgt = src if same else SimpleNamespace(shape=tuple(tgt_shape))
+            with contextlib.redirect_stdout(io.StringIO()):
+                c.connect(src, tgt)
+            _LEGACY_FAN_IN[key] = max(1, int(round(len(c.post_ind) / int(np.prod(tgt_shape)))))
+        finally:
+            np.random.set_state(state)
+    return _LEGACY_FAN_IN[key]
+
+
+def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_shape=None, same=False):
     """The connectivity object of one connection (same weight scaling as snake.py's make_connectivity)."""
     mean_scale, sd_scale = conn.mean_scale, conn.sd_scale
     if conn.type == "fixed":
@@ -123,9 +158,25 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None):
         mean_scale *= 3
     elif sign is None:
         sd_scale = 1.0
-    return ToroidalGaussian2D(sigma=sig, fan_in=fan, weight=Normal(mean=(sign or 0) * mean_scale / np.sqrt(fan),
-                                                                    sd=sd_scale / np.sqrt(fan)),
-                              exact=conn.exact)
+    if conn.p_max is not None:
+        if tgt_shape is None:
+            raise ValueError("p_max connectivity needs the target shape")
+        kw = dict(sigma=sig, fan_in=0, p_max=conn.p_max, sigma_cells=conn.sigma_cells, sigma_ref=conn.sigma_ref,
+                  p_global=conn.p_global)
+        w_fan = conn.weight_fan_in
+        if w_fan is None:
+            w_fan = max(1.0, ToroidalGaussian2D(weight=0.0, **kw).expected_fan_in(src_shape, tgt_shape))
+        return ToroidalGaussian2D(weight=Normal(mean=(sign or 0) * mean_scale / np.sqrt(w_fan),
+                                                sd=sd_scale / np.sqrt(w_fan)), **kw)
+    w_fan = conn.weight_fan_in if conn.weight_fan_in is not None else fan
+    sample_fan, exact = fan, conn.exact
+    if conn.match_legacy:
+        if tgt_shape is None:
+            raise ValueError("match_legacy needs the target shape")
+        sample_fan, exact = legacy_fan_in(src_shape, tgt_shape, sig, fan, same), True
+    return ToroidalGaussian2D(sigma=sig, fan_in=sample_fan, weight=Normal(mean=(sign or 0) * mean_scale / np.sqrt(w_fan),
+                                                                           sd=sd_scale / np.sqrt(w_fan)),
+                              exact=exact)
 
 
 def _alif(neuron: NeuronSpec, node_sigma):
@@ -144,7 +195,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             i = Population(_alif(ls.neuron, spec.node_sigma), ls.i_shape)
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
-                Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma), exc_inh_sign=sign)
+                Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
+                                                   same=pre is post), exc_inh_sign=sign)
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
@@ -165,15 +217,18 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         # input -> first layer (excitatory)
         first = spec.layers[0]
         for target in layers[0]:
-            Connection(inp, target, connectivity(spec.input, spec.input_shape, +1, first.fan_in_e, first.sigma),
-                       exc_inh_sign=+1)
+            Connection(inp, target, connectivity(spec.input, spec.input_shape, +1, first.fan_in_e, first.sigma,
+                                                 tgt_shape=target.shape), exc_inh_sign=+1)
         # layer k -> layer k+1
         for k in range(len(layers) - 1):
             ls = spec.layers[k]
             for src, src_shape, fan, sign, conn in ((layers[k][0], ls.e_shape, ls.fan_in_e, +1, ls.to_next),
                                                     (layers[k][1], ls.i_shape, ls.fan_in_i, -1, ls.to_next_i or ls.to_next)):
+                if conn.type == "none":
+                    continue
                 for target in layers[k + 1]:
-                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma), exc_inh_sign=sign)
+                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape),
+                               exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
         if fields is not None:
             fs = spec.fields
@@ -181,7 +236,10 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 for src, src_shape, fan, sign, conn in ((last[0], last_spec.e_shape, last_spec.fan_in_e, +1, fs.conn),
                                                         (last[1], last_spec.i_shape, last_spec.fan_in_i, -1,
                                                          fs.conn_i or fs.conn)):
-                    Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma), exc_inh_sign=sign)
+                    if conn.type == "none":
+                        continue
+                    Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape),
+                               exc_inh_sign=sign)
             for fld, head, name in ((fields[0], policy, "policy_feedback"), (fields[1], value, "value_feedback")):
                 Connection(fld, head, connectivity(ConnSpec(type="fixed", p=fs.readout_p), fs.shape, None),
                            exc_inh_sign=None)
@@ -230,12 +288,29 @@ def _merge(obj, d):
         if k not in names:
             raise KeyError(f"{type(obj).__name__} has no field '{k}' (fields: {sorted(names)})")
         cur = getattr(obj, k)
-        if cur is None and k == "to_next_i" and isinstance(v, dict):
+        off = cur is None or getattr(cur, "type", None) == "none"
+        if off and k == "to_next_i" and isinstance(v, dict) and v.get("type") != "none":
             cur = obj.to_next                   # inhibitory feedforward: start from the layer's to_next settings
-        if cur is None and k == "conn_i" and isinstance(v, dict):
+        if off and k == "conn_i" and isinstance(v, dict) and v.get("type") != "none":
             cur = obj.conn
         kw[k] = _merge(cur, v) if hasattr(cur, "__dataclass_fields__") and isinstance(v, dict) else v
     return replace(obj, **kw)
+
+
+# "toroidal": "local" -- distance-dependent connectivity: each pair connected with probability
+# p_max * exp(-d^2 / 2 sigma^2), d in cells of the source grid. sigma_cells 1.75 with p_max 1 (every source in a ~2-cell
+# neighbourhood) reproduces the realised statistics of the legacy network (45-75 inputs at a median ~2 cells; the
+# legacy input projection was wider, ~2.5 cells). Connections into depth k use p_max * p_max_decay^k and
+# sigma_cells * sigma_decay^k (k = 0 the first layer, the fields at depth ei_layers): decays < 1 = fan-in descending
+# with depth. Weights are scaled by the expected fan-in. Between layers of different sizes sigma is measured in cells of
+# the coarser grid (ConnSpec.sigma_ref): big -> small pools (fan-in grows with the size ratio; lower that connection's
+# p_max for sparse pooling), small -> big upsamples (neighbouring targets share most inputs). p_global adds random
+# long-range connections between hidden layers (not the input projection): a small-world graph.
+# feedforward_inhibition False (default): projections between layers and into the fields come from the E populations
+# only (long-range projections excitatory, inhibition local, as in cortex). With inhibitory feedforward at x3 weight
+# and I rates >= E rates, every layer after the first and the fields start silent (legacy networks included).
+LOCAL_DEFAULTS = {"p_max": 1.0, "sigma_cells": 1.75, "input_sigma_cells": 2.5, "p_max_decay": 1.0, "sigma_decay": 1.0,
+                  "p_global": 0.0, "feedforward_inhibition": False}
 
 
 def spec_from_hparams(hp, input_shape, num_actions, channels=3):
@@ -243,19 +318,43 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
 
     Layer shortcuts in "network": {"layers": [{"e": 30, "i": 20, "rule": ...}, ...]} (sizes as ints) or full LayerSpec
     fields; "fields": null removes the fields; {"fields": {"shape": 6}} resizes them."""
-    exact = hp.get("toroidal", "exact") == "exact"
-    base_layer = LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
-                           fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"],
-                           internal=ConnSpec(exact=exact), to_next=ConnSpec(exact=exact))
-    spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions,
-                       input=ConnSpec(fan_in=hp["fan_in"], sigma=0.1, exact=exact),
-                       layers=[base_layer for _ in range(hp["ei_layers"])],
-                       fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=ConnSpec(p=0.005, exact=exact)),
+    mode = hp.get("toroidal", "exact")
+    if mode not in ("exact", "legacy", "matched", "local"):
+        raise ValueError(f"toroidal must be 'exact', 'legacy', 'matched' or 'local', not {mode!r}")
+    exact = mode in ("exact", "matched")
+    matched = mode == "matched"
+    if mode == "local":
+        loc = {**LOCAL_DEFAULTS, **(hp.get("local") or {})}
+        unknown = set(loc) - set(LOCAL_DEFAULTS)
+        if unknown:
+            raise KeyError(f"local: unknown keys {sorted(unknown)} (keys: {sorted(LOCAL_DEFAULTS)})")
+
+        def conn(k, **kw):        # connections into depth k (0: the first layer): p_max * p_max_decay^k
+            return ConnSpec(p_max=loc["p_max"] * loc["p_max_decay"] ** k,
+                            sigma_cells=loc["sigma_cells"] * loc["sigma_decay"] ** k, p_global=loc["p_global"], **kw)
+        input_conn = ConnSpec(p_max=loc["p_max"], sigma_cells=loc["input_sigma_cells"])
+    else:
+        def conn(k, **kw):
+            return ConnSpec(exact=exact, match_legacy=matched, **kw)
+        input_conn = ConnSpec(fan_in=hp["fan_in"], sigma=0.1, exact=exact, match_legacy=matched)
+
+    ff_i = None
+    if mode == "local" and not loc["feedforward_inhibition"]:
+        ff_i = ConnSpec(type="none")
+
+    def base_layer(k):
+        return LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
+                         fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), to_next=conn(k + 1),
+                         to_next_i=ff_i)
+    spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions, input=input_conn,
+                       layers=[base_layer(k) for k in range(hp["ei_layers"])],
+                       fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], p=0.005),
+                                        conn_i=ff_i),
                        explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"])
     net = dict(hp.get("network") or {})
     if "layers" in net:
         layers = []
-        for ld in net.pop("layers"):
+        for depth, ld in enumerate(net.pop("layers")):
             ld = dict(ld)
             short = {}
             if "e" in ld:
@@ -267,7 +366,7 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             for k in ("e_shape", "i_shape"):
                 if k in ld:
                     ld[k] = _shape(ld[k], channels)
-            layers.append(_merge(replace(base_layer, **short), ld))
+            layers.append(_merge(replace(base_layer(depth), **short), ld))
         spec = replace(spec, layers=layers)
     if "fields" in net:
         fd = net.pop("fields")

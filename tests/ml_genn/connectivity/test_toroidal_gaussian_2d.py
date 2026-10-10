@@ -65,3 +65,48 @@ def test_legacy_unchanged(tmp_path):
         new = _connect(ToroidalGaussian2D(sigma=0.05, fan_in=300, weight=0.0), *shapes, same=same)
         old = _connect(ns["ToroidalGaussian2D"](sigma=0.05, fan_in=300, weight=0.0), *shapes, same=same)
         np.testing.assert_array_equal(new[0], old[0]); np.testing.assert_array_equal(new[1], old[1])
+
+
+def test_distance_dependent_mode_matches_expected_fan_in_and_stays_local():
+    conn = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=1.0, sigma_cells=1.75)
+    pre, post = _connect(conn, (20, 20, 3), same=True)
+    fan = np.bincount(post, minlength=1200)
+    assert fan.mean() == pytest.approx(conn.expected_fan_in((20, 20, 3), (20, 20, 3)) - 1, rel=0.03)  # minus self
+    assert not np.any(pre == post)
+    tgt, src = post // 3, pre // 3
+    dy = np.abs(tgt // 20 - src // 20); dy = np.minimum(dy, 20 - dy)
+    dx = np.abs(tgt % 20 - src % 20); dx = np.minimum(dx, 20 - dx)
+    assert np.percentile(np.sqrt(dx ** 2 + dy ** 2), 99) < 6            # nothing far into the tails
+    half = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=0.5, sigma_cells=1.75)
+    assert np.bincount(_connect(half, (20, 20, 3), same=True)[1]).mean() == pytest.approx(fan.mean() / 2, rel=0.05)
+
+
+def test_coarser_sigma_reference_pools_big_to_small_and_leaves_small_to_big():
+    def fans(sigma_ref, src, tgt):
+        conn = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=1.0, sigma_cells=1.75, sigma_ref=sigma_ref)
+        pre, post = _connect(conn, src, tgt)
+        return np.bincount(post, minlength=int(np.prod(tgt))), np.bincount(pre, minlength=int(np.prod(src))), conn
+    _, out_src, _ = fans("source", (20, 20, 3), (3, 3, 3))
+    assert np.mean(out_src == 0) > 0.15                       # subsampling: part of the source is unused
+    fan_in, out, conn = fans("coarser", (20, 20, 3), (3, 3, 3))
+    assert np.all(out > 0)                                    # pooling: every source reaches a target
+    assert fan_in.mean() == pytest.approx(conn.expected_fan_in((20, 20, 3), (3, 3, 3)), rel=0.05)
+    up_c, _, _ = fans("coarser", (6, 6, 3), (20, 20, 3))
+    up_s, _, _ = fans("source", (6, 6, 3), (20, 20, 3))
+    assert up_c.mean() == pytest.approx(up_s.mean(), rel=0.05)   # small -> big: unchanged
+    with pytest.raises(ValueError):
+        ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=1.0, sigma_ref="target")
+
+
+def test_p_global_adds_long_range_connections():
+    local = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=1.0, sigma_cells=1.0)
+    world = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=0.0, p_max=1.0, sigma_cells=1.0, p_global=0.02)
+    def far(conn):
+        pre, post = _connect(conn, (20, 20, 3), (20, 20, 3))
+        tgt, src = post // 3, pre // 3
+        dy = np.abs(tgt // 20 - src // 20); dy = np.minimum(dy, 20 - dy)
+        dx = np.abs(tgt % 20 - src % 20); dx = np.minimum(dx, 20 - dx)
+        return np.mean(np.sqrt(dx ** 2 + dy ** 2) > 6) * len(pre) / 1200, len(pre) / 1200
+    assert far(local)[0] == 0
+    n_far, fan = far(world)
+    assert n_far > 15 and fan == pytest.approx(world.expected_fan_in((20, 20, 3), (20, 20, 3)), rel=0.03)

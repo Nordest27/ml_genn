@@ -1,0 +1,11 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": {
+  "preset": "eprop"
+ },
+ "toroidal": "local"
+}

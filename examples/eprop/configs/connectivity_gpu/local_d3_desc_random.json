@@ -1,0 +1,15 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": {
+  "preset": "eprop"
+ },
+ "toroidal": "local",
+ "ei_layers": 3,
+ "local": {
+  "p_max_decay": 0.6
+ }
+}
