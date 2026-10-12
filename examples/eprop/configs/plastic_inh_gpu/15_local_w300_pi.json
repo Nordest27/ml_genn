@@ -1,0 +1,20 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "local",
+ "hidden_rule": {
+  "preset": "proposed_homeostat",
+  "homeostat": 1.0,
+  "center_drift": true
+ },
+ "plastic_inhibition": {
+  "eta": 1e-05,
+  "rate": 10.0
+ },
+ "local": {
+  "weight_fan_in": 300
+ }
+}

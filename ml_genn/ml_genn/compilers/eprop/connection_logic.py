@@ -118,8 +118,30 @@ def build_plastic_inhibition_wum(cfg, weight, dt):
         "pre_spike_syn_code": "addToPost(g);",
         "synapse_dynamics_code": "g = fmin(0.0, g - Eta * XTrace * (YTrace - Y0));",
     }
-    return WeightUpdateModel(model=model, param_vals={"Eta": cfg.eta, "Decay": decay, "Y0": y0},
-                             var_vals={"g": weight}, pre_var_vals={"XTrace": 0.0}, post_var_vals={"YTrace": 0.0})
+    w_max = cfg.w_max
+    if cfg.w_max_rel is not None:
+        mean = getattr(weight, "mean", None)
+        if mean is None:
+            mean = float(np.mean(np.abs(weight)))
+        w_max = cfg.w_max_rel * abs(float(mean))
+    floor = "" if w_max is None else f"g = fmax(g, {-float(w_max)!r});"
+    param_vals = {"Eta": cfg.eta, "Decay": decay, "Y0": y0}
+    pre_var_vals, post_var_vals = {"XTrace": 0.0}, {"YTrace": 0.0}
+    if cfg.mode == "covariance":
+        # running means start at the trace of a ~10 Hz neuron, so the first seconds do not see a large covariance
+        start = 10.0 * (dt / 1000.0) / (1.0 - decay)
+        model["params"].append(("MeanDecay", "scalar"))
+        model["pre_vars"].append(("XMean", "scalar"))
+        model["post_vars"].append(("YMean", "scalar"))
+        model["pre_dynamics_code"] += "\nXMean = MeanDecay * XMean + (1.0 - MeanDecay) * XTrace;"
+        model["post_dynamics_code"] += "\nYMean = MeanDecay * YMean + (1.0 - MeanDecay) * YTrace;"
+        model["synapse_dynamics_code"] = "g = fmin(0.0, g - Eta * (XTrace - XMean) * (YTrace - YMean));"
+        param_vals["MeanDecay"] = float(np.exp(-dt / cfg.tau_mean))
+        pre_var_vals["XMean"], post_var_vals["YMean"] = start, start
+    if floor:
+        model["synapse_dynamics_code"] += "\n" + floor
+    return WeightUpdateModel(model=model, param_vals=param_vals, var_vals={"g": weight},
+                             pre_var_vals=pre_var_vals, post_var_vals=post_var_vals)
 
 
 def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neuron, alpha):

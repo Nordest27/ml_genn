@@ -131,8 +131,20 @@ class PlasticInhibitionConfig:
     neurons that share drive come to inhibit each other through the I population (decorrelation). Local: pre and post
     spike traces only, no TD error; the weight is updated directly (own rate, no optimiser) and stays inhibitory."""
     eta: float = 1e-5
-    rate: float = 10.0               # target postsynaptic rate (Hz)
+    rate: float = 10.0               # target postsynaptic rate (Hz) ("rate" mode)
     tau: float = 20.0                # trace time constant (ms)
+    mode: str = "rate"               # "rate": |w| += eta * x * (y - y0), inhibition also pins the E rate at `rate`;
+                                     # "covariance": |w| += eta * (x - xbar) * (y - ybar), xbar / ybar slow running
+                                     # means of each neuron's own trace: only co-activity beyond what the two rates
+                                     # predict strengthens inhibition (Foldiak decorrelation, no rate target)
+    tau_mean: float = 1000.0         # running-mean time constant (ms) of the covariance mode
+    w_max: Optional[float] = None    # cap on |w| (current-based inhibition can otherwise push V without limit; real
+                                     # inhibition stops at its reversal potential)
+    w_max_rel: Optional[float] = None    # ... the cap as a multiple of the connection's initial mean |w|
+
+    def __post_init__(self):
+        if self.mode not in ("rate", "covariance"):
+            raise ValueError(f"plastic inhibition mode must be 'rate' or 'covariance', not {self.mode!r}")
 
 
 def plastic_inhibition_from(value):

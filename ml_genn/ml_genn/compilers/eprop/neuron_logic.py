@@ -267,6 +267,22 @@ _NODE_NOISE_SWITCHES = (("Sigma = 0.0 * exp(LogSigma);", "Sigma = exp(LogSigma);
                         ("V = Alpha * V + Isyn + 0.0 * PertEps;", "V = Alpha * V + Isyn + PertEps;"))
 
 
+def add_inhibitory_reversal(model_copy, e_inh):
+    """Conductance-like inhibition: inhibitory synapses (routed to ISynInh) act through the driving force
+    (V - E_inh) / (0 - E_inh), unchanged at rest (V = 0) for small inputs, vanishing at the reversal potential
+    E_inh (< 0), so inhibition cannot push V below E_inh (shunting instead of unlimited subtraction)."""
+    if e_inh >= 0:
+        raise ValueError(f"inhibitory reversal potential must be below rest (0), not {e_inh}")
+    model_copy.add_additional_input_var("ISynInh", "scalar", 0.0)
+    sim = model_copy.model.get("sim_code", "")
+    source = "V = Alpha * V + Isyn"
+    if sim.count(source) != 1:
+        raise RuntimeError("inhibitory reversal: the ALIF membrane update was not found exactly once")
+    # exact step of a conductance G = ISynInh / E_inh (>= 0): V relaxes towards E_inh by (E_inh - V)(1 - exp(-G)),
+    # = ISynInh (V - E_inh) / -E_inh for small inputs, and never past E_inh however many inhibitory spikes arrive
+    model_copy.replace_sim_code(source, f"V = Alpha * V + Isyn + ({e_inh!r} - V) * (1.0 - exp(-fmax(0.0, ISynInh / ({e_inh!r}))))")
+
+
 def enable_node_noise(model_copy):
     """Turn on membrane ("node") noise in an ALIF hidden neuron: PertEps = Sigma * N(0, 1) is added to
     the membrane and filtered into PertEpsTrace by the neuron model itself."""

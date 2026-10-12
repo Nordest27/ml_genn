@@ -2,7 +2,7 @@ import logging
 import numpy as np
 
 from copy import deepcopy
-from typing import Sequence
+from typing import Optional, Sequence
 from pygenn import SynapseMatrixType, create_var_ref, create_wu_var_ref
 
 from .. import Compiler
@@ -75,6 +75,7 @@ class CompileState:
         self.policy_reward_connections = []
         self.pert_eps_transport_connections = []
         self.backprop_connections = []           # hidden -> hidden synapses sending the backward signal
+        self.inhibitory_connections = []         # inhibitory hidden synapses (conductance-like inhibition)
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
         self.value_regularisation_connections = []
@@ -196,6 +197,10 @@ class EPropCompiler(Compiler):
                                     "original", "drift_only", "gradient_only",
                                     "unbiased", "eprop", ...). Ignored outside
                                     the RL variant.
+        inhibitory_reversal:         None (default): current-based synapses. A value E_inh < 0
+                                    (rest 0, threshold ~0.61): inhibitory hidden synapses
+                                    (exc_inh_sign -1) act through the driving force
+                                    (V - E_inh) / -E_inh, so inhibition cannot push V below E_inh
         value_feedback_ret_e:        RetE of the value feedback connections, which
                                     deliver VE to the hidden neurons (used only by
                                     the e-prop term). 0.0: VE = B^V, the critic
@@ -239,6 +244,7 @@ class EPropCompiler(Compiler):
                  value_head: Population = None,
                  hidden_rule="proposed",
                  value_feedback_ret_e: float = 0.0,
+                 inhibitory_reversal: Optional[float] = None,
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
                  population_rules: dict = None,
@@ -284,6 +290,7 @@ class EPropCompiler(Compiler):
         self.population_rules = {p: get_hidden_rule(r) for p, r in (population_rules or {}).items()}
         self.plastic_inhibition = {c: plastic_inhibition_from(v) for c, v in (plastic_inhibition or {}).items()}
         self.value_feedback_ret_e = value_feedback_ret_e
+        self.inhibitory_reversal = inhibitory_reversal
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
         self.value_reg = value_reg
@@ -360,6 +367,9 @@ class EPropCompiler(Compiler):
                 f"E-prop compiler doesn't support connections targeting "
                 f"{type(target_neuron).__name__} neurons")
 
+        if (self.inhibitory_reversal is not None and not conn.is_feedback and conn.exc_inh_sign == -1
+                and isinstance(target_neuron, AdaptiveLeakyIntegrateFire)):
+            compile_state.inhibitory_connections.append(conn)
         compile_state.checkpoint_connection_vars.append((conn, "g"))
         # adaptive feedback connections have DeltaG; they are optimised only on request
         # (the original implementation never optimised them)
@@ -410,6 +420,8 @@ class EPropCompiler(Compiler):
             if (pop_rule.noise is NoisePlacement.NODE
                     and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire)):
                 neuron_logic.enable_node_noise(model_copy)
+        if self.inhibitory_reversal is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            neuron_logic.add_inhibitory_reversal(model_copy, self.inhibitory_reversal)
 
         if not isinstance(pop.neuron, (AdaptiveLeakyIntegrateFire, LeakyIntegrateFire)):
             raise NotImplementedError(f"E-prop compiler doesn't support "
@@ -483,6 +495,8 @@ class EPropCompiler(Compiler):
         """
         for c in compile_state.feedback_connections:
             connection_populations[c].pre_target_var = "ISynFeedback"
+        for c in compile_state.inhibitory_connections:
+            connection_populations[c].post_target_var = "ISynInh"
 
         if self.gamma_lambda is None:
             return

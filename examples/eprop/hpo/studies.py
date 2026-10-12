@@ -374,3 +374,34 @@ CPU_REDUNDANCY_VARIANTS = [
 ]
 STUDIES["cpu_redundancy"] = {"base": _RED_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                              "space": {"*": ("choice", CPU_REDUNDANCY_VARIANTS)}}
+
+# CPU: the controls of configs/plastic_inh_gpu on the small network (target 10 Hz as in the strong GPU run)
+_PI10 = {"eta": 1e-5, "rate": 10.0}
+CPU_PI_VARIANTS = [
+    {"_meta": {"variant": "prop_homeo_c_pi10"}, "hidden_rule": _HC, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "prop_homeo_c_pi10_eta1e-6"}, "hidden_rule": _HC,
+     "plastic_inhibition": {"eta": 1e-6, "rate": 10.0}},
+    {"_meta": {"variant": "prop_homeo_c_pi_cov"}, "hidden_rule": _HC,
+     "plastic_inhibition": {"eta": 1e-5, "mode": "covariance"}},
+    {"_meta": {"variant": "reservoir_pi10"}, "hidden_rule": {"preset": "reservoir"}, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "random_eprop_pi10"}, "hidden_rule": {"preset": "eprop"}, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "prop_homeo_c_creg1e-2"}, "hidden_rule": _HC, "c_reg": 1e-2},
+]
+STUDIES["cpu_plastic_inh"] = {"base": _RED_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                              "space": {"*": ("choice", CPU_PI_VARIANTS)}}
+
+# CPU: plastic inhibition works on the GPU only with legacy / matched connectivity. Same small network: legacy,
+# matched, and local at the legacy weight scale (weight_fan_in = the requested fan-in 50), with plastic inhibition.
+_PI_CONN_BASE = {**CPU_SMALL, "probe": {"moves": 5000}, "monitor": True, "monitor_every": 20000}
+_LOCAL_S = {"sigma_cells": 1.0, "input_sigma_ref": "source"}
+CPU_PI_CONN_VARIANTS = [
+    {"_meta": {"variant": "legacy"}, "toroidal": "legacy", "hidden_rule": _HC},
+    {"_meta": {"variant": "legacy_pi10"}, "toroidal": "legacy", "hidden_rule": _HC, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "matched_pi10"}, "toroidal": "matched", "hidden_rule": _HC, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "local_w50_pi10"}, "toroidal": "local", "local": {**_LOCAL_S, "weight_fan_in": 50},
+     "hidden_rule": _HC, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "local_w50"}, "toroidal": "local", "local": {**_LOCAL_S, "weight_fan_in": 50},
+     "hidden_rule": _HC},
+]
+STUDIES["cpu_pi_connectivity"] = {"base": _PI_CONN_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                  "space": {"*": ("choice", CPU_PI_CONN_VARIANTS)}}
