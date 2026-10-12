@@ -29,7 +29,7 @@ from ...utils.snippet import ConnectivitySnippet
 from ...utils.value import is_value_constant
 
 from .variants import (FeedbackType, PolicyType, HiddenRuleConfig, NoisePlacement,
-                       get_hidden_rule, as_policy_type, rule_for_population)
+                       get_hidden_rule, as_policy_type, rule_for_population, plastic_inhibition_from)
 from .models import GRADIENT_BATCH_REDUCE_MODEL
 from . import neuron_logic
 from . import connection_logic as conn_logic
@@ -205,6 +205,9 @@ class EPropCompiler(Compiler):
                                     ~ delta^2 B^V e (a biased push, not a gradient).
         population_rules:            {Population: rule} learning rules for individual hidden populations
                                     (presets, dicts or HiddenRuleConfig); others use hidden_rule
+        plastic_inhibition:          {Connection: settings} hidden I -> E connections with anti-Hebbian
+                                    inhibitory plasticity instead of the hidden rule (PlasticInhibitionConfig,
+                                    a dict of its fields, or True for the defaults)
         train_readout:               False keeps the readout (policy / value) weights at their
                                     initial values, to test what the hidden rule learns on its own
         optimise_feedback:           Optimise adaptive feedback connections
@@ -239,6 +242,7 @@ class EPropCompiler(Compiler):
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
                  population_rules: dict = None,
+                 plastic_inhibition: dict = None,
                  value_reg: float = 0.0,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
@@ -278,6 +282,7 @@ class EPropCompiler(Compiler):
         self.hidden_rule = get_hidden_rule(hidden_rule)
         # per-population rules (e.g. perturbation-based in wide layers, e-prop in narrow ones); they take precedence
         self.population_rules = {p: get_hidden_rule(r) for p, r in (population_rules or {}).items()}
+        self.plastic_inhibition = {c: plastic_inhibition_from(v) for c, v in (plastic_inhibition or {}).items()}
         self.value_feedback_ret_e = value_feedback_ret_e
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
@@ -361,6 +366,8 @@ class EPropCompiler(Compiler):
         readout_conn = (not conn.is_feedback and target_neuron.readout is not None)
         if readout_conn and not self.train_readout:
             pass                               # frozen readout: the readout weights keep their initial values
+        elif conn in self.plastic_inhibition:
+            pass                               # updated by its own local rule, not the optimiser
         elif not conn.is_feedback or (self.optimise_feedback and
                                     "DeltaG" in [v[0] for v in wum.model["vars"]]):
             compile_state.weight_optimiser_connections.append(conn)

@@ -29,6 +29,9 @@ DEFAULTS = {
     "explicit_feedback": True,   # random/adaptive feedback connections from the core and fields to the heads; False
                                  # with feedback_type "symmetric" leaves the forward readout weights as the only
                                  # e-prop signal (the "symmetric_hybrid" rule)
+    "plastic_inhibition": None,  # anti-Hebbian plasticity on every layer's I -> E synapses instead of the hidden rule
+                                 # (decorrelates the E neurons; modular compiler only): {} for the defaults or e.g.
+                                 # {"eta": 1e-5, "rate": 10.0, "tau": 20.0} (ml_genn.compilers.eprop.PlasticInhibitionConfig)
     "optimiser": "adabelief",    # "adabelief" (beta 0.99/0.99999) | "adam" (beta 0.9/0.999, adaptive e-prop)
     # entropy: used only by a categorical (on-device softmax) policy head. Snake's generic head takes its gradient
     # from the script, which does not compute an entropy term, so these have no effect on Snake.

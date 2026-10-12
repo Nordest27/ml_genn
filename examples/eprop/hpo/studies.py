@@ -355,3 +355,22 @@ STUDIES["cpu_features_small"] = {"base": {**CPU_SMALL, "probe": {"moves": 5000},
                                           "monitor_every": 20000},
                                  "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                                  "space": {"*": ("choice", _rule_x_conn(CPU_FEATURE_RULES, ["local_s", "global_s"]))}}
+
+# CPU: making the representation the perturbation rule freezes less redundant (small network, current local defaults
+# incl. the sheet-referenced sigma; probe + redundancy metrics in probe_analyse.py). Rate target 20 Hz ~ the E rate
+# of this network, so that the plastic inhibition decorrelates rather than lowers the rate.
+_RED_BASE = {**CPU_SMALL, "toroidal": "local", "local": {"sigma_cells": 1.0, "input_sigma_ref": "source"},
+             "probe": {"moves": 5000}, "monitor": True, "monitor_every": 20000}
+CPU_REDUNDANCY_VARIANTS = [
+    {"_meta": {"variant": "prop_homeo_c"}, "hidden_rule": _HC},
+    {"_meta": {"variant": "plastic_inh_1e-6"}, "hidden_rule": _HC, "plastic_inhibition": {"eta": 1e-6, "rate": 20.0}},
+    {"_meta": {"variant": "plastic_inh_1e-5"}, "hidden_rule": _HC, "plastic_inhibition": {"eta": 1e-5, "rate": 20.0}},
+    {"_meta": {"variant": "inhibition_x2"}, "hidden_rule": _HC,
+     "local": {"sigma_cells": 1.0, "input_sigma_ref": "source", "inhibition_scale": 6.0}},
+    {"_meta": {"variant": "psi_spread_0.7"}, "hidden_rule": {**_HC, "psi_target_spread": 0.7}},
+    {"_meta": {"variant": "plastic_inh_1e-5+psi_spread"}, "hidden_rule": {**_HC, "psi_target_spread": 0.7},
+     "plastic_inhibition": {"eta": 1e-5, "rate": 20.0}},
+    {"_meta": {"variant": "random_eprop"}, "hidden_rule": {"preset": "eprop"}},
+]
+STUDIES["cpu_redundancy"] = {"base": _RED_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                             "space": {"*": ("choice", CPU_REDUNDANCY_VARIANTS)}}

@@ -101,8 +101,31 @@ def build_feedback_wum(conn, connect_snippet, compiler, compile_state, target_po
                                           compile_state, alpha)
 
 
+def build_plastic_inhibition_wum(cfg, weight, dt):
+    """I -> E synapses with anti-Hebbian inhibitory plasticity (PlasticInhibitionConfig): |g| += eta * x_pre *
+    (y_post - y0), applied directly every timestep, g kept <= 0. No DeltaG, so the optimiser leaves it alone."""
+    decay = float(np.exp(-dt / cfg.tau))
+    y0 = cfg.rate * (dt / 1000.0) / (1.0 - decay)        # mean post trace at the target rate
+    model = {
+        "params": [("Eta", "scalar"), ("Decay", "scalar"), ("Y0", "scalar")],
+        "vars": [("g", "scalar")],
+        "pre_vars": [("XTrace", "scalar")],
+        "post_vars": [("YTrace", "scalar")],
+        "pre_spike_code": "XTrace += 1.0;",
+        "pre_dynamics_code": "XTrace *= Decay;",
+        "post_spike_code": "YTrace += 1.0;",
+        "post_dynamics_code": "YTrace *= Decay;",
+        "pre_spike_syn_code": "addToPost(g);",
+        "synapse_dynamics_code": "g = fmin(0.0, g - Eta * XTrace * (YTrace - Y0));",
+    }
+    return WeightUpdateModel(model=model, param_vals={"Eta": cfg.eta, "Decay": decay, "Y0": y0},
+                             var_vals={"g": weight}, pre_var_vals={"XTrace": 0.0}, post_var_vals={"YTrace": 0.0})
+
+
 def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neuron, alpha):
     """Weight-update model for a connection targeting a hidden LIF/ALIF neuron."""
+    if conn in compiler.plastic_inhibition:
+        return build_plastic_inhibition_wum(compiler.plastic_inhibition[conn], connect_snippet.weight, compiler.dt)
     if isinstance(target_neuron, LeakyIntegrateFire):
         return WeightUpdateModel(
             model=get_hidden_model(HiddenRule.LIF),

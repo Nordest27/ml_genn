@@ -124,6 +124,26 @@ class LocalObjectives:
 
 
 @dataclass(frozen=True)
+class PlasticInhibitionConfig:
+    """Anti-Hebbian inhibitory plasticity on I -> E synapses (cf. Vogels et al. 2011; King, Zylberberg & DeWeese
+    2013): |w| += eta * x_I * (y_E - y0), x / y the pre / post spike traces (time constant tau, +1 per spike) and y0
+    the post trace at the target rate. Co-active I and E cells (E above target) strengthen the inhibition, so E
+    neurons that share drive come to inhibit each other through the I population (decorrelation). Local: pre and post
+    spike traces only, no TD error; the weight is updated directly (own rate, no optimiser) and stays inhibitory."""
+    eta: float = 1e-5
+    rate: float = 10.0               # target postsynaptic rate (Hz)
+    tau: float = 20.0                # trace time constant (ms)
+
+
+def plastic_inhibition_from(value):
+    if isinstance(value, PlasticInhibitionConfig):
+        return value
+    if value is None or value is True:
+        return PlasticInhibitionConfig()
+    return PlasticInhibitionConfig(**value)
+
+
+@dataclass(frozen=True)
 class HiddenRuleConfig:
     """Hidden-layer rule of the RL / TD(lambda) variant. Zero coefficients remove their terms."""
     noise: NoisePlacement = NoisePlacement.WEIGHT_SHARED
@@ -133,6 +153,9 @@ class HiddenRuleConfig:
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
+    psi_target_spread: float = 0.0   # heterogeneous homeostat targets: psi_target * exp(spread * z_i), z_i a fixed
+                                     # standard-uniform-in-log draw per neuron (from its index, so every synapse
+                                     # group targeting the neuron agrees); neurons settle at different sparseness
     eprop: float = 0.0               # e-prop learning signal: lambda-trace of eFiltered * (PG - eprop_value * VE)
     eprop_value: float = 0.1
     eprop_scope: "EpropScope" = None     # None = EpropScope.ALL

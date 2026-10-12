@@ -5,6 +5,10 @@ state (membrane potentials + refractory flags of all hidden populations) to each
 70% of the window and tested on the last 30% (time order, no shuffling). Reported: test accuracy and the
 majority-class rate (chance). Features created by learning show up as accuracy rising from the first to the last
 window, beyond what a frozen reservoir achieves.
+Redundancy table: mean |r| = mean absolute pairwise correlation of the membrane potentials (active neurons); the
+subset curve = mean decoding gain above chance (food side, danger) from k random neurons' potentials, k = 4, 16, 64
+and all. A redundant code saturates early (few neurons already carry what the population carries, low ceiling); a
+compact distributed code keeps rising with k. sat = gain(16) / gain(all).
 Usage: python3 probe_analyse.py <study runs dir or probe files ...>
 """
 import glob
@@ -54,6 +58,42 @@ def dimensionality(x, sizes):
     sd = v.std(0)
     frozen = float((sd < 0.01 * np.median(sd[sd > 0]) if np.any(sd > 0) else np.ones_like(sd, bool)).mean())
     return pr, frozen
+
+
+def _potentials(x, sizes):
+    cols, off = [], 0
+    for n in sizes:
+        cols.append(np.arange(off, off + n)); off += 2 * n
+    return x[:, np.concatenate(cols)]
+
+
+def mean_abs_corr(x, sizes):
+    v = _potentials(x, sizes)
+    v = v[:, v.std(0) > 1e-6]
+    if v.shape[1] < 2:
+        return float("nan")
+    c = np.corrcoef(v, rowvar=False)
+    return float(np.abs(c[np.triu_indices_from(c, 1)]).mean())
+
+
+def subset_curve(x, y, sizes, ks=(4, 16, 64, None), repeats=5, seed=0):
+    """Mean decoding gain above chance (food side, danger) from k random neurons' potentials (None: all)."""
+    v = _potentials(x, sizes)
+    t = targets(y)
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in ks:
+        if k is not None and k >= v.shape[1]:
+            out.append(float("nan")); continue
+        gains = []
+        for _ in range(1 if k is None else repeats):
+            cols = np.arange(v.shape[1]) if k is None else rng.choice(v.shape[1], k, replace=False)
+            for key in ("apple_y", "apple_x", "danger_l", "danger_u", "danger_r", "danger_d"):
+                acc, ch = probe(v[:, cols], t[key])
+                if np.isfinite(acc):
+                    gains.append(acc - ch)
+        out.append(float(np.mean(gains)) if gains else float("nan"))
+    return out
 
 
 def per_population(x, y, sizes, labels):
@@ -106,6 +146,19 @@ def main(args):
         a = per_population(d["first_x"], d["first_y"], sizes, labels)
         b = per_population(d["last_x"], d["last_y"], sizes, labels)
         print(f"{label_of(f):28s} " + "  ".join(f"{k}: {a[k]:+.2f}->{b[k]:+.2f}" for k in a))
+    print("\nredundancy: mean |r| and decoding gain from k random neurons (k = 4 / 16 / 64 / all), first -> last window")
+    print(f"{'run':28s} {'window':6s} {'mean|r|':>8s} {'k=4':>7s} {'k=16':>7s} {'k=64':>7s} {'all':>7s} {'sat':>6s}")
+    for f in sorted(files, key=label_of):
+        d = np.load(f)
+        sizes = [int(n) for n in d["sizes"]]
+        for w in ("first", "last"):
+            x, y = d[f"{w}_x"], d[f"{w}_y"]
+            if len(x) == 0:
+                continue
+            curve = subset_curve(x, y, sizes)
+            sat = curve[1] / curve[-1] if curve[-1] > 0.01 else float("nan")
+            print(f"{label_of(f):28s} {w:6s} {mean_abs_corr(x, sizes):8.3f} " + " ".join(f"{g:+7.3f}" for g in curve)
+                  + f" {sat:6.2f}")
     print("\naccuracy (majority-class chance); learned features: last > first, and above a frozen reservoir")
     print("eff.dim: participation ratio of the membrane potentials; frozen: fraction of neurons with ~constant V")
 

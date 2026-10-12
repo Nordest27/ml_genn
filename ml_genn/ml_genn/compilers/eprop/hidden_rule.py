@@ -228,7 +228,13 @@ else {
     if use_G and cfg.gradient != 0:
         dg.append(_scaled(cfg.gradient, "reward * RLNoiseGtrace"))
     if cfg.homeostat != 0:
-        dg.append(f"{_f(cfg.homeostat)} * AbsTd * (PsiBar - {_f(cfg.psi_target)}) * RLNoisePtrace")
+        target = _f(cfg.psi_target)
+        if cfg.psi_target_spread != 0:
+            # z in [-sqrt(3), sqrt(3)] (unit variance) from a hash of the neuron index, identical in every group
+            syn.append("const scalar zPsi = 1.7320508 * (2.0 * (sin((scalar)id_post * 12.9898) * 43758.5453"
+                       " - floor(sin((scalar)id_post * 12.9898) * 43758.5453)) - 1.0);")
+            target = f"({target} * exp({_f(cfg.psi_target_spread)} * zPsi))"
+        dg.append(f"{_f(cfg.homeostat)} * AbsTd * (PsiBar - {target}) * RLNoisePtrace")
     if use_eprop:
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
     if use_backprop:

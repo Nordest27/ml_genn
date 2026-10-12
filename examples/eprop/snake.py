@@ -640,6 +640,8 @@ def build_compiled_network(connectivity_type="fixed"):
                                                            "optimise_feedback": HP["optimise_feedback"],
                                                            "train_readout": HP["train_readout"],
                                                            "population_rules": built.population_rules}
+        if HP["plastic_inhibition"] is not None:
+            rule_kwargs["plastic_inhibition"] = {c: HP["plastic_inhibition"] for c in built.inhibitory_to_e}
     if HP["optimiser"] == "adam":
         optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999)
     else:

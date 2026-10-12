@@ -34,6 +34,7 @@ class ConnSpec:
     p: float = 0.01                  # fixed: connection probability
     mean_scale: float = 0.1          # weight mean = sign * mean_scale / sqrt(fan_in) (x3 for inhibitory, toroidal)
     sd_scale: float = 0.05           # weight s.d. = sd_scale / sqrt(fan_in)  (1 / sqrt(fan_in) without a sign)
+    inh_scale: float = 3.0           # toroidal: inhibitory sources use mean_scale * inh_scale
     exact: bool = True               # toroidal sampler (ToroidalGaussian2D exact)
     weight_fan_in: Optional[float] = None   # fan-in used for the 1/sqrt(fan_in) weight scale (None: the fan-in)
     match_legacy: bool = False       # exact sampler with the fan-in the legacy sampler actually realised for this
@@ -114,6 +115,7 @@ class Built:
     value: Population
     labels: dict          # Population -> name used in logs (L1_E, L1_I, ..., policy_field, value_field)
     population_rules: dict    # Population -> rule (only populations with their own rule)
+    inhibitory_to_e: list = field(default_factory=list)   # the I -> E connection of every layer
 
     @property
     def hidden(self):
@@ -162,7 +164,7 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
     if fan is None or sig is None:
         raise ValueError("toroidal connectivity needs fan_in and sigma")
     if sign == -1:
-        mean_scale *= 3
+        mean_scale *= conn.inh_scale
     elif sign is None:
         sd_scale = 1.0
     if conn.p_max is not None:
@@ -206,7 +208,7 @@ def _alif(neuron: NeuronSpec, node_sigma):
 
 def build_network(spec: NetworkSpec, default_params) -> Built:
     network = Network(default_params)
-    labels, rules = {}, {}
+    labels, rules, i_to_e = {}, {}, []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
         layers = []
@@ -215,9 +217,11 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             i = Population(_alif(ls.neuron, spec.node_sigma), ls.i_shape)
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
-                Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
-                                                   same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
-                           exc_inh_sign=sign)
+                c = Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
+                                                       same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
+                               exc_inh_sign=sign)
+                if pre is i and post is e:
+                    i_to_e.append(c)
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
@@ -291,7 +295,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                         Connection(pop, head, FixedProbability(spec.feedback_p,
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
-    return Built(network, inp, layers, fields, policy, value, labels, rules)
+    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -351,7 +355,7 @@ LOCAL_DEFAULTS = {"p_max": 1.0, "sigma_cells": 1.75, "input_sigma_cells": 2.5, "
                   "p_global": 0.0, "feedforward_inhibition": False, "ff_gain": 0.5,
                   "field_gain": 0.25, "mean_norm": "sqrt",
                   "input_sigma_ref": "coarser", "weight_fan_in": None,
-                  "sigma_ref": "sheet"}
+                  "sigma_ref": "sheet", "inhibition_scale": 3.0}
 
 
 def spec_from_hparams(hp, input_shape, num_actions, channels=3):
@@ -375,7 +379,8 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                 kw["mean_scale"] = loc["field_gain" if ff == "field" else "ff_gain"]
             return ConnSpec(p_max=loc["p_max"] * loc["p_max_decay"] ** k,
                             sigma_cells=loc["sigma_cells"] * loc["sigma_decay"] ** k, p_global=loc["p_global"],
-                            mean_norm=loc["mean_norm"], weight_fan_in=loc["weight_fan_in"], sigma_ref=loc["sigma_ref"], **kw)
+                            mean_norm=loc["mean_norm"], weight_fan_in=loc["weight_fan_in"], sigma_ref=loc["sigma_ref"],
+                            inh_scale=loc["inhibition_scale"], **kw)
         input_conn = ConnSpec(p_max=loc["p_max"], sigma_cells=loc["input_sigma_cells"], mean_norm=loc["mean_norm"],
                               sigma_ref=loc["input_sigma_ref"], weight_fan_in=loc["weight_fan_in"])
         if loc["input_sigma_ref"] == "coarser" and loc["sigma_ref"] == "sheet":

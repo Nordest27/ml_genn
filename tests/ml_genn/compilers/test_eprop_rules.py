@@ -379,3 +379,48 @@ def test_population_rules_override_the_global_rule(request):
     core_in, field_in = pops[(inp, core)], pops[(core, pf)]
     assert "RLNoisePtrace" in core_in.vars and "RLTrace" not in core_in.vars      # perturbation rule + homeostat
     assert "RLTrace" in field_in.vars and "NoiseTrace" not in field_in.vars       # e-prop (global rule)
+
+
+def test_plastic_inhibition_updates_i_to_e_locally_and_stays_inhibitory(request):
+    rng = np.random.default_rng(0)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, e, Dense((0.3 + 0.05 * rng.standard_normal((N_IN, N_HID))).astype(np.float32)))
+        Connection(inp, i, Dense((0.3 + 0.05 * rng.standard_normal((N_IN, 6))).astype(np.float32)))
+        i_to_e = Connection(i, e, Dense(np.full((6, N_HID), -0.05, np.float32)), exc_inh_sign=-1)
+        for src in (e,):
+            Connection(src, pol, Dense((0.5 * rng.standard_normal((N_HID, 4))).astype(np.float32)))
+            Connection(src, val, Dense((0.5 * rng.standard_normal((N_HID, 1))).astype(np.float32)))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="proposed_homeostat",
+        plastic_inhibition={i_to_e: {"eta": 1e-3, "rate": 1.0}})
+    compiled = compiler.compile(net, request.node.name)
+    pop = compiled.connection_populations[i_to_e]
+    assert "DeltaG" not in pop.vars and "XTrace" in pop.pre_vars and "YTrace" in pop.post_vars
+    optimised = {id(v) for _, cus in compiled.optimisers for v in cus}
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        pop.vars["g"].pull_from_device(); g0 = pop.vars["g"].values.copy()
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.full(N_IN, 0.8, np.float32)})
+        for _ in range(300):
+            compiled.step_time(cb)
+        pop.vars["g"].pull_from_device(); g1 = pop.vars["g"].values.copy()
+    assert np.all(g1 <= 0.0)
+    assert np.mean(g1) < np.mean(g0) - 1e-3          # E fires above the 1 Hz target: inhibition strengthens
+    assert len(optimised) > 0
