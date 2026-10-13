@@ -91,3 +91,28 @@ Compare with 02 (your strong run). Check the voltage columns: `v_mean`, `v_p10` 
 - Both lose it → the effect relies on unbounded inhibition (your effective-threshold reading).
 
 Expected: both stay well above 01. If plastic inhibition must hold E at 10 Hz with bounded inhibition, the weights may keep growing; in that case combine with `w_max_rel` (13/14).
+
+## Update: plastic inhibition from the homeostat ("mode": "psi")
+
+|w_IE| += eta · x_I · (psibar_E − psi_target): the hidden rule's homeostat signal, applied deterministically to the inhibitory synapses.
+- psibar is the running mean of the postsynaptic pseudo-derivative, computed exactly as in the hidden rule.
+- Excitatory synapses get the homeostat stochastically (noise trace × |δ|), for feature allocation. Inhibitory synapses get it directly, for activity control. One signal, two routes.
+- Self-limiting: a neuron held far below threshold has psibar ≈ 0 < target, so the inhibition onto it shrinks. The rate mode can't see this, because a neuron at V ≈ −20 still firing at 10 Hz keeps its inhibition.
+
+Full-size CPU smoke test (200 moves, eta 1e-4):
+
+| mode | E rate | mean ψ | I -> E growth |
+|---|---|---|---|
+| rate | 5 Hz | 0.08 | ×1.6–1.8 |
+| psi | 13–20 Hz, held near ψ = 0.1 | 0.09–0.10 | ×0.5–0.7 |
+
+| config | what it is |
+|---|---|
+| 21 | psi mode (eta 1e-5) |
+| 22 | 21 + reversal −1.2 |
+| 23 | psi mode, psi_target 0.05 (sparser, closer to the rate mode's 10 Hz) |
+
+Compare with 02 (rate mode) and 18 (rate + reversal).
+- If 21 or 23 keeps 02's score with a normal V (v_mean, voltage_loss), that is the version for the paper: no extra mechanism, the homeostat extended to inhibitory synapses.
+
+Suggested order: 21, 18, 03, 23, 22.

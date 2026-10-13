@@ -381,7 +381,7 @@ def test_population_rules_override_the_global_rule(request):
     assert "RLTrace" in field_in.vars and "NoiseTrace" not in field_in.vars       # e-prop (global rule)
 
 
-@pytest.mark.parametrize("MODE", ["rate", "covariance"])
+@pytest.mark.parametrize("MODE", ["rate", "covariance", "psi"])
 def test_plastic_inhibition_updates_i_to_e_locally_and_stays_inhibitory(request, MODE):
     rng = np.random.default_rng(0)
     net = Network(default_params)
@@ -425,6 +425,8 @@ def test_plastic_inhibition_updates_i_to_e_locally_and_stays_inhibitory(request,
     assert np.all(g1 <= 0.0) and np.all(g1 >= -0.2 - 1e-6)
     if MODE == "rate":
         assert np.mean(g1) < np.mean(g0) - 1e-3      # E fires above the 1 Hz target: inhibition strengthens
+    elif MODE == "psi":
+        assert "PsiBar" in pop.post_vars and np.abs(g1 - g0).max() > 1e-4
     else:
         assert np.abs(g1 - g0).max() > 1e-4 and "YMean" in pop.post_vars
     assert len(optimised) > 0
@@ -471,3 +473,43 @@ def test_inhibitory_reversal_bounds_hyperpolarisation(request, E_INH):
         assert vmin < -3.0                       # current-based: far below any reversal potential
     else:
         assert vmin >= E_INH - 1e-4 and vmin < -0.3
+
+
+def test_psi_mode_releases_inhibition_onto_hyperpolarised_neurons(request):
+    """E held far below threshold by strong inhibition has psibar ~ 0 < psi_target, so the psi mode weakens the
+    inhibition onto it."""
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, i, Dense(np.full((N_IN, 6), 0.5, np.float32)))
+        i_to_e = Connection(i, e, FixedProbability(1.0, -1.0), exc_inh_sign=-1)
+        Connection(e, pol, Dense(np.zeros((N_HID, 4), np.float32)))
+        Connection(e, val, Dense(np.zeros((N_HID, 1), np.float32)))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(0.0, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="reservoir",
+        plastic_inhibition={i_to_e: {"eta": 1e-3, "mode": "psi"}})
+    compiled = compiler.compile(net, request.node.name)
+    pop = compiled.connection_populations[i_to_e]
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        pop.vars["g"].pull_from_device(); g0 = pop.vars["g"].values.copy()
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.full(N_IN, 0.9, np.float32)})
+        for _ in range(300):
+            compiled.step_time(cb)
+        pop.vars["g"].pull_from_device(); g1 = pop.vars["g"].values.copy()
+    assert np.all(g1 <= 0.0) and np.mean(g1) > np.mean(g0) + 1e-3     # |w| shrinks: inhibition released

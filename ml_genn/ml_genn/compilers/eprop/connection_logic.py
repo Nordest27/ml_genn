@@ -101,7 +101,7 @@ def build_feedback_wum(conn, connect_snippet, compiler, compile_state, target_po
                                           compile_state, alpha)
 
 
-def build_plastic_inhibition_wum(cfg, weight, dt):
+def build_plastic_inhibition_wum(cfg, weight, dt, target_neuron=None):
     """I -> E synapses with anti-Hebbian inhibitory plasticity (PlasticInhibitionConfig): |g| += eta * x_pre *
     (y_post - y0), applied directly every timestep, g kept <= 0. No DeltaG, so the optimiser leaves it alone."""
     decay = float(np.exp(-dt / cfg.tau))
@@ -138,16 +138,39 @@ def build_plastic_inhibition_wum(cfg, weight, dt):
         model["synapse_dynamics_code"] = "g = fmin(0.0, g - Eta * (XTrace - XMean) * (YTrace - YMean));"
         param_vals["MeanDecay"] = float(np.exp(-dt / cfg.tau_mean))
         pre_var_vals["XMean"], post_var_vals["YMean"] = start, start
+    post_refs = {}
+    if cfg.mode == "psi":
+        if not isinstance(target_neuron, AdaptiveLeakyIntegrateFire):
+            raise ValueError("plastic inhibition 'psi' mode needs an ALIF target")
+        # the hidden rule's pseudo-derivative and its running mean, computed here from the postsynaptic state
+        model["params"] += [("Vthresh_post", "scalar"), ("PsiTarget", "scalar"), ("PsiBarDecay", "scalar")]
+        model["post_vars"] += [("Psi", "scalar"), ("PsiBar", "scalar")]
+        post_refs = {"V_post": "V", "A_post": "A", "Beta_post": "Beta", "RefracTime_post": "RefracTime"}
+        model["post_neuron_var_refs"] = [(k, "scalar") for k in post_refs]
+        model["post_dynamics_code"] += """
+if (RefracTime_post > 0.0) {
+    Psi = 0.0;
+}
+else {
+    Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
+}
+PsiBar = PsiBarDecay * PsiBar + (1.0 - PsiBarDecay) * Psi;"""
+        model["synapse_dynamics_code"] = "g = fmin(0.0, g - Eta * XTrace * (PsiBar - PsiTarget));"
+        param_vals.update({"Vthresh_post": target_neuron.v_thresh, "PsiTarget": cfg.psi_target,
+                           "PsiBarDecay": cfg.psibar_decay})
+        post_var_vals.update({"Psi": 0.0, "PsiBar": cfg.psi_target})
     if floor:
         model["synapse_dynamics_code"] += "\n" + floor
     return WeightUpdateModel(model=model, param_vals=param_vals, var_vals={"g": weight},
-                             pre_var_vals=pre_var_vals, post_var_vals=post_var_vals)
+                             pre_var_vals=pre_var_vals, post_var_vals=post_var_vals,
+                             post_neuron_var_refs=post_refs)
 
 
 def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neuron, alpha):
     """Weight-update model for a connection targeting a hidden LIF/ALIF neuron."""
     if conn in compiler.plastic_inhibition:
-        return build_plastic_inhibition_wum(compiler.plastic_inhibition[conn], connect_snippet.weight, compiler.dt)
+        return build_plastic_inhibition_wum(compiler.plastic_inhibition[conn], connect_snippet.weight, compiler.dt,
+                                            target_neuron)
     if isinstance(target_neuron, LeakyIntegrateFire):
         return WeightUpdateModel(
             model=get_hidden_model(HiddenRule.LIF),

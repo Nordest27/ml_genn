@@ -136,15 +136,22 @@ class PlasticInhibitionConfig:
     mode: str = "rate"               # "rate": |w| += eta * x * (y - y0), inhibition also pins the E rate at `rate`;
                                      # "covariance": |w| += eta * (x - xbar) * (y - ybar), xbar / ybar slow running
                                      # means of each neuron's own trace: only co-activity beyond what the two rates
-                                     # predict strengthens inhibition (Foldiak decorrelation, no rate target)
+                                     # predict strengthens inhibition (Foldiak decorrelation, no rate target);
+                                     # "psi": |w| += eta * x * (psibar - psi_target), the hidden rule's homeostat
+                                     # applied deterministically to the inhibitory synapses (psibar = running mean
+                                     # of the postsynaptic pseudo-derivative): inhibition grows onto neurons that
+                                     # sit near threshold more than the target and shrinks onto neurons held far
+                                     # below it (psibar ~ 0), so it cannot drive V into a deep silent regime
     tau_mean: float = 1000.0         # running-mean time constant (ms) of the covariance mode
+    psi_target: float = 0.1          # "psi" mode: target psibar (the homeostat's psi_target)
+    psibar_decay: float = 0.99       # "psi" mode: per-step decay of psibar (as the hidden rule)
     w_max: Optional[float] = None    # cap on |w| (current-based inhibition can otherwise push V without limit; real
                                      # inhibition stops at its reversal potential)
     w_max_rel: Optional[float] = None    # ... the cap as a multiple of the connection's initial mean |w|
 
     def __post_init__(self):
-        if self.mode not in ("rate", "covariance"):
-            raise ValueError(f"plastic inhibition mode must be 'rate' or 'covariance', not {self.mode!r}")
+        if self.mode not in ("rate", "covariance", "psi"):
+            raise ValueError(f"plastic inhibition mode must be 'rate', 'covariance' or 'psi', not {self.mode!r}")
 
 
 def plastic_inhibition_from(value):
