@@ -121,3 +121,33 @@ def test_sheet_sigma_keeps_e_and_i_of_a_layer_on_the_same_neighbourhood():
     assert fan(e, i) == pytest.approx(fan(e, e), rel=0.1)                 # I does not pool its own layer
     assert fan(i, e) == pytest.approx(fan(e, e) * (15 / 20) ** 2, rel=0.15)  # sparser I: fewer inputs, same area
     assert fan(b.input, i) == pytest.approx(fan(b.input, e), rel=0.1)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "local"])
+def test_feedforward_targets_e_removes_the_next_layers_inhibitory_inputs(mode):
+    np.random.seed(0)
+    both = build(toroidal=mode, ei_layers=3)
+    np.random.seed(0)
+    e_only = build(toroidal=mode, ei_layers=3, feedforward_targets="e")
+    def into(b, k, pop):        # sources from layer k projecting into population pop (0: E, 1: I) of layer k + 1
+        return {j for c in b.network.connections if c.target() is b.layers[k + 1][pop]
+                for j, p in enumerate(b.layers[k]) if c.source() is p}     # 0: from E_n, 1: from I_n
+    for k in range(2):
+        assert into(both, k, 1) and not into(e_only, k, 1)          # E_n -> I_n+1 only with "both"
+        assert into(e_only, k, 0) == into(both, k, 0)                # projections into E unchanged
+
+
+def test_to_next_i_none_removes_the_inhibitory_feedforward_in_legacy_mode():
+    np.random.seed(0)
+    b = build(toroidal="legacy", ei_layers=2, network={"layers": [{"to_next_i": {"type": "none"}}, {}]})
+    assert not any(c.source() is b.layers[0][1] and c.target() in b.layers[1] for c in b.network.connections)
+    assert any(c.source() is b.layers[0][0] and c.target() is b.layers[1][0] for c in b.network.connections)
+
+
+def test_inhibitory_connection_lists_per_layer():
+    np.random.seed(0)
+    b = build(toroidal="legacy", ei_layers=3)
+    assert len(b.inhibitory_to_e) == len(b.inhibitory_to_i) == 3
+    for (e, i), ie, ii in zip(b.layers, b.inhibitory_to_e, b.inhibitory_to_i):
+        assert ie.source() is i and ie.target() is e
+        assert ii.source() is i and ii.target() is i

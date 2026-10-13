@@ -405,3 +405,17 @@ CPU_PI_CONN_VARIANTS = [
 ]
 STUDIES["cpu_pi_connectivity"] = {"base": _PI_CONN_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                                   "space": {"*": ("choice", CPU_PI_CONN_VARIANTS)}}
+
+# CPU: Dale's law with locally aware rewiring (small network, legacy connectivity, plain proposed rule)
+_DALE_BASE = {**CPU_SMALL, "toroidal": "legacy", "probe": {"moves": 5000}, "monitor": True, "monitor_every": 10000}
+_P = {"preset": "proposed"}
+_DL = {"every_episodes": 1, "local": True}
+CPU_DALE_VARIANTS = [
+    {"_meta": {"variant": "proposed"}, "hidden_rule": _P},
+    {"_meta": {"variant": "proposed_dale_local"}, "hidden_rule": _P, "dale": _DL},
+    {"_meta": {"variant": "proposed_dale_uniform"}, "hidden_rule": _P, "dale": {**_DL, "local": False}},
+    {"_meta": {"variant": "proposed_pi"}, "hidden_rule": _P, "plastic_inhibition": _PI10},
+    {"_meta": {"variant": "proposed_pi_dale_local"}, "hidden_rule": _P, "plastic_inhibition": _PI10, "dale": _DL},
+]
+STUDIES["cpu_dale"] = {"base": _DALE_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                       "space": {"*": ("choice", CPU_DALE_VARIANTS)}}

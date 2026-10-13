@@ -381,7 +381,7 @@ def test_population_rules_override_the_global_rule(request):
     assert "RLTrace" in field_in.vars and "NoiseTrace" not in field_in.vars       # e-prop (global rule)
 
 
-@pytest.mark.parametrize("MODE", ["rate", "covariance", "psi"])
+@pytest.mark.parametrize("MODE", ["rate", "covariance", "psi", "psi_fast"])
 def test_plastic_inhibition_updates_i_to_e_locally_and_stays_inhibitory(request, MODE):
     rng = np.random.default_rng(0)
     net = Network(default_params)
@@ -425,7 +425,7 @@ def test_plastic_inhibition_updates_i_to_e_locally_and_stays_inhibitory(request,
     assert np.all(g1 <= 0.0) and np.all(g1 >= -0.2 - 1e-6)
     if MODE == "rate":
         assert np.mean(g1) < np.mean(g0) - 1e-3      # E fires above the 1 Hz target: inhibition strengthens
-    elif MODE == "psi":
+    elif MODE in ("psi", "psi_fast"):
         assert "PsiBar" in pop.post_vars and np.abs(g1 - g0).max() > 1e-4
     else:
         assert np.abs(g1 - g0).max() > 1e-4 and "YMean" in pop.post_vars
@@ -475,7 +475,8 @@ def test_inhibitory_reversal_bounds_hyperpolarisation(request, E_INH):
         assert vmin >= E_INH - 1e-4 and vmin < -0.3
 
 
-def test_psi_mode_releases_inhibition_onto_hyperpolarised_neurons(request):
+@pytest.mark.parametrize("MODE", ["psi", "psi_fast"])
+def test_psi_mode_releases_inhibition_onto_hyperpolarised_neurons(request, MODE):
     """E held far below threshold by strong inhibition has psibar ~ 0 < psi_target, so the psi mode weakens the
     inhibition onto it."""
     net = Network(default_params)
@@ -501,7 +502,7 @@ def test_psi_mode_releases_inhibition_onto_hyperpolarised_neurons(request):
         train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
         entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
         value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="reservoir",
-        plastic_inhibition={i_to_e: {"eta": 1e-3, "mode": "psi"}})
+        plastic_inhibition={i_to_e: {"eta": 1e-3, "mode": MODE}})
     compiled = compiler.compile(net, request.node.name)
     pop = compiled.connection_populations[i_to_e]
     cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
@@ -513,3 +514,67 @@ def test_psi_mode_releases_inhibition_onto_hyperpolarised_neurons(request):
             compiled.step_time(cb)
         pop.vars["g"].pull_from_device(); g1 = pop.vars["g"].values.copy()
     assert np.all(g1 <= 0.0) and np.mean(g1) > np.mean(g0) + 1e-3     # |w| shrinks: inhibition released
+
+
+def _dale_net(seed=0):
+    from ml_genn.connectivity import ToroidalGaussian2D
+    np.random.seed(seed)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        a = Population(AdaptiveLeakyIntegrateFire(**alif), (16, 16, 1))
+        b = Population(AdaptiveLeakyIntegrateFire(**alif), (16, 16, 1))
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, a, Dense(weight=0.2))
+        # excitatory by sign, but every weight starts negative: all of them violate Dale's law
+        conn = Connection(a, b, ToroidalGaussian2D(sigma=0.06, fan_in=12, weight=Normal(mean=-0.05, sd=0.001),
+                                                   exact=True), exc_inh_sign=+1)
+        Connection(b, pol, Dense(weight=0.0))
+        Connection(b, val, Dense(weight=0.0))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (a, b):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    return net, conn, pol, val
+
+
+def _toroidal_dist(pre, post, n=16):
+    dy = np.abs(pre // n - post // n); dy = np.minimum(dy, n - dy)
+    dx = np.abs(pre % n - post % n); dx = np.minimum(dx, n - dx)
+    return np.sqrt(dx ** 2 + dy ** 2)
+
+
+@pytest.mark.parametrize("LOCAL", [True, False])
+def test_dale_rewiring_restores_signs_and_local_mode_keeps_new_synapses_local(request, LOCAL):
+    net, conn, pol, val = _dale_net()
+    original = _toroidal_dist(conn.connectivity.pre_ind, conn.connectivity.post_ind)
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(0.0, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="proposed", dale_local_rewiring=LOCAL)
+    compiled = compiler.compile(net, request.node.name)
+    sg = compiled.connection_populations[conn]
+    with compiled:
+        compiled.genn_model.custom_update("DaleInit")
+        for _ in range(30):                       # resistance 0.9: ~10% of the violating synapses rewire per call
+            compiled.genn_model.custom_update("DalePrune")
+            compiled.genn_model.custom_update("DaleRewire")
+        sg.pull_connectivity_from_device()
+        sg.vars["g"].pull_from_device()
+        pre, post = np.asarray(sg.get_sparse_pre_inds()), np.asarray(sg.get_sparse_post_inds())
+        g = np.asarray(sg.vars["g"].values)
+    assert len(pre) == len(original) and np.all(g >= 0.0)        # same synapse count, all excitatory again
+    # most violating synapses are reset to a tiny weight of the right sign (resistance 0.9); look at the rewired ones
+    old = set(zip(conn.connectivity.pre_ind.tolist(), conn.connectivity.post_ind.tolist()))
+    new = np.array([(i, j) for i, j in zip(pre.tolist(), post.tolist()) if (i, j) not in old])
+    assert len(new) > 20
+    far = np.mean(_toroidal_dist(new[:, 0], new[:, 1]) > original.max() + 2)
+    if LOCAL:
+        assert far < 0.05                         # rewired synapses stay in the original neighbourhood
+    else:
+        assert far > 0.3                          # uniform rewiring scatters them across the layer

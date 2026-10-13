@@ -139,9 +139,9 @@ def build_plastic_inhibition_wum(cfg, weight, dt, target_neuron=None):
         param_vals["MeanDecay"] = float(np.exp(-dt / cfg.tau_mean))
         pre_var_vals["XMean"], post_var_vals["YMean"] = start, start
     post_refs = {}
-    if cfg.mode == "psi":
+    if cfg.mode in ("psi", "psi_fast"):
         if not isinstance(target_neuron, AdaptiveLeakyIntegrateFire):
-            raise ValueError("plastic inhibition 'psi' mode needs an ALIF target")
+            raise ValueError(f"plastic inhibition '{cfg.mode}' mode needs an ALIF target")
         # the hidden rule's pseudo-derivative and its running mean, computed here from the postsynaptic state
         model["params"] += [("Vthresh_post", "scalar"), ("PsiTarget", "scalar"), ("PsiBarDecay", "scalar")]
         model["post_vars"] += [("Psi", "scalar"), ("PsiBar", "scalar")]
@@ -155,7 +155,8 @@ else {
     Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
 }
 PsiBar = PsiBarDecay * PsiBar + (1.0 - PsiBarDecay) * Psi;"""
-        model["synapse_dynamics_code"] = "g = fmin(0.0, g - Eta * XTrace * (PsiBar - PsiTarget));"
+        psi = "Psi" if cfg.mode == "psi_fast" else "PsiBar"
+        model["synapse_dynamics_code"] = f"g = fmin(0.0, g - Eta * XTrace * ({psi} - PsiTarget));"
         param_vals.update({"Vthresh_post": target_neuron.v_thresh, "PsiTarget": cfg.psi_target,
                            "PsiBarDecay": cfg.psibar_decay})
         post_var_vals.update({"Psi": 0.0, "PsiBar": cfg.psi_target})

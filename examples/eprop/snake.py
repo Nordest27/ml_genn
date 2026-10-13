@@ -640,10 +640,21 @@ def build_compiled_network(connectivity_type="fixed"):
                                                            "optimise_feedback": HP["optimise_feedback"],
                                                            "train_readout": HP["train_readout"],
                                                            "population_rules": built.population_rules}
+        if HP["dale"] is not None:
+            rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
         if HP["inhibitory_reversal"] is not None:
             rule_kwargs["inhibitory_reversal"] = HP["inhibitory_reversal"]
         if HP["plastic_inhibition"] is not None:
-            rule_kwargs["plastic_inhibition"] = {c: HP["plastic_inhibition"] for c in built.inhibitory_to_e}
+            layers = HP["plastic_inhibition_layers"]            # 1-based layer numbers; None = every layer
+            if layers is not None and any(not 1 <= k <= len(built.inhibitory_to_e) for k in layers):
+                raise ValueError(f"plastic_inhibition_layers {layers}: the network has {len(built.inhibitory_to_e)} layers")
+            rule_kwargs["plastic_inhibition"] = {c: HP["plastic_inhibition"] for k, c in enumerate(built.inhibitory_to_e, 1)
+                                                 if layers is None or k in layers}
+        if HP["plastic_inhibition_i"] is not None:
+            layers = HP["plastic_inhibition_layers"]
+            rule_kwargs.setdefault("plastic_inhibition", {}).update(
+                {c: HP["plastic_inhibition_i"] for k, c in enumerate(built.inhibitory_to_i, 1)
+                 if layers is None or k in layers})
     if HP["optimiser"] == "adam":
         optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999)
     else:
@@ -1628,6 +1639,11 @@ def train_snake_agent_with_ipc(episodes=10000,
 
             # compiled_net.genn_model.custom_update("DalePrune")
             # compiled_net.genn_model.custom_update("DaleRewire")
+            # Dale's law during continuous training: synapses whose weight crossed to the wrong sign are reset to a
+            # tiny weight of the right sign (most) or pruned and rewired (locally aware with "local": true)
+            if HP["dale"] is not None and ep % int(HP["dale"].get("every_episodes", 1)) == 0:
+                compiled_net.genn_model.custom_update("DalePrune")
+                compiled_net.genn_model.custom_update("DaleRewire")
 
             # snake_switch: after a task switch the best run (and its value / probability plots) starts over,
             # so the viewers show the new task; the episode that contains the switch is shown first

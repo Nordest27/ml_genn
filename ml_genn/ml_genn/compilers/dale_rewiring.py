@@ -96,6 +96,11 @@ dale_rewire_model = {
     "params": [
         ("NumRowWords", "unsigned int"),
         ("Sign", "int"),
+        ("Local", "int"),
+        ("PreH", "unsigned int"), ("PreW", "unsigned int"), ("PreC", "unsigned int"),
+        ("PostH", "unsigned int"), ("PostW", "unsigned int"), ("PostC", "unsigned int"),
+        ("SigmaY", "scalar"), ("SigmaX", "scalar"),
+        ("MaxTries", "unsigned int"),
     ],
     "pre_vars": [
         ("NumPruned", "unsigned int")
@@ -109,20 +114,71 @@ dale_rewire_model = {
     "row_update_code": """
     uint32_t *rowConnectivity = Connectivity + (NumRowWords * id_pre);
 
-    while (NumPruned > 0) {
-        const unsigned int j = gennrand() % num_post;
-
-        // Skip if already connected
-        if (rowConnectivity[j / 32] & (1 << (j % 32))) {
-            continue;
+    if (Local) {
+        // locally aware: draw the new target around the presynaptic neuron's position on the sheet (as fractions
+        // of the grid, so grids of different sizes map onto each other), with a Gaussian offset of SigmaY / SigmaX
+        // target cells and toroidal wrapping. Unplaced synapses stay in NumPruned and are retried next call.
+        const unsigned int preCell = id_pre / PreC;
+        const scalar py = ((scalar)(preCell / PreW) + 0.5) / (scalar)PreH * (scalar)PostH;
+        const scalar px = ((scalar)(preCell % PreW) + 0.5) / (scalar)PreW * (scalar)PostW;
+        unsigned int tries = 0;
+        while (NumPruned > 0 && tries < MaxTries) {
+            tries++;
+            int r = (int)floor(py + SigmaY * gennrand_normal());
+            int c = (int)floor(px + SigmaX * gennrand_normal());
+            r = ((r % (int)PostH) + (int)PostH) % (int)PostH;
+            c = ((c % (int)PostW) + (int)PostW) % (int)PostW;
+            const unsigned int j = ((unsigned int)r * PostW + (unsigned int)c) * PostC + (gennrand() % PostC);
+            if (j >= num_post || (rowConnectivity[j / 32] & (1 << (j % 32)))) {
+                continue;
+            }
+            add_synapse(j, Sign * 1e-5 * fabs(gennrand_uniform()));
+            rowConnectivity[j / 32] |= (1 << (j % 32));
+            NumPruned--;
         }
+    }
+    else {
+        while (NumPruned > 0) {
+            const unsigned int j = gennrand() % num_post;
 
-        add_synapse(j, Sign * 1e-5 * fabs(gennrand_uniform()));
-        rowConnectivity[j / 32] |= (1 << (j % 32));
-        NumPruned--;
+            // Skip if already connected
+            if (rowConnectivity[j / 32] & (1 << (j % 32))) {
+                continue;
+            }
+
+            add_synapse(j, Sign * 1e-5 * fabs(gennrand_uniform()));
+            rowConnectivity[j / 32] |= (1 << (j % 32));
+            NumPruned--;
+        }
     }
     """
 }
+
+
+def _grid(shape):
+    shape = tuple(int(s) for s in np.atleast_1d(shape))
+    if len(shape) == 3:
+        return shape
+    if len(shape) == 2:
+        return (shape[0], shape[1], 1)
+    return (1, shape[0], 1)
+
+
+def local_rewiring_geometry(pre_shape, post_shape, pre_ind, post_ind):
+    """Grids of the two populations and the Gaussian width (target cells, per axis) that reproduces the realised
+    spread of an existing connection: the RMS toroidal row / column offset between each synapse's target cell and
+    its source position mapped onto the target grid."""
+    (ph, pw, pc), (qh, qw, qc) = _grid(pre_shape), _grid(post_shape)
+    pre_ind, post_ind = np.asarray(pre_ind, dtype=np.int64), np.asarray(post_ind, dtype=np.int64)
+    pre_cell, post_cell = pre_ind // pc, post_ind // qc
+    py = (pre_cell // pw + 0.5) / ph * qh
+    px = (pre_cell % pw + 0.5) / pw * qw
+    dy = np.abs((post_cell // qw + 0.5) - py); dy = np.minimum(dy, qh - dy)
+    dx = np.abs((post_cell % qw + 0.5) - px); dx = np.minimum(dx, qw - dx)
+    sigma_y = float(np.sqrt(np.mean(dy ** 2))) if len(dy) else 1.0
+    sigma_x = float(np.sqrt(np.mean(dx ** 2))) if len(dx) else 1.0
+    return {"PreH": ph, "PreW": pw, "PreC": pc, "PostH": qh, "PostW": qw, "PostC": qc,
+            "SigmaY": max(sigma_y, 0.5), "SigmaX": max(sigma_x, 0.5)}
 
 # ================================================================
 # Optional callback to record rewiring statistics
@@ -160,7 +216,9 @@ def add_dale_rewiring(
     l1_strength,
     sign,
     weight_var_ref,
-    allow_self_connections=False
+    allow_self_connections=False,
+    geometry=None,
+    max_tries=64
 ):
     """
     Adds Dale-Constrained Rewiring (DCR) to a synapse group,
@@ -199,6 +257,9 @@ def add_dale_rewiring(
         +1 for excitatory, -1 for inhibitory.
     weight_var_ref :
         Var reference to synaptic weight.
+    geometry : dict, optional
+        Locally aware rewiring (local_rewiring_geometry): new synapses are drawn around the presynaptic neuron's
+        position with the connection's own spread instead of uniformly over the target population.
 
     Returns
     -------
@@ -218,6 +279,10 @@ def add_dale_rewiring(
         param_vals={
             "NumRowWords": num_row_words,
             "Sign": sign,
+            "Local": int(geometry is not None),
+            **(geometry or {"PreH": 1, "PreW": 1, "PreC": 1, "PostH": 1, "PostW": 1, "PostC": 1,
+                            "SigmaY": 1.0, "SigmaX": 1.0}),
+            "MaxTries": max_tries,
         },
         pre_var_vals={
             "NumPruned": 0,

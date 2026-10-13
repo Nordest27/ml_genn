@@ -116,3 +116,45 @@ Compare with 02 (rate mode) and 18 (rate + reversal).
 - If 21 or 23 keeps 02's score with a normal V (v_mean, voltage_loss), that is the version for the paper: no extra mechanism, the homeostat extended to inhibitory synapses.
 
 Suggested order: 21, 18, 03, 23, 22.
+
+## Update: "mode": "psi_fast" (config 24)
+
+|w_IE| += eta · x_I · (psi_E − psi_target), using the instantaneous pseudo-derivative.
+
+Averaged over time, each mode splits into a rate part and a co-activity part:
+
+| mode | homeostasis | co-activity term |
+|---|---|---|
+| rate (02) | ρ_I (ρ_E − target) | Cov(x_I, y_E), 20 ms traces: I cells firing with this E neuron gain weight |
+| psi (21) | ρ_I (ψ̄_E − ψ*) | Cov(x_I, ψ̄_E): smoothed over ~100 ms, weak |
+| psi_fast (24) | same as psi | Cov(x_I, ψ_E): I cells active while the E neuron is near threshold gain weight |
+
+How to read them:
+- 21 ≈ 02 → homeostasis is what matters.
+- Only 24 ≈ 02 → the co-activity term matters.
+
+Caveat for every mode: I-mediated decorrelation is limited by how the I cells are tuned. The E -> I synapses learn with the reward-driven hidden rule, not a Hebbian one.
+
+## Update: the homeostat was fighting the plastic inhibition
+
+GPU: proposed (no homeostat) + plastic inhibition (rate mode, 10 Hz).
+- E settles at 6 Hz; the voltage loss grows slowly (1.47).
+- Value function much better; task performance grows faster.
+
+The homeostat (ψ̄ → 0.1, by strengthening excitation) and the plastic inhibition (E → 10 Hz, by strengthening inhibition) had incompatible targets. Both grew without limit, and V sank to ≈ −20.
+
+Earlier failures of the bounded variants (reversal 18/19, psi 21–24) all happened with the homeostat on, so they need re-testing without it:
+
+| config | what it is |
+|---|---|
+| 25 | proposed + PI: the new baseline (second seed of your run) |
+| 26 | 25 + reversal −2.4: does bounding V now keep the benefit? |
+| 27 | 25 + cap at 5× the initial I -> E weights (insurance against a slow runaway) |
+| 28 | 25 with a 6 Hz target (= where E settles: no pressure from PI on the mean) |
+| 29 | centred drift (no homeostat) + PI (centring alone killed the fields before; PI may now keep them alive) |
+| 30 | proposed + psi_fast mode (the homeostat signal on inhibition only, no conflicting target) |
+| 31 | proposed without PI (control) |
+
+Watch over time: `dW|L1_I->L1_E` (still climbing or levelling off), `L1_E_hyper`, `L1_E_v_p10`, `L1_E_dead`, and the voltage loss.
+
+Suggested order: 25, 31, 26, 27, then 28–30. The earlier controls 03 (reservoir + PI) and 05/04 (e-prop ± PI) remain the key checks of whether the rule matters.

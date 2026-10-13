@@ -8,7 +8,7 @@ from pygenn import SynapseMatrixType, create_var_ref, create_wu_var_ref
 from .. import Compiler
 from ..compiled_training_network import CompiledTrainingNetwork
 from ..deep_r import RewiringRecord, add_deep_r
-from ..dale_rewiring import add_dale_rewiring
+from ..dale_rewiring import add_dale_rewiring, local_rewiring_geometry
 from ..compiler import create_reset_custom_update
 from ... import Connection, Population, Network
 from ...callbacks import (BatchProgressBar, CustomUpdateOnBatchBegin,
@@ -197,6 +197,9 @@ class EPropCompiler(Compiler):
                                     "original", "drift_only", "gradient_only",
                                     "unbiased", "eprop", ...). Ignored outside
                                     the RL variant.
+        dale_local_rewiring:         Dale rewiring of topographic (ToroidalGaussian2D) connections draws new
+                                    synapses around the presynaptic neuron with the connection's own spread
+                                    instead of uniformly (keeps the connectivity local; see dale_rewiring)
         inhibitory_reversal:         None (default): current-based synapses. A value E_inh < 0
                                     (rest 0, threshold ~0.61): inhibitory hidden synapses
                                     (exc_inh_sign -1) act through the driving force
@@ -245,6 +248,7 @@ class EPropCompiler(Compiler):
                  hidden_rule="proposed",
                  value_feedback_ret_e: float = 0.0,
                  inhibitory_reversal: Optional[float] = None,
+                 dale_local_rewiring: bool = False,
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
                  population_rules: dict = None,
@@ -291,6 +295,7 @@ class EPropCompiler(Compiler):
         self.plastic_inhibition = {c: plastic_inhibition_from(v) for c, v in (plastic_inhibition or {}).items()}
         self.value_feedback_ret_e = value_feedback_ret_e
         self.inhibitory_reversal = inhibitory_reversal
+        self.dale_local_rewiring = dale_local_rewiring
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
         self.value_reg = value_reg
@@ -540,10 +545,15 @@ class EPropCompiler(Compiler):
 
             if dale_sign is not None:
                 dale_rewiring_required = True
+                geometry = None
+                con = c.connectivity
+                if (self.dale_local_rewiring and getattr(con, "pre_ind", None) is not None
+                        and type(con).__name__ == "ToroidalGaussian2D"):
+                    geometry = local_rewiring_geometry(c.source().shape, c.target().shape, con.pre_ind, con.post_ind)
                 add_dale_rewiring(
                     synapse_group=genn_pop, genn_model=genn_model,
                     compiler=self, l1_strength=self.dale_rewiring_l1_strength,
-                    sign=dale_sign, weight_var_ref=weight_var_ref)
+                    sign=dale_sign, weight_var_ref=weight_var_ref, geometry=geometry)
 
             optimiser_custom_updates.append(
                 self._create_optimiser_custom_update(

@@ -1,0 +1,11 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "legacy",
+ "hidden_rule": {
+  "preset": "proposed"
+ }
+}

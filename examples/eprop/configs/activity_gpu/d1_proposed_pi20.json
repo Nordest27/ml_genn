@@ -1,0 +1,15 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "legacy",
+ "hidden_rule": {
+  "preset": "proposed"
+ },
+ "plastic_inhibition": {
+  "eta": 1e-05,
+  "rate": 20.0
+ }
+}

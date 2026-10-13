@@ -141,7 +141,12 @@ class PlasticInhibitionConfig:
                                      # applied deterministically to the inhibitory synapses (psibar = running mean
                                      # of the postsynaptic pseudo-derivative): inhibition grows onto neurons that
                                      # sit near threshold more than the target and shrinks onto neurons held far
-                                     # below it (psibar ~ 0), so it cannot drive V into a deep silent regime
+                                     # below it (psibar ~ 0), so it cannot drive V into a deep silent regime. Mostly
+                                     # a homeostat: psibar averages over ~100 steps, so it barely sees co-activity;
+                                     # "psi_fast": |w| += eta * x * (psi - psi_target) with the instantaneous psi:
+                                     # the same homeostasis plus a co-activity term (I cells active while the E
+                                     # neuron is near threshold gain weight), Vogels' rule with "near threshold" in
+                                     # place of "just spiked"
     tau_mean: float = 1000.0         # running-mean time constant (ms) of the covariance mode
     psi_target: float = 0.1          # "psi" mode: target psibar (the homeostat's psi_target)
     psibar_decay: float = 0.99       # "psi" mode: per-step decay of psibar (as the hidden rule)
@@ -150,8 +155,9 @@ class PlasticInhibitionConfig:
     w_max_rel: Optional[float] = None    # ... the cap as a multiple of the connection's initial mean |w|
 
     def __post_init__(self):
-        if self.mode not in ("rate", "covariance", "psi"):
-            raise ValueError(f"plastic inhibition mode must be 'rate', 'covariance' or 'psi', not {self.mode!r}")
+        if self.mode not in ("rate", "covariance", "psi", "psi_fast"):
+            raise ValueError("plastic inhibition mode must be 'rate', 'covariance', 'psi' or 'psi_fast', "
+                             f"not {self.mode!r}")
 
 
 def plastic_inhibition_from(value):

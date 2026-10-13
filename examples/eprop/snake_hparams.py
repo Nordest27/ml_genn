@@ -32,6 +32,14 @@ DEFAULTS = {
     "plastic_inhibition": None,  # anti-Hebbian plasticity on every layer's I -> E synapses instead of the hidden rule
                                  # (decorrelates the E neurons; modular compiler only): {} for the defaults or e.g.
                                  # {"eta": 1e-5, "rate": 10.0, "tau": 20.0} (ml_genn.compilers.eprop.PlasticInhibitionConfig)
+    "plastic_inhibition_i": None,    # the same plasticity on every layer's I -> I synapses, with its own settings
+                                 # (e.g. {"eta": 1e-5, "rate": 20.0}): the I population regulates itself; without it
+                                 # the drift pushes I's excitatory inputs up unchecked (~100 Hz on the GPU)
+    "plastic_inhibition_layers": None,   # which layers get it (1-based, e.g. [1]); None = every layer
+    "dale": None,                # enforce Dale's law during training (modular compiler): {"every_episodes": 1,
+                                 # "local": true}: sign-violating synapses are reset or pruned and rewired at episode
+                                 # ends; "local": new synapses drawn around the source with the connection's own
+                                 # spread (false: uniformly over the target population, which loses locality)
     "inhibitory_reversal": None, # conductance-like inhibition: inhibitory synapses scaled by (V - E_inh) / -E_inh, so
                                  # V cannot be pushed below E_inh (e.g. -1.2 = 2 thresholds below rest); None =
                                  # current-based (modular compiler only)
@@ -53,6 +61,8 @@ DEFAULTS = {
     # task and architecture
     "board_size": 5,             # larger boards are harder (the view stays visible_range = 5)
     "ei_layers": 1,              # stacked EI layers between the input and the fields (depth)
+    "feedforward_targets": "both",   # layer n -> layer n+1: "both" (E and I; disynaptic feedforward inhibition) or
+                                 # "e" (E only: the next layer's I cells are driven by their own layer)
     "network": None,             # overrides of the network spec (snake_network.py), e.g.
                                  # {"layers": [{"e": 30}, {"e": 20}, {"e": 10, "rule": {"preset": "eprop"}}],
                                  #  "fields": {"shape": 6}, "input": {"fan_in": 200}}; "fields": null = no fields

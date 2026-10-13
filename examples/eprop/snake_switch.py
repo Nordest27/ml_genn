@@ -248,12 +248,16 @@ class NeuronMonitor:
                 sg.vars["g"].pull_from_device()
                 w0 = np.asarray(sg.vars["g"].values, dtype=np.float64).copy()
                 src = name_of.get(c.source(), c.source().name)
-                self.weight_groups.append((f"{src}->{name_of[c.target()]}", sg, w0, np.linalg.norm(w0) + 1e-12))
+                self.weight_groups.append((f"{src}->{name_of[c.target()]}", sg, w0, np.linalg.norm(w0) + 1e-12,
+                                           getattr(c, "exc_inh_sign", None)))
         cols = ["timestep", "moves", "switch"]
         for l in self.labels:
             cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
                      f"{l}_recovered", f"{l}_vloss", f"{l}_v_mean", f"{l}_v_p10", f"{l}_v_p90", f"{l}_hyper"]
         cols += [f"dW|{name}" for name, *_ in self.weight_groups]
+        # Dale's law is not enforced during continuous training: fraction of each sign-constrained group's synapses
+        # whose weight has crossed to the other sign (E source: g < 0; I source: g > 0)
+        cols += [f"flip|{name}" for name, *_, sign in self.weight_groups if sign is not None]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
 
@@ -303,9 +307,14 @@ class NeuronMonitor:
             self.prev_dead[i] = dead
             self.psi_sum[i][:] = 0
             self.spikes[i][:] = 0
-        for name, sg, w0, n0 in self.weight_groups:
+        flips = []
+        for name, sg, w0, n0, sign in self.weight_groups:
             sg.vars["g"].pull_from_device()
-            row.append(float(np.linalg.norm(np.asarray(sg.vars["g"].values, dtype=np.float64) - w0) / n0))
+            g = np.asarray(sg.vars["g"].values, dtype=np.float64)
+            row.append(float(np.linalg.norm(g - w0) / n0))
+            if sign is not None:
+                flips.append(float(np.mean(sign * g < 0)))
+        row += flips
         self.samples = 0
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])

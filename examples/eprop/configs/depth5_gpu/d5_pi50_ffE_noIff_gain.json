@@ -1,0 +1,54 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "legacy",
+ "ei_layers": 5,
+ "hidden_rule": {
+  "preset": "proposed"
+ },
+ "plastic_inhibition": {
+  "eta": 1e-05,
+  "rate": 50.0
+ },
+ "feedforward_targets": "e",
+ "network": {
+  "layers": [
+   {
+    "to_next_i": {
+     "type": "none"
+    },
+    "to_next": {
+     "mean_scale": 0.5
+    }
+   },
+   {
+    "to_next_i": {
+     "type": "none"
+    },
+    "to_next": {
+     "mean_scale": 0.5
+    }
+   },
+   {
+    "to_next_i": {
+     "type": "none"
+    },
+    "to_next": {
+     "mean_scale": 0.5
+    }
+   },
+   {
+    "to_next_i": {
+     "type": "none"
+    },
+    "to_next": {
+     "mean_scale": 0.5
+    }
+   },
+   {}
+  ]
+ }
+}

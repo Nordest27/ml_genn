@@ -79,6 +79,11 @@ class LayerSpec:
                                                                # feedforward inhibition outweighs the excitation 3:1;
                                                                # mean_scale 0.033 here balances it
     rule: Optional[Union[str, dict]] = None                    # learning rule of this layer (None: the default)
+    to_next_targets: str = "both"                              # "both": this layer projects to the next layer's E and
+                                                               # I populations (disynaptic feedforward inhibition:
+                                                               # E_n -> I_n+1 -> E_n+1); "e": to its E population only,
+                                                               # so the next layer's I cells are driven by their own
+                                                               # layer (feedback inhibition only)
 
 
 @dataclass
@@ -116,6 +121,7 @@ class Built:
     labels: dict          # Population -> name used in logs (L1_E, L1_I, ..., policy_field, value_field)
     population_rules: dict    # Population -> rule (only populations with their own rule)
     inhibitory_to_e: list = field(default_factory=list)   # the I -> E connection of every layer
+    inhibitory_to_i: list = field(default_factory=list)   # the I -> I connection of every layer
 
     @property
     def hidden(self):
@@ -208,7 +214,7 @@ def _alif(neuron: NeuronSpec, node_sigma):
 
 def build_network(spec: NetworkSpec, default_params) -> Built:
     network = Network(default_params)
-    labels, rules, i_to_e = {}, {}, []
+    labels, rules, i_to_e, i_to_i = {}, {}, [], []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
         layers = []
@@ -222,6 +228,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                exc_inh_sign=sign)
                 if pre is i and post is e:
                     i_to_e.append(c)
+                elif pre is i and post is i:
+                    i_to_i.append(c)
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
@@ -251,7 +259,9 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                     (layers[k][1], ls.i_shape, ls.fan_in_i, -1, ls.to_next_i or ls.to_next)):
                 if conn.type == "none":
                     continue
-                for target in layers[k + 1]:
+                if ls.to_next_targets not in ("both", "e"):
+                    raise ValueError(f"to_next_targets must be 'both' or 'e', not {ls.to_next_targets!r}")
+                for target in (layers[k + 1] if ls.to_next_targets == "both" else layers[k + 1][:1]):
                     Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape,
                                                          src_sheet=ls.e_shape, tgt_sheet=spec.layers[k + 1].e_shape),
                                exc_inh_sign=sign)
@@ -295,7 +305,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                         Connection(pop, head, FixedProbability(spec.feedback_p,
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
-    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e)
+    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -316,9 +326,9 @@ def _merge(obj, d):
             raise KeyError(f"{type(obj).__name__} has no field '{k}' (fields: {sorted(names)})")
         cur = getattr(obj, k)
         off = cur is None or getattr(cur, "type", None) == "none"
-        if off and k == "to_next_i" and isinstance(v, dict) and v.get("type") != "none":
+        if off and k == "to_next_i" and isinstance(v, dict):
             cur = obj.to_next                   # inhibitory feedforward: start from the layer's to_next settings
-        if off and k == "conn_i" and isinstance(v, dict) and v.get("type") != "none":
+        if off and k == "conn_i" and isinstance(v, dict):
             cur = obj.conn
         kw[k] = _merge(cur, v) if hasattr(cur, "__dataclass_fields__") and isinstance(v, dict) else v
     return replace(obj, **kw)
@@ -397,7 +407,7 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
     def base_layer(k):
         return LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
                          fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), to_next=conn(k + 1, ff=True),
-                         to_next_i=ff_i)
+                         to_next_i=ff_i, to_next_targets=hp.get("feedforward_targets", "both"))
     spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions, input=input_conn,
                        layers=[base_layer(k) for k in range(hp["ei_layers"])],
                        fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], ff="field", p=0.005),
