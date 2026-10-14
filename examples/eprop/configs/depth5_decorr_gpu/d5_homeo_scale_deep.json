@@ -1,0 +1,25 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "legacy",
+ "ei_layers": 5,
+ "hidden_rule": {
+  "preset": "proposed_homeostat",
+  "homeostat": 1.0,
+  "center_drift": true
+ },
+ "plastic_inhibition": {
+  "eta": 0.001,
+  "mode": "covariance",
+  "scaling": 0.01
+ },
+ "plastic_inhibition_layers": [
+  2,
+  3,
+  4,
+  5
+ ]
+}

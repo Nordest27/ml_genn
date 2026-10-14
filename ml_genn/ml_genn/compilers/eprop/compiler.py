@@ -76,6 +76,7 @@ class CompileState:
         self.pert_eps_transport_connections = []
         self.backprop_connections = []           # hidden -> hidden synapses sending the backward signal
         self.inhibitory_connections = []         # inhibitory hidden synapses (conductance-like inhibition)
+        self.pi_scaled_connections = []          # plastic inhibitory synapses with local scaling (-> ISynPI)
         self.value_feedback_connections = []
         self.policy_feedback_connections = []
         self.value_regularisation_connections = []
@@ -293,6 +294,18 @@ class EPropCompiler(Compiler):
         # per-population rules (e.g. perturbation-based in wide layers, e-prop in narrow ones); they take precedence
         self.population_rules = {p: get_hidden_rule(r) for p, r in (population_rules or {}).items()}
         self.plastic_inhibition = {c: plastic_inhibition_from(v) for c, v in (plastic_inhibition or {}).items()}
+        # populations whose incoming plastic inhibition uses local synaptic scaling: they track their inhibition
+        rules = [r for r in (self.hidden_rule, *self.population_rules.values()) if r is not None]
+        # an inhibitory input channel (ISynInh) when inhibition acts through a reversal potential or a rule needs
+        # to know the inhibition its neurons receive (decorrelation reward)
+        self.inhibitory_channel = (inhibitory_reversal is not None or
+                                   any(r.local is not None and r.local.decorr != 0 for r in rules))
+        self.inhibition_scaling = {}
+        for c, cfg in self.plastic_inhibition.items():
+            if cfg.scaling > 0:
+                prev = self.inhibition_scaling.setdefault(c.target(), (cfg.scaling_tau, cfg.scaling_warmup))
+                if prev != (cfg.scaling_tau, cfg.scaling_warmup):
+                    raise ValueError("plastic inhibition scaling: one scaling_tau / scaling_warmup per population")
         self.value_feedback_ret_e = value_feedback_ret_e
         self.inhibitory_reversal = inhibitory_reversal
         self.dale_local_rewiring = dale_local_rewiring
@@ -372,9 +385,11 @@ class EPropCompiler(Compiler):
                 f"E-prop compiler doesn't support connections targeting "
                 f"{type(target_neuron).__name__} neurons")
 
-        if (self.inhibitory_reversal is not None and not conn.is_feedback and conn.exc_inh_sign == -1
+        if (self.inhibitory_channel and not conn.is_feedback and conn.exc_inh_sign == -1
                 and isinstance(target_neuron, AdaptiveLeakyIntegrateFire)):
             compile_state.inhibitory_connections.append(conn)
+        elif conn in self.plastic_inhibition and self.plastic_inhibition[conn].scaling > 0:
+            compile_state.pi_scaled_connections.append(conn)
         compile_state.checkpoint_connection_vars.append((conn, "g"))
         # adaptive feedback connections have DeltaG; they are optimised only on request
         # (the original implementation never optimised them)
@@ -427,6 +442,16 @@ class EPropCompiler(Compiler):
                 neuron_logic.enable_node_noise(model_copy)
         if self.inhibitory_reversal is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             neuron_logic.add_inhibitory_reversal(model_copy, self.inhibitory_reversal)
+        elif self.inhibitory_channel and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            neuron_logic.add_inhibitory_channel(model_copy)
+        if self.gamma_lambda is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            local = self.rule_for(pop).local
+            if local is not None and local.decorr != 0:
+                neuron_logic.add_decorr_tracking(model_copy, local.decorr_tau, self.dt)
+        if pop in self.inhibition_scaling and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            tau, warmup = self.inhibition_scaling[pop]
+            neuron_logic.add_inhibition_tracking(model_copy, tau, warmup, self.dt,
+                                                 reversal=self.inhibitory_channel)
 
         if not isinstance(pop.neuron, (AdaptiveLeakyIntegrateFire, LeakyIntegrateFire)):
             raise NotImplementedError(f"E-prop compiler doesn't support "
@@ -502,6 +527,8 @@ class EPropCompiler(Compiler):
             connection_populations[c].pre_target_var = "ISynFeedback"
         for c in compile_state.inhibitory_connections:
             connection_populations[c].post_target_var = "ISynInh"
+        for c in compile_state.pi_scaled_connections:
+            connection_populations[c].post_target_var = "ISynPI"
 
         if self.gamma_lambda is None:
             return

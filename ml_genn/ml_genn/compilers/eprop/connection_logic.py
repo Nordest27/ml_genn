@@ -160,6 +160,16 @@ PsiBar = PsiBarDecay * PsiBar + (1.0 - PsiBarDecay) * Psi;"""
         param_vals.update({"Vthresh_post": target_neuron.v_thresh, "PsiTarget": cfg.psi_target,
                            "PsiBarDecay": cfg.psibar_decay})
         post_var_vals.update({"Psi": 0.0, "PsiBar": cfg.psi_target})
+    if cfg.scaling > 0:
+        # local synaptic scaling: the synapse's own weight and two variables of its postsynaptic neuron
+        model["params"].append(("EtaS", "scalar"))
+        param_vals["EtaS"] = cfg.scaling
+        post_refs.update({"InhAvg_post": "InhAvg", "InhTarget_post": "InhTarget"})
+        model["post_neuron_var_refs"] = [(k, "scalar") for k in post_refs]
+        model["synapse_dynamics_code"] += (
+            "\nif (InhTarget_post > 0.0) {\n"
+            "    g *= fmax(0.0, 1.0 - EtaS * (InhAvg_post - InhTarget_post) / InhTarget_post);\n"
+            "}")
     if floor:
         model["synapse_dynamics_code"] += "\n" + floor
     return WeightUpdateModel(model=model, param_vals=param_vals, var_vals={"g": weight},

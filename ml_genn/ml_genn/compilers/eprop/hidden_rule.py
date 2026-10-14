@@ -13,6 +13,7 @@ GeNN runs the weight update's ``post_dynamics_code`` after the neuron's integrat
 threshold/reset, and the synapse dynamics after the reset (see the paper's Appendix D.6).
 """
 
+import numpy as np
 from pygenn import VarAccess
 
 from .variants import (HiddenRuleConfig, NoisePlacement, Estimator, LocalRoute, DVMode)
@@ -92,6 +93,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     vreg_w = (c_reg if local is None or local.vreg is None else local.vreg)
     rate_w = (c_reg if local is None or local.rate is None else local.rate)
     use_rate_local = local is not None and rate_w != 0
+    use_decorr = local is not None and local.decorr != 0
+    if use_decorr and not use_local_post:
+        raise ValueError("the decorrelation reward needs a GRADIENT_INSTANT or GRADIENT_TRACE local route")
     use_favg = cfg.fire_rate_gradient or use_rate_local
     use_backprop = cfg.backprop != 0
     send_back = send_back and use_backprop
@@ -142,8 +146,10 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     post_var_vals = {"Psi": 0.0}
     for name, used in (("FAvg", use_favg), ("FAvgTrace", use_rate_local), ("Z", use_dvc),
                        ("PrevV", use_prevv), ("DVc", use_dvc), ("PsiBar", uses_psibar),
+                       ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
                        ("TdMean", cfg.center_drift), ("AbsTd", cfg.homeostat != 0),
-                       ("LocR", use_local_post), ("LocMean", use_local_post)):
+                       ("LocR", use_local_post), ("LocMean", use_local_post),
+                       ("ZDec", use_decorr), ("ZDecMean", use_decorr)):
         if used:
             post_vars.append((name, "scalar")); post_var_vals[name] = 0.0
 
@@ -165,6 +171,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         post_spike.append("FAvg += (1.0 - AlphaFAv);")
     if use_dvc:
         post_spike.append("Z = 1.0;")
+    if use_decorr:
+        post_spike.append("ZDec = 1.0;")
+        post_refs.update({"InhNow_post": "InhNow", "InhMean_post": "InhMean"})
     post_dyn = []
     if use_dvc:   # change from the previous post-reset voltage (relative reset by Vthresh)
         post_dyn.append("DVc = fabs(V_post - (PrevV - Vthresh_post * Z));")
@@ -181,6 +190,11 @@ else {
 }""")
     if uses_psibar:
         post_dyn.append(f"PsiBar = {_f(cfg.psibar_decay)} * PsiBar + {_f(1 - cfg.psibar_decay)} * Psi;")
+        if cfg.homeostat != 0 and cfg.psi_target_warmup is not None:
+            # the neuron's own psibar at the warm-up time becomes its homeostat target (identical in every synapse
+            # group of the neuron: they all compute the same PsiBar from the same postsynaptic state)
+            post_dyn.append(f"if (PsiTargetN == 0.0 && t >= {float(cfg.psi_target_warmup)!r}) {{ "
+                            "PsiTargetN = fmax(PsiBar, 1e-4); }")
     if cfg.center_drift:
         post_dyn.append(f"TdMean = {_f(cfg.td_stats_decay)} * TdMean + {_f(1 - cfg.td_stats_decay)} * (TdE_post + PRew_post);")
     if cfg.homeostat != 0:
@@ -195,8 +209,16 @@ else {
             terms.append(f"- {_f(vreg_w)} * (fmax(0.0, V_post - thrL) + fmax(0.0, -V_post - thrL))")
         if rate_w != 0:
             terms.append(f"+ {_f(rate_w)} * (FAvgTrace - fabs(FAvg - FTarget))")
+        if use_decorr:
+            # spiking in step with the received inhibition = redundancy with the cells that drive it
+            terms.append(f"- {_f(local.decorr)} * (ZDec - ZDecMean) * (InhNow_post - InhMean_post)"
+                         " / (InhMean_post + 1e-6)")
         post_dyn.append("LocR = 0.0 " + " ".join(terms) + ";")
         post_dyn.append(f"LocMean = {_f(local.baseline_decay)} * LocMean + {_f(1 - local.baseline_decay)} * LocR;")
+        if use_decorr:
+            zd = float(np.exp(-1.0 / local.decorr_tau))          # dt = 1 ms
+            post_dyn.append(f"ZDecMean = {zd!r} * ZDecMean + {1.0 - zd!r} * ZDec;")
+            post_dyn.append("ZDec = 0.0;")
     if use_prevv:
         post_dyn.append("PrevV = V_post;")
 
@@ -234,7 +256,9 @@ else {
             syn.append("const scalar zPsi = 1.7320508 * (2.0 * (sin((scalar)id_post * 12.9898) * 43758.5453"
                        " - floor(sin((scalar)id_post * 12.9898) * 43758.5453)) - 1.0);")
             target = f"({target} * exp({_f(cfg.psi_target_spread)} * zPsi))"
-        dg.append(f"{_f(cfg.homeostat)} * AbsTd * (PsiBar - {target}) * RLNoisePtrace")
+        deviation = (f"(PsiBar - {target})" if cfg.psi_target_warmup is None
+                     else "(PsiTargetN > 0.0 ? (PsiBar - PsiTargetN) : 0.0)")
+        dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
     if use_eprop:
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
     if use_backprop:

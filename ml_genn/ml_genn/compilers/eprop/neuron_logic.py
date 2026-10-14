@@ -283,6 +283,53 @@ def add_inhibitory_reversal(model_copy, e_inh):
     model_copy.replace_sim_code(source, f"V = Alpha * V + Isyn + ({e_inh!r} - V) * (1.0 - exp(-fmax(0.0, ISynInh / ({e_inh!r}))))")
 
 
+def add_inhibitory_channel(model_copy):
+    """Route inhibitory synapses to their own input ISynInh, added to the membrane like Isyn (current-based, as
+    before); used when the neuron needs to know the inhibition it receives (decorrelation reward)."""
+    model_copy.add_additional_input_var("ISynInh", "scalar", 0.0)
+    sim = model_copy.model.get("sim_code", "")
+    source = "V = Alpha * V + Isyn"
+    if sim.count(source) != 1:
+        raise RuntimeError("inhibitory channel: the ALIF membrane update was not found exactly once")
+    model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + ISynInh")
+
+
+def add_decorr_tracking(model_copy, tau, dt):
+    """Neuron state for the decorrelation reward: InhNow, the magnitude of the inhibitory input this step, and
+    InhMean, its running average (time constant tau)."""
+    model_copy.add_var("InhNow", "scalar", 0.0)
+    model_copy.add_var("InhMean", "scalar", 0.0)
+    decay = float(np.exp(-dt / tau))
+    model_copy.append_sim_code(f"""
+        InhNow = fabs(ISynInh);
+        InhMean = {decay!r} * InhMean + {1.0 - decay!r} * InhNow;
+        """)
+
+
+def add_inhibition_tracking(model_copy, tau, warmup, dt, reversal):
+    """Neuron state for local synaptic scaling of plastic inhibition: InhAvg, a running average (time constant tau)
+    of the magnitude of the inhibitory current received on the plastic-inhibition channel, and InhTarget, that
+    average captured once at time `warmup`. Without an inhibitory reversal the plastic inhibitory synapses get their
+    own input channel ISynPI, added to the membrane like Isyn; with it they share ISynInh."""
+    channel = "ISynInh" if reversal else "ISynPI"
+    if not reversal:
+        model_copy.add_additional_input_var("ISynPI", "scalar", 0.0)
+        sim = model_copy.model.get("sim_code", "")
+        source = "V = Alpha * V + Isyn"
+        if sim.count(source) != 1:
+            raise RuntimeError("inhibition tracking: the ALIF membrane update was not found exactly once")
+        model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + ISynPI")
+    model_copy.add_var("InhAvg", "scalar", 0.0)
+    model_copy.add_var("InhTarget", "scalar", 0.0)
+    decay = float(np.exp(-dt / tau))
+    model_copy.append_sim_code(f"""
+        InhAvg = {decay!r} * InhAvg + {1.0 - decay!r} * fabs({channel});
+        if (InhTarget == 0.0 && t >= {float(warmup)!r}) {{
+            InhTarget = fmax(InhAvg, 1e-6);
+        }}
+        """)
+
+
 def enable_node_noise(model_copy):
     """Turn on membrane ("node") noise in an ALIF hidden neuron: PertEps = Sigma * N(0, 1) is added to
     the membrane and filtered into PertEpsTrace by the neuron model itself."""

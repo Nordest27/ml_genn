@@ -419,3 +419,92 @@ CPU_DALE_VARIANTS = [
 ]
 STUDIES["cpu_dale"] = {"base": _DALE_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                        "space": {"*": ("choice", CPU_DALE_VARIANTS)}}
+
+# CPU: decorrelation without lowering activity -- covariance plastic inhibition whose total per neuron is held fixed
+# (heterosynaptic normalisation), so it only redistributes inhibition; Dale with local rewiring throughout
+_DEC_BASE = {**_DALE_BASE, "dale": _DL}
+_COV = {"eta": 1e-5, "mode": "covariance"}
+_CREG30 = {"c_reg": 1e-3, "f_target": 30.0}
+CPU_DECORR_VARIANTS = [
+    {"_meta": {"variant": "base"}, "hidden_rule": _P},
+    {"_meta": {"variant": "cov"}, "hidden_rule": _P, "plastic_inhibition": _COV},
+    {"_meta": {"variant": "cov_norm"}, "hidden_rule": _P, "plastic_inhibition": {**_COV, "normalise": True}},
+    {"_meta": {"variant": "cov_norm_eta1e-4"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 1e-4, "normalise": True}},
+    {"_meta": {"variant": "cov_norm_creg30"}, "hidden_rule": _P, "plastic_inhibition": {**_COV, "normalise": True},
+     **_CREG30},
+    {"_meta": {"variant": "creg30"}, "hidden_rule": _P, **_CREG30},
+]
+STUDIES["cpu_decorr"] = {"base": _DEC_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                         "space": {"*": ("choice", CPU_DECORR_VARIANTS)}}
+
+# CPU: the local version of the normalisation -- synaptic scaling from the neuron's own received inhibition
+# (compare with cpu_decorr's base and cov_norm_eta1e-4: identical base config and seeds, runs are deterministic)
+CPU_DECORR_LOCAL_VARIANTS = [
+    {"_meta": {"variant": "cov_scale_eta1e-4"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 1e-4, "scaling": 1e-3}},
+    {"_meta": {"variant": "cov_scale_eta1e-4_s1e-2"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 1e-4, "scaling": 1e-2}},
+    {"_meta": {"variant": "cov_scale_eta1e-3"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 1e-3, "scaling": 1e-3}},
+]
+STUDIES["cpu_decorr_local"] = {"base": _DEC_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                               "space": {"*": ("choice", CPU_DECORR_LOCAL_VARIANTS)}}
+
+# CPU: local scaling with its strength matched to the redistribution rate
+CPU_DECORR_MATCHED_VARIANTS = [
+    {"_meta": {"variant": "cov_scale_eta1e-3_s1e-2"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 1e-3, "scaling": 1e-2}},
+    {"_meta": {"variant": "cov_scale_eta3e-4_s3e-3"}, "hidden_rule": _P,
+     "plastic_inhibition": {**_COV, "eta": 3e-4, "scaling": 3e-3}},
+]
+STUDIES["cpu_decorr_matched"] = {"base": _DEC_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                 "space": {"*": ("choice", CPU_DECORR_MATCHED_VARIANTS)}}
+
+# CPU: decorrelation as room for exploration -- targeted, bounded inhibition (covariance + local scaling) plus a weak
+# homeostat whose target is each neuron's own psibar after the warm-up (redundant neurons are suppressed by the
+# inhibition and pushed by the homeostat to find unexplained input). All local.
+_SCALE = {**_COV, "eta": 1e-4, "scaling": 1e-3}
+_HOMEO_W = {"preset": "proposed_homeostat", "psi_target_warmup": 3000.0}
+CPU_EXPLORE_VARIANTS = [
+    {"_meta": {"variant": "scale_homeo0.3"}, "hidden_rule": {**_HOMEO_W, "homeostat": 0.3},
+     "plastic_inhibition": _SCALE},
+    {"_meta": {"variant": "scale_homeo1"}, "hidden_rule": {**_HOMEO_W, "homeostat": 1.0},
+     "plastic_inhibition": _SCALE},
+    {"_meta": {"variant": "homeo0.3_only"}, "hidden_rule": {**_HOMEO_W, "homeostat": 0.3}},
+    {"_meta": {"variant": "scale_slow"}, "hidden_rule": _P, "plastic_inhibition": {**_SCALE, "tau_mean": 10000.0}},
+]
+STUDIES["cpu_explore"] = {"base": _DEC_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                          "space": {"*": ("choice", CPU_EXPLORE_VARIANTS)}}
+
+# CPU: a local decorrelation reward (LocalObjectives.decorr: penalises spiking in step with the received inhibition),
+# driving every synapse of the rule through the local policy-gradient route, alone and with matched scaling
+_DEC_LOCAL = lambda c: {"preset": "proposed", "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0,
+                                                        "rate": 0.0, "decorr": c}}
+_SCALE_M = {**_COV, "eta": 1e-3, "scaling": 1e-2}
+CPU_DECORR_REWARD_VARIANTS = [
+    {"_meta": {"variant": "decorr0.1"}, "hidden_rule": _DEC_LOCAL(0.1)},
+    {"_meta": {"variant": "decorr1"}, "hidden_rule": _DEC_LOCAL(1.0)},
+    {"_meta": {"variant": "scale+decorr0.1"}, "hidden_rule": _DEC_LOCAL(0.1), "plastic_inhibition": _SCALE_M},
+    {"_meta": {"variant": "scale+decorr1"}, "hidden_rule": _DEC_LOCAL(1.0), "plastic_inhibition": _SCALE_M},
+]
+STUDIES["cpu_decorr_reward"] = {"base": _DEC_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                                "space": {"*": ("choice", CPU_DECORR_REWARD_VARIANTS)}}
+
+# CPU: 5-layer training from the architecture search's winner (narrow feed-forward 0.45 cells, 6x6 fields with a
+# narrow projection, layer-wise rate calibration folded into the weight scales) vs legacy and the local default
+import json as _json
+from pathlib import Path as _Path
+_WIN = _Path("/home/user/repos/personal/analysis/reservoir_sweep2/ff0.45_field6_narrow-cal/result.json")
+_WIN_CFG = _json.loads(_WIN.read_text())["snake_config"] if _WIN.exists() else {}
+_D5_BASE = {**CPU_SMALL, "ei_layers": 5, "probe": {"moves": 5000}, "monitor": True, "monitor_every": 10000}
+_ARCH = {
+    "legacy": {"toroidal": "legacy"},
+    "local": {"toroidal": "local", "local": {"sigma_cells": 1.0, "input_sigma_ref": "source"}},
+    "winner": {k: v for k, v in _WIN_CFG.items() if k not in ("ei_layers", "hid_e", "hid_i", "fan_in")},
+}
+_RULES5 = {"prop_homeo_c": _HC, "proposed": _P}
+CPU_DEPTH5_ARCH_VARIANTS = [{"_meta": {"variant": f"{r}|{a}"}, "hidden_rule": rule, **arch}
+                            for a, arch in _ARCH.items() for r, rule in _RULES5.items()]
+STUDIES["cpu_depth5_arch"] = {"base": _D5_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
+                              "space": {"*": ("choice", CPU_DEPTH5_ARCH_VARIANTS)}}

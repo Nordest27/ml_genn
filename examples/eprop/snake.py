@@ -620,6 +620,19 @@ hidden_layers = {}
 # The network is built by snake_network.py from the "network" config (see snake_hparams.py).
 
 
+def plastic_inhibition_connections(built):
+    """{Connection: settings} of the plastic inhibitory synapses: every layer's I -> E ("plastic_inhibition") and
+    I -> I ("plastic_inhibition_i"), restricted to "plastic_inhibition_layers" (1-based; None = every layer)."""
+    layers = HP["plastic_inhibition_layers"]
+    if layers is not None and any(not 1 <= k <= len(built.inhibitory_to_e) for k in layers):
+        raise ValueError(f"plastic_inhibition_layers {layers}: the network has {len(built.inhibitory_to_e)} layers")
+    out = {}
+    for key, conns in (("plastic_inhibition", built.inhibitory_to_e), ("plastic_inhibition_i", built.inhibitory_to_i)):
+        if HP[key] is not None:
+            out.update({c: HP[key] for k, c in enumerate(conns, 1) if layers is None or k in layers})
+    return out
+
+
 def build_compiled_network(connectivity_type="fixed"):
     global dale_l1_reg
     spec = snake_network.spec_from_hparams(HP, INPUT_SHAPE, NUM_OUTPUT, channels=INPUT_C)
@@ -1227,6 +1240,14 @@ def train_snake_agent_with_ipc(episodes=10000,
             monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
                                                  f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
                                                  report_every=HP["monitor_every"])
+        normaliser = None
+        normalised = {c: cfg for c, cfg in plastic_inhibition_connections(built).items() if cfg.get("normalise")}
+        if normalised:
+            from inhibition_normaliser import InhibitionNormaliser
+            every = {int(cfg.get("normalise_every", 10)) for cfg in normalised.values()}
+            if len(every) != 1:
+                raise ValueError("plastic inhibition: use one normalise_every for all normalised connections")
+            normaliser = InhibitionNormaliser(compiled_net, list(normalised), every.pop())
         probe = None
         if HP["probe"]:
             probe = snake_switch.ProbeRecorder(compiled_net, built.hidden, [built.labels[p] for p in built.hidden],
@@ -1487,6 +1508,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 if monitor is not None and env.wait_count == env.wait_inc:
                     monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
+                if normaliser is not None and env.wait_count == env.wait_inc:
+                    normaliser.move()
                 if probe is not None and env.wait_count == env.wait_inc and not done:
                     probe.sample(env)
 

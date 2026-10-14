@@ -121,6 +121,11 @@ class LocalObjectives:
     rate: Optional[float] = None     # weight of the firing-rate reward (None: the compiler's c_reg)
     dv_mode: DVMode = DVMode.CORRECT
     baseline_decay: float = 0.999    # per-neuron running mean subtracted (GRADIENT_* routes only)
+    decorr: float = 0.0              # weight of the decorrelation reward -(z - zbar)(I_inh - Ibar_inh) / Ibar_inh:
+                                     # penalises spiking in step with the inhibition the neuron receives (redundancy
+                                     # with the cells that drive that inhibition). Neuron-local: its own spikes and
+                                     # its own total inhibitory input (GRADIENT_* routes only)
+    decorr_tau: float = 1000.0       # ... time constant (ms) of the running means zbar and Ibar_inh
 
 
 @dataclass(frozen=True)
@@ -153,6 +158,20 @@ class PlasticInhibitionConfig:
     w_max: Optional[float] = None    # cap on |w| (current-based inhibition can otherwise push V without limit; real
                                      # inhibition stops at its reversal potential)
     w_max_rel: Optional[float] = None    # ... the cap as a multiple of the connection's initial mean |w|
+    normalise: bool = False          # keep each postsynaptic neuron's total inhibitory input (sum of |w| over its
+                                     # incoming synapses of this connection) at its initial value: the rule then only
+                                     # redistributes inhibition between I cells, it cannot raise or lower the total
+                                     # (heterosynaptic normalisation; applied by the training loop, see
+                                     # examples/eprop/inhibition_normaliser.py)
+    normalise_every: int = 10        # ... every this many environment moves
+    scaling: float = 0.0             # local alternative to `normalise` (synaptic scaling): every synapse multiplies
+                                     # its weight by 1 - scaling * (InhAvg - InhTarget) / InhTarget, where InhAvg is
+                                     # the postsynaptic neuron's running average of the inhibitory current it receives
+                                     # through these synapses and InhTarget that average captured once after a
+                                     # warm-up. Uses only the synapse's own weight and two variables of its neuron;
+                                     # the plasticity rule then mostly redistributes inhibition. 0 = off
+    scaling_tau: float = 1000.0      # ... time constant (ms) of InhAvg
+    scaling_warmup: float = 3000.0   # ... InhTarget is captured at this time (ms); scaling acts from then on
 
     def __post_init__(self):
         if self.mode not in ("rate", "covariance", "psi", "psi_fast"):
@@ -178,6 +197,9 @@ class HiddenRuleConfig:
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
+    psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
+                                     # this time (ms) and the homeostat defends that value from then on (off before);
+                                     # neuron-local, unlike a target taken from the population
     psi_target_spread: float = 0.0   # heterogeneous homeostat targets: psi_target * exp(spread * z_i), z_i a fixed
                                      # standard-uniform-in-log draw per neuron (from its index, so every synapse
                                      # group targeting the neuron agrees); neurons settle at different sparseness

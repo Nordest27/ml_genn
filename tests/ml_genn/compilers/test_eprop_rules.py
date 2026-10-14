@@ -578,3 +578,144 @@ def test_dale_rewiring_restores_signs_and_local_mode_keeps_new_synapses_local(re
         assert far < 0.05                         # rewired synapses stay in the original neighbourhood
     else:
         assert far > 0.3                          # uniform rewiring scatters them across the layer
+
+
+@pytest.mark.parametrize("SCALING", [0.0, 0.02])
+def test_local_scaling_holds_received_inhibition_near_its_warmup_level(request, SCALING):
+    """Covariance plasticity moves the total inhibition (here it shrinks it); local synaptic scaling (synapse weight x
+    the neuron's own InhAvg / InhTarget) pulls the received inhibition back towards the level captured after the
+    warm-up, in either direction."""
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, e, Dense(weight=0.3))
+        Connection(inp, i, Dense(weight=0.3))
+        i_to_e = Connection(i, e, FixedProbability(1.0, -0.05), exc_inh_sign=-1)
+        Connection(e, pol, Dense(weight=0.0))
+        Connection(e, val, Dense(weight=0.0))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    cfg = {"eta": 5e-3, "mode": "covariance", "tau_mean": 50.0, "scaling": SCALING, "scaling_tau": 20.0,
+           "scaling_warmup": 60.0}
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(0.0, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="reservoir",
+        plastic_inhibition={i_to_e: cfg})
+    compiled = compiler.compile(net, request.node.name)
+    sg, npop = compiled.connection_populations[i_to_e], compiled.neuron_populations[e]
+    if SCALING > 0:
+        assert "InhAvg" in npop.vars and sg.post_target_var == "ISynPI"
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.full(N_IN, 0.9, np.float32)})
+        for _ in range(60):
+            compiled.step_time(cb)
+        sg.vars["g"].pull_from_device(); g_warm = float(np.abs(sg.vars["g"].values).mean())
+        for _ in range(600):
+            compiled.step_time(cb)
+        sg.vars["g"].pull_from_device(); g_end = float(np.abs(sg.vars["g"].values).mean())
+        if SCALING > 0:
+            npop.vars["InhTarget"].pull_from_device()
+            assert np.all(npop.vars["InhTarget"].view > 0)            # captured after the warm-up
+    growth = g_end / g_warm
+    _SCALING_GROWTH[SCALING] = growth
+    print(f"scaling {SCALING}: mean |g| warm-up -> end x{growth:.2f}")
+    if len(_SCALING_GROWTH) == 2:                # with scaling the total ends much closer to its warm-up level
+        assert abs(np.log(_SCALING_GROWTH[0.02])) < 0.5 * abs(np.log(_SCALING_GROWTH[0.0]))
+
+
+_SCALING_GROWTH = {}
+
+
+def test_per_neuron_homeostat_target_is_captured_after_the_warmup(request):
+    rule = {"preset": "proposed_homeostat", "homeostat": 1.0, "psi_target_warmup": 30.0}
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC, hidden_rule=rule)
+    pops = [p for c, p in compiled.connection_populations.items()
+            if not c.is_feedback and c.target() is hid and "PsiTargetN" in p.post_vars]
+    assert pops
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        for t in range(60):
+            compiled.step_time(cb)
+            if t == 20:
+                pops[0].post_vars["PsiTargetN"].pull_from_device()
+                assert np.all(pops[0].post_vars["PsiTargetN"].view == 0)      # not captured before the warm-up
+        targets = []
+        for p in pops:
+            p.post_vars["PsiTargetN"].pull_from_device(); targets.append(p.post_vars["PsiTargetN"].view.copy())
+    assert np.all(targets[0] > 0)                                              # captured, one value per neuron
+    for t in targets[1:]:
+        assert np.allclose(t, targets[0])                                      # the same in every synapse group
+
+
+@pytest.mark.parametrize("DECORR", [0.0, 0.5])
+def test_decorrelation_reward_routes_inhibition_and_changes_learning(request, DECORR):
+    """The decorrelation local reward: inhibitory synapses go to the ISynInh channel, the neuron tracks InhNow /
+    InhMean, and the reward (same seed, same everything else) changes how the excitatory weights learn."""
+    rule = {"preset": "proposed", "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0,
+                                            "decorr": DECORR}}
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        # moderate drive (a saturated, always-refractory neuron has psi = 0 and cannot learn); a matrix: learnable
+        inp_e = Connection(inp, e, Dense(np.full((N_IN, N_HID), 0.06, np.float32)))
+        Connection(inp, i, Dense(weight=0.08))
+        i_to_e = Connection(i, e, FixedProbability(1.0, -0.05), exc_inh_sign=-1)
+        Connection(e, pol, Dense(weight=0.0))
+        Connection(e, val, Dense(weight=0.0))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule=rule)
+    compiled = compiler.compile(net, request.node.name)
+    sg, npop = compiled.connection_populations[i_to_e], compiled.neuron_populations[e]
+    if DECORR != 0:
+        assert sg.post_target_var == "ISynInh" and "InhMean" in npop.vars
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    upd = 0
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.full(N_IN, 0.9, np.float32)})
+        for _ in range(300):
+            compiled.step_time(cb)
+            compiled.genn_model.custom_update("GradientLearn")
+            for o, cus in compiled.optimisers:
+                for c in cus:
+                    upd += 1; o.set_step(c, upd)
+        if DECORR != 0:
+            npop.vars["InhMean"].pull_from_device()
+            assert np.all(npop.vars["InhMean"].view > 0)               # the neuron senses its inhibition
+        w = compiled.connection_populations[inp_e]
+        w.vars["g"].pull_from_device()
+        _DECORR_W[DECORR] = np.asarray(w.vars["g"].values).copy()
+    if len(_DECORR_W) == 2:                                            # the reward changes what is learned
+        assert np.abs(_DECORR_W[0.5] - _DECORR_W[0.0]).max() > 1e-6
+
+
+_DECORR_W = {}
