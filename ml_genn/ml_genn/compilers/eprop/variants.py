@@ -126,6 +126,10 @@ class LocalObjectives:
                                      # with the cells that drive that inhibition). Neuron-local: its own spikes and
                                      # its own total inhibitory input (GRADIENT_* routes only)
     decorr_tau: float = 1000.0       # ... time constant (ms) of the running means zbar and Ibar_inh
+    decorr_norm: str = "covariance"  # "covariance": the reward above (its size also shrinks when the neuron fires
+                                     # less, so going quiet lowers the penalty); "correlation": divided by the
+                                     # neuron's spiking spread sqrt(zbar (1 - zbar)) and its inhibition's s.d.:
+                                     # only how aligned the firing is with the inhibition counts, not how much it fires
 
 
 @dataclass(frozen=True)

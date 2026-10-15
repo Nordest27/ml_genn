@@ -94,6 +94,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     rate_w = (c_reg if local is None or local.rate is None else local.rate)
     use_rate_local = local is not None and rate_w != 0
     use_decorr = local is not None and local.decorr != 0
+    if use_decorr and local.decorr_norm not in ("covariance", "correlation"):
+        raise ValueError(f"decorr_norm must be 'covariance' or 'correlation', not {local.decorr_norm!r}")
     if use_decorr and not use_local_post:
         raise ValueError("the decorrelation reward needs a GRADIENT_INSTANT or GRADIENT_TRACE local route")
     use_favg = cfg.fire_rate_gradient or use_rate_local
@@ -173,7 +175,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         post_spike.append("Z = 1.0;")
     if use_decorr:
         post_spike.append("ZDec = 1.0;")
-        post_refs.update({"InhNow_post": "InhNow", "InhMean_post": "InhMean"})
+        post_refs.update({"InhNow_post": "InhNow", "InhMean_post": "InhMean", "InhVar_post": "InhVar"})
     post_dyn = []
     if use_dvc:   # change from the previous post-reset voltage (relative reset by Vthresh)
         post_dyn.append("DVc = fabs(V_post - (PrevV - Vthresh_post * Z));")
@@ -211,8 +213,12 @@ else {
             terms.append(f"+ {_f(rate_w)} * (FAvgTrace - fabs(FAvg - FTarget))")
         if use_decorr:
             # spiking in step with the received inhibition = redundancy with the cells that drive it
-            terms.append(f"- {_f(local.decorr)} * (ZDec - ZDecMean) * (InhNow_post - InhMean_post)"
-                         " / (InhMean_post + 1e-6)")
+            if local.decorr_norm == "correlation":
+                terms.append(f"- {_f(local.decorr)} * (ZDec - ZDecMean) * (InhNow_post - InhMean_post)"
+                             " / ((sqrt(ZDecMean * (1.0 - ZDecMean)) + 1e-4) * (sqrt(InhVar_post) + 1e-6))")
+            else:
+                terms.append(f"- {_f(local.decorr)} * (ZDec - ZDecMean) * (InhNow_post - InhMean_post)"
+                             " / (InhMean_post + 1e-6)")
         post_dyn.append("LocR = 0.0 " + " ".join(terms) + ";")
         post_dyn.append(f"LocMean = {_f(local.baseline_decay)} * LocMean + {_f(1 - local.baseline_decay)} * LocR;")
         if use_decorr:

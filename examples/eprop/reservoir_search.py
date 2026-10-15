@@ -132,6 +132,7 @@ class Sim:
         counts = [np.zeros((len(rates), int(np.prod(p.shape)))) for p in self.pops]
         states = []
         self.psi = []
+        self.adapt = []                                  # per frame: the adaptation variable A of every population
         ppop = None
         if perturb is not None:
             ppop = self.net.neuron_populations[perturb[0]]
@@ -151,7 +152,7 @@ class Sim:
                 counts[i][f] = np.bincount(np.asarray(ids, dtype=np.int64), minlength=counts[i].shape[1])
                 npop.vars["RefracTime"].pull_from_device() if record else None
             if record:
-                row, psi_row = [], []
+                row, psi_row, a_row = [], [], []
                 for p, npop in zip(self.pops, npops):
                     npop.vars["V"].pull_from_device(); npop.vars["A"].pull_from_device()
                     v = np.asarray(npop.vars["V"].view).ravel().copy()
@@ -159,8 +160,10 @@ class Sim:
                     row += [v, (ref > 0).astype(np.float32)]
                     psi_row.append(pseudo_derivative(v, np.asarray(npop.vars["A"].view).ravel(), p.neuron.beta,
                                                      p.neuron.v_thresh, ref))
+                    a_row.append(np.asarray(npop.vars["A"].view).ravel().copy())
                 states.append(np.concatenate(row))
                 self.psi.append(psi_row)
+                self.adapt.append(a_row)
         return counts, (np.array(states) if record else None)
 
     def hz(self, counts):
@@ -212,6 +215,34 @@ def ridge_r2(x, y, ridge=1.0, cut=0.7, max_features=100):
     return float(1.0 - (resid ** 2).sum() / max(total, 1e-12))
 
 
+MEMORY_LAGS = (1, 2, 3)
+
+
+def _pcs(x, k, n=100):
+    """Top-n principal components of x, fit on its first k rows."""
+    xc = x - x[:k].mean(0)
+    _, _, vt = np.linalg.svd(xc[:k], full_matrices=False)
+    return xc @ vt[:n].T
+
+
+def memory_r2(state, rates, lags=MEMORY_LAGS, ridge=10.0, cut=0.7):
+    """Memory of a population (state: its V and adaptation A per frame; with tau_mem 10 ms and 30 ms frames, V and the
+    spikes forget the previous frame and what survives is in A), per lag k (frames): how much of the input k frames ago its state recovers BEYOND what
+    the current frame already says about it. Consecutive Snake frames are similar, so the past frame is first
+    regressed on the current one (ridge on the top-100 input PCs, fit on the training part) and only the residual is
+    the target; the score is the held-out share of that residual's variance a readout of the state explains
+    (ridge_r2). ~0: the population only represents the present frame."""
+    z = _pcs(rates, int(cut * len(rates)))
+    out = []
+    for lag in lags:
+        now, past, st = z[lag:], z[:-lag], state[lag:]
+        k = int(cut * len(now))
+        xs = np.hstack([now, np.ones((len(now), 1))])
+        w = np.linalg.solve(xs[:k].T @ xs[:k] + ridge * np.eye(xs.shape[1]), xs[:k].T @ past[:k])
+        out.append(max(ridge_r2(st, past - xs @ w, ridge=ridge, cut=cut), 0.0))
+    return out
+
+
 def perturbation_reach(sim, rates, amp, frames_per_layer=1200, n_dirs=4, folds=5, seed=0):
     """Per layer k: how detectably a perturbation of layer k shows up at the fields, measured the way the
     perturbation rule sees it. Each frame, layer k's E potentials get amp * sum_j s_fj * u_j per step (u_j fixed
@@ -254,6 +285,31 @@ def pseudo_derivative(v, a, beta, v_thresh, refrac):
     return np.where(refrac > 0, 0.0, psi)
 
 
+def rf_spread(counts, rates, shape, in_hw=(20, 20), in_c=3):
+    """Median receptive-field spread (input cells) of a population: per neuron, the correlation of its spike counts
+    with each input pixel (channels summed) across frames; only |r| > 3 / sqrt(frames) counts; spread = RMS toroidal
+    distance from the neuron's own position (mapped onto the input grid), weighted by |r|."""
+    h, w = shape[0], shape[1]
+    c = shape[2] if len(shape) == 3 else 1
+    pix = rates.reshape(len(rates), in_hw[0], in_hw[1], in_c).sum(-1).reshape(len(rates), -1)
+    pz = (pix - pix.mean(0)) / (pix.std(0) + 1e-9)
+    cz = (counts - counts.mean(0)) / (counts.std(0) + 1e-9)
+    corr = np.abs(cz.T @ pz) / len(rates)                       # neurons x pixels
+    corr[corr < 3.0 / np.sqrt(len(rates))] = 0.0
+    py, px = np.divmod(np.arange(in_hw[0] * in_hw[1]), in_hw[1])
+    cells = np.arange(counts.shape[1]) // c
+    ny = (cells // w + 0.5) / h * in_hw[0] - 0.5
+    nx = (cells % w + 0.5) / w * in_hw[1] - 0.5
+    dy = np.abs(py[None, :] - ny[:, None]); dy = np.minimum(dy, in_hw[0] - dy)
+    dx = np.abs(px[None, :] - nx[:, None]); dx = np.minimum(dx, in_hw[1] - dx)
+    wsum = corr.sum(1)
+    ok = wsum > 0
+    if not ok.any():
+        return float("nan")
+    spread = np.sqrt((corr * (dy ** 2 + dx ** 2)).sum(1)[ok] / wsum[ok])
+    return float(np.median(spread))
+
+
 def evaluate(sim, rates, ys):
     from probe_analyse import per_population
     from layer_dims import participation_ratio
@@ -261,6 +317,8 @@ def evaluate(sim, rates, ys):
     sizes = [int(np.prod(p.shape)) for p in sim.pops]
     decode = per_population(states, ys, sizes, sim.labels)
     psi = [np.array([row[i] for row in sim.psi]) for i in range(len(sim.pops))]     # frames x neurons per pop
+    adapt = [np.array([row[i] for row in sim.adapt]) for i in range(len(sim.pops))]   # adaptation A, same layout
+    prev_e = None
     out, off = [], 0
     for lab, n, c, ps in zip(sim.labels, sizes, counts, psi):
         v = states[:, off:off + n]; off += 2 * n
@@ -270,7 +328,17 @@ def evaluate(sim, rates, ys):
                     "decode": decode[lab], "active": float(np.mean(c.sum(0) > 0)),
                     "input_r2": ridge_r2(x, rates, ridge=10.0),
                     # learnability for the rule: mean psi, and the fraction of neurons almost never near threshold
-                    "psi": float(ps.mean()), "psi_dead": float(np.mean(ps.mean(0) < 0.01))})
+                    "psi": float(ps.mean()), "psi_dead": float(np.mean(ps.mean(0) < 0.01)),
+                    # mixing: receptive-field spread in input cells, and (E of layers >= 2, fields) how much of the layer's
+                    # spike counts a linear map from the previous layer's E counts explains (1 = a relay)
+                    "rf_spread": rf_spread(c, rates, tuple(sim.pops[sim.labels.index(lab)].shape)),
+                    "pred_from_prev": (ridge_r2(prev_e, c, ridge=10.0) if prev_e is not None
+                                       and (lab.endswith("_E") or "field" in lab) else float("nan")),
+                    # memory: the input 1, 2, 3 frames ago recovered beyond what the current frame predicts
+                    "memory": (memory_r2(np.hstack([v, adapt[len(out)]]), rates)
+                               if lab.endswith("_E") or "field" in lab else None)})
+        if lab.endswith("_E"):
+            prev_e = c
     return out
 
 
@@ -329,17 +397,25 @@ def snake_config(hp_over, factors, layers, size):
     if f1 != 1.0:
         net["input"] = {**net.get("input", {}), "mean_scale": spec.input.mean_scale * f1,
                         "sd_scale": spec.input.sd_scale * f1}
+    # the calibration scaled only the excitatory projections; with feed-forward inhibition (to_next_i / conn_i None:
+    # the I projection shares the E settings) the I projection is written out with its own, unscaled weights
     for k in range(2, layers + 1):
         f = factors.get(k, 1.0)
         if f != 1.0:
-            src = spec.layers[k - 2].to_next
-            lay[k - 2]["to_next"] = {**lay[k - 2].get("to_next", {}), "mean_scale": src.mean_scale * f,
-                                     "sd_scale": src.sd_scale * f}
+            ls = spec.layers[k - 2]
+            src, own = ls.to_next, dict(lay[k - 2].get("to_next", {}))
+            if ls.to_next_i is None:
+                lay[k - 2]["to_next_i"] = {**own, "mean_scale": src.mean_scale, "sd_scale": src.sd_scale}
+            lay[k - 2]["to_next"] = {**own, "mean_scale": src.mean_scale * f, "sd_scale": src.sd_scale * f}
     net["layers"] = lay
     if factors.get("fields", 1.0) != 1.0 and spec.fields is not None:
         f = factors["fields"]
-        net["fields"] = {**net.get("fields", {}), "conn": {**net.get("fields", {}).get("conn", {}),
-                         "mean_scale": spec.fields.conn.mean_scale * f, "sd_scale": spec.fields.conn.sd_scale * f}}
+        fd = dict(net.get("fields", {}))
+        own = dict(fd.get("conn", {}))
+        if spec.fields.conn_i is None:
+            fd["conn_i"] = {**own, "mean_scale": spec.fields.conn.mean_scale, "sd_scale": spec.fields.conn.sd_scale}
+        fd["conn"] = {**own, "mean_scale": spec.fields.conn.mean_scale * f, "sd_scale": spec.fields.conn.sd_scale * f}
+        net["fields"] = fd
     return cfg
 
 
@@ -349,10 +425,11 @@ def table(res):
          f"L_last/L1: dim {sc['dim_ratio']:.2f}, input R2 {sc['input_r2_ratio']:.2f}; "
          f"perturbation reach min/max {sc['reach_min_max']:.2f}",
          f"  {'pop':14s} {'n':>5s} {'Hz':>6s} {'eff.dim':>8s} {'dim(cnt)':>9s} {'inputR2':>8s} {'decode':>7s} "
-         f"{'psi':>6s} {'psi~0':>6s}"]
+         f"{'psi':>6s} {'psi~0':>6s} {'RF':>5s} {'R2prev':>6s}"]
     for r in res["per_pop"]:
         s.append(f"  {r['pop']:14s} {r['n']:5d} {r['hz']:6.1f} {r['dim']:8.2f} {r['dim_counts']:9.2f} "
-                 f"{r['input_r2']:8.3f} {r['decode']:+7.3f} {r['psi']:6.3f} {r['psi_dead']:6.2f}")
+                 f"{r['input_r2']:8.3f} {r['decode']:+7.3f} {r['psi']:6.3f} {r['psi_dead']:6.2f} "
+                 f"{r.get('rf_spread', float('nan')):5.2f} {r.get('pred_from_prev', float('nan')):6.3f}")
     s.append("  perturbation reach (held-out corr. of an injected L_k perturbation with the fields): "
              + "  ".join(f"{k} {v:.3f}" for k, v in res["reach"].items()))
     return "\n".join(s)

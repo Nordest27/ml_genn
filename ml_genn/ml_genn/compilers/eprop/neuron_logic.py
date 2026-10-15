@@ -299,10 +299,12 @@ def add_decorr_tracking(model_copy, tau, dt):
     InhMean, its running average (time constant tau)."""
     model_copy.add_var("InhNow", "scalar", 0.0)
     model_copy.add_var("InhMean", "scalar", 0.0)
+    model_copy.add_var("InhVar", "scalar", 0.0)
     decay = float(np.exp(-dt / tau))
     model_copy.append_sim_code(f"""
         InhNow = fabs(ISynInh);
         InhMean = {decay!r} * InhMean + {1.0 - decay!r} * InhNow;
+        InhVar = {decay!r} * InhVar + {1.0 - decay!r} * (InhNow - InhMean) * (InhNow - InhMean);
         """)
 
 

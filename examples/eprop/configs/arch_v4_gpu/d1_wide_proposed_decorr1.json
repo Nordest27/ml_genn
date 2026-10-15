@@ -1,0 +1,80 @@
+{
+ "toroidal": "local",
+ "local": {
+  "sigma_cells": 2.208,
+  "p_max": 0.841,
+  "input_sigma_cells": 1.703,
+  "inhibition_scale": 4.302,
+  "feedforward_inhibition": true,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 1.184
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 2.181,
+    "mean_scale": 0.7528726075810434,
+    "sd_scale": 0.15057452151620868
+   },
+   "shape": 15,
+   "conn_i": {
+    "sigma_cells": 2.181,
+    "mean_scale": 0.25,
+    "sd_scale": 0.05
+   }
+  },
+  "input": {
+   "mean_scale": 0.2275417267209767,
+   "sd_scale": 0.11377086336048835
+  },
+  "layers": [
+   {}
+  ]
+ },
+ "ei_layers": 1,
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": {
+  "preset": "proposed",
+  "local": {
+   "route": "GRADIENT_INSTANT",
+   "dv": 0.0,
+   "vreg": 0.0,
+   "rate": 0.0,
+   "decorr": 1.0
+  }
+ },
+ "c_reg": 0.0001,
+ "_meta": {
+  "variant": "d1_wide_proposed_decorr1",
+  "description": "wide excitation (sigma ~2.3), inhibition about as wide (ratio 1.18); the shortcut-search winner without its long-range inputs",
+  "architecture_search": {
+   "folder": "arch_search_full_v4_l1_local",
+   "idx": 78,
+   "score": 0.824,
+   "parts": {
+    "l1": 0.9403082704983837,
+    "fields": 0.8674042007004699,
+    "memory": 0.502292235880059,
+    "later_kept": 0.8674042007004699,
+    "mixing": 0.925676916468398,
+    "penalty": 0.0,
+    "wiring": 0.0
+   },
+   "genome": {
+    "ff_inhibition": true,
+    "inh_sigma_ratio": 1.1844530943881018,
+    "sigma_cells": 2.2081598056953444,
+    "p_max": 0.8407361089114189,
+    "input_sigma_cells": 1.703284530828656,
+    "inhibition_scale": 4.302076566022281,
+    "field_sigma": 2.180567876402213,
+    "field_shape": "inhibitory",
+    "target_hz": 30.0
+   }
+  }
+ }
+}

@@ -662,12 +662,12 @@ def test_per_neuron_homeostat_target_is_captured_after_the_warmup(request):
         assert np.allclose(t, targets[0])                                      # the same in every synapse group
 
 
-@pytest.mark.parametrize("DECORR", [0.0, 0.5])
-def test_decorrelation_reward_routes_inhibition_and_changes_learning(request, DECORR):
+@pytest.mark.parametrize("DECORR,NORM", [(0.0, "covariance"), (0.5, "covariance"), (0.5, "correlation")])
+def test_decorrelation_reward_routes_inhibition_and_changes_learning(request, DECORR, NORM):
     """The decorrelation local reward: inhibitory synapses go to the ISynInh channel, the neuron tracks InhNow /
     InhMean, and the reward (same seed, same everything else) changes how the excitatory weights learn."""
     rule = {"preset": "proposed", "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0,
-                                            "decorr": DECORR}}
+                                            "decorr": DECORR, "decorr_norm": NORM}}
     net = Network(default_params)
     with net:
         inp = Population(PoissonInput(), N_IN)
@@ -713,9 +713,11 @@ def test_decorrelation_reward_routes_inhibition_and_changes_learning(request, DE
             assert np.all(npop.vars["InhMean"].view > 0)               # the neuron senses its inhibition
         w = compiled.connection_populations[inp_e]
         w.vars["g"].pull_from_device()
-        _DECORR_W[DECORR] = np.asarray(w.vars["g"].values).copy()
-    if len(_DECORR_W) == 2:                                            # the reward changes what is learned
-        assert np.abs(_DECORR_W[0.5] - _DECORR_W[0.0]).max() > 1e-6
+        _DECORR_W[(DECORR, NORM)] = np.asarray(w.vars["g"].values).copy()
+    base = _DECORR_W.get((0.0, "covariance"))
+    if DECORR != 0 and base is not None:                               # the reward changes what is learned
+        assert np.abs(_DECORR_W[(DECORR, NORM)] - base).max() > 1e-6
+        assert np.all(np.isfinite(_DECORR_W[(DECORR, NORM)]))
 
 
 _DECORR_W = {}

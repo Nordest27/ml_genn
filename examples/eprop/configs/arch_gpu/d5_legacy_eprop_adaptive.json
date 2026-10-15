@@ -1,0 +1,15 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "legacy",
+ "ei_layers": 5,
+ "hidden_rule": {
+  "preset": "eprop"
+ },
+ "feedback_type": "adaptive",
+ "optimise_feedback": true,
+ "c_reg": 0.0001
+}

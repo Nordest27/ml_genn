@@ -73,6 +73,7 @@ class LayerSpec:
     fan_in_e: float = 300            # fan-in of connections whose source is an E population (E->E, E->I, E->next)
     fan_in_i: float = 300            # fan-in of connections whose source is an I population
     internal: ConnSpec = field(default_factory=lambda: ConnSpec(p=0.005))   # the four recurrent E/I connections
+    internal_i: Optional[ConnSpec] = None                      # ... the two from the I population (None: internal)
     to_next: ConnSpec = field(default_factory=ConnSpec)        # this layer -> next layer (E and I sources)
     to_next_i: Optional[ConnSpec] = None                       # ... from the I population only (None: to_next). The
                                                                # inhibitory scale is x3, so with equal rates the
@@ -223,7 +224,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             i = Population(_alif(ls.neuron, spec.node_sigma), ls.i_shape)
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
-                c = Connection(pre, post, connectivity(ls.internal, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
+                spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
+                c = Connection(pre, post, connectivity(spec_c, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
                                                        same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
                                exc_inh_sign=sign)
                 if pre is i and post is e:
@@ -330,6 +332,8 @@ def _merge(obj, d):
             cur = obj.to_next                   # inhibitory feedforward: start from the layer's to_next settings
         if off and k == "conn_i" and isinstance(v, dict):
             cur = obj.conn
+        if off and k == "internal_i" and isinstance(v, dict):
+            cur = obj.internal
         kw[k] = _merge(cur, v) if hasattr(cur, "__dataclass_fields__") and isinstance(v, dict) else v
     return replace(obj, **kw)
 
@@ -343,6 +347,8 @@ def _merge(obj, d):
 # the coarser grid (ConnSpec.sigma_ref): big -> small pools (fan-in grows with the size ratio; lower that connection's
 # p_max for sparse pooling), small -> big upsamples (neighbouring targets share most inputs). p_global adds random
 # long-range connections between hidden layers (not the input projection): a small-world graph.
+# inhibition_sigma_ratio: spread of the recurrent connections from the I population (I -> E, I -> I) relative to
+# sigma_cells (None: the same). > 1: excitation narrower than inhibition (lateral inhibition, a "Mexican hat").
 # feedforward_inhibition False (default): projections between layers and into the fields come from the E populations
 # only (long-range projections excitatory, inhibition local, as in cortex). With inhibitory feedforward at x3 weight
 # and I rates >= E rates, every layer after the first and the fields start silent (legacy networks included).
@@ -362,7 +368,7 @@ def _merge(obj, d):
 # pooling connections over-drive their targets (a 20 -> 8 input puts an 8x8 layer at ~40 Hz), but the E/I balance of
 # the standard 20/15 layers relies on it (E 20x20 -> I 15x15 pools); "mean_field" weakens I and every layer runs hotter.
 LOCAL_DEFAULTS = {"p_max": 1.0, "sigma_cells": 1.75, "input_sigma_cells": 2.5, "p_max_decay": 1.0, "sigma_decay": 1.0,
-                  "p_global": 0.0, "feedforward_inhibition": False, "ff_gain": 0.5,
+                  "p_global": 0.0, "feedforward_inhibition": False, "ff_gain": 0.5, "inhibition_sigma_ratio": None,
                   "field_gain": 0.25, "mean_norm": "sqrt",
                   "input_sigma_ref": "coarser", "weight_fan_in": None,
                   "sigma_ref": "sheet", "inhibition_scale": 3.0}
@@ -405,8 +411,12 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         ff_i = ConnSpec(type="none")
 
     def base_layer(k):
+        internal_i = None
+        if mode == "local" and loc["inhibition_sigma_ratio"] is not None:     # I -> E / I -> I spread: ratio x E's
+            internal_i = replace(conn(k), sigma_cells=conn(k).sigma_cells * loc["inhibition_sigma_ratio"])
         return LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
-                         fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), to_next=conn(k + 1, ff=True),
+                         fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), internal_i=internal_i,
+                         to_next=conn(k + 1, ff=True),
                          to_next_i=ff_i, to_next_targets=hp.get("feedforward_targets", "both"))
     spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions, input=input_conn,
                        layers=[base_layer(k) for k in range(hp["ei_layers"])],

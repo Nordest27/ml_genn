@@ -1,0 +1,105 @@
+{
+ "toroidal": "local",
+ "local": {
+  "sigma_cells": 3.0,
+  "p_max": 0.44,
+  "input_sigma_cells": 1.644,
+  "inhibition_scale": 8.0,
+  "feedforward_inhibition": false,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 1.0
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 1.685,
+    "mean_scale": 0.313807989192851,
+    "sd_scale": 0.0627615978385702
+   },
+   "shape": 20
+  },
+  "layers": [
+   {
+    "to_next": {
+     "sigma_cells": 1.472,
+     "mean_scale": 0.9848900215117261,
+     "sd_scale": 0.09848900215117262
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 1.472,
+     "mean_scale": 0.7858044627596905,
+     "sd_scale": 0.07858044627596905
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 1.472,
+     "mean_scale": 1.0072116302495882,
+     "sd_scale": 0.10072116302495882
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 1.472,
+     "mean_scale": 0.7673774305921811,
+     "sd_scale": 0.07673774305921811
+    }
+   },
+   {}
+  ],
+  "input": {
+   "mean_scale": 0.35298859430833596,
+   "sd_scale": 0.17649429715416798
+  }
+ },
+ "feedforward_targets": "both",
+ "ei_layers": 5,
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "c_reg": 0.0001,
+ "hidden_rule": {
+  "preset": "proposed",
+  "local": {
+   "route": "GRADIENT_INSTANT",
+   "dv": 0.0,
+   "vreg": 0.0,
+   "rate": 0.0,
+   "decorr": 1.0
+  }
+ },
+ "_meta": {
+  "variant": "d5_local_proposed_decorr1",
+  "architecture_search": {
+   "folder": "arch_search_full_v4_l5_local",
+   "idx": 29,
+   "score": 0.787,
+   "parts": {
+    "l1": 0.9721370067567416,
+    "fields": 0.7708592834087349,
+    "memory": 0.4718065056973877,
+    "later_kept": 0.8709207870375699,
+    "mixing": 0.48082308453082756,
+    "penalty": 0.0,
+    "wiring": 0.004899691358024691
+   },
+   "genome": {
+    "ff_inhibition": false,
+    "ff_targets": "both",
+    "inh_sigma_ratio": 1.0,
+    "sigma_cells": 3.0,
+    "p_max": 0.43954905332694405,
+    "input_sigma_cells": 1.643886396495428,
+    "inhibition_scale": 8.0,
+    "ff_sigma": 1.4717221951330535,
+    "field_sigma": 1.6851658340539586,
+    "field_shape": "excitatory",
+    "target_hz": 30.0
+   }
+  }
+ }
+}

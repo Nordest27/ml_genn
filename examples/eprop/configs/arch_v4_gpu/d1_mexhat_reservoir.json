@@ -1,0 +1,73 @@
+{
+ "toroidal": "local",
+ "local": {
+  "sigma_cells": 1.009,
+  "p_max": 0.753,
+  "input_sigma_cells": 2.428,
+  "inhibition_scale": 3.5,
+  "feedforward_inhibition": true,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 3.0
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 1.56,
+    "mean_scale": 0.75,
+    "sd_scale": 0.15000000000000002
+   },
+   "shape": 15,
+   "conn_i": {
+    "sigma_cells": 1.56,
+    "mean_scale": 0.25,
+    "sd_scale": 0.05
+   }
+  },
+  "input": {
+   "mean_scale": 0.1432871010605291,
+   "sd_scale": 0.07164355053026455
+  },
+  "layers": [
+   {}
+  ]
+ },
+ "ei_layers": 1,
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": {
+  "preset": "reservoir"
+ },
+ "c_reg": 0.0001,
+ "_meta": {
+  "variant": "d1_mexhat_reservoir",
+  "description": "Mexican hat: narrow excitation (sigma ~1), inhibition 3.0x wider; fields 15x15 like the wide variant",
+  "architecture_search": {
+   "folder": "arch_search_full_v4_l1_local",
+   "idx": 65,
+   "score": 0.837,
+   "parts": {
+    "l1": 0.8978283816529121,
+    "fields": 0.9637474828363388,
+    "memory": 0.4631702678008428,
+    "later_kept": 0.9637474828363388,
+    "mixing": 0.6451215552539069,
+    "penalty": 0.0,
+    "wiring": 0.0
+   },
+   "genome": {
+    "ff_inhibition": true,
+    "inh_sigma_ratio": 3.0,
+    "sigma_cells": 1.0093150651919254,
+    "p_max": 0.7530276440877489,
+    "input_sigma_cells": 2.4280161062601797,
+    "inhibition_scale": 3.499582976512528,
+    "field_sigma": 1.5596311960001035,
+    "field_shape": "inhibitory",
+    "target_hz": 20.0
+   }
+  }
+ }
+}
