@@ -22,10 +22,16 @@ L1, kept per layer 0.95 -> 0.85, no wiring violations). Wide sparse recurrence (
 inhibition (8.0), feed-forward sigma 1.47, fields sigma 1.69 (20x20), calibrated to 30 Hz, no feed-forward
 inhibition. The search is still running; this may be replaced by a better network later.
 
+Five layers with feed-forward inhibition (`d5_ffinh_*`): best 5-layer network of any search so far (score 0.797,
+arch_search_full_v5_l5_unconstrained c5). Fields keep 90% of L1 (kept per layer 1.00, 1.00, 0.97, 0.94 -> 0.90).
+Feed-forward sigma 0.79 (~10 inputs from ~6 cells per neuron: mixing, not a 1-to-1 relay), E and I of every layer
+project into the next layer and the fields, recurrence sigma 2.4 / p_max 0.83, inhibition 3.6 with I spread 0.64x
+E's, 20x20 fields (sigma 0.71), calibrated to 20 Hz.
+
 Rule: proposed + local decorrelation reward 1.0 (covariance form), c_reg 1e-4, monitor and probe on.
 Compare at matched episodes: mean score, E and I rates (monitor CSV), flip|L1_E->L1_I (Dale), voltage loss.
 
-Needs the updated `snake_network.py` (keys `local.inhibition_sigma_ratio` and `local.feedforward_inhibition` into the
+Needs the updated `snake_network.py` and `ml_genn/connectivity/toroidal_gaussian_2d.py` (keys `local.inhibition_sigma_ratio` and `local.feedforward_inhibition` into the
 fields via `network.fields.conn_i`).
 
     SNAKE_CONFIG=configs/arch_v4_gpu/d1_mexhat_proposed_decorr1.json python run_headless.py
@@ -34,3 +40,5 @@ fields via `network.fields.conn_i`).
     SNAKE_CONFIG=configs/arch_v4_gpu/d1_wide_reservoir.json python run_headless.py
     SNAKE_CONFIG=configs/arch_v4_gpu/d5_local_proposed_decorr1.json python run_headless.py  # five layers
     SNAKE_CONFIG=configs/arch_v4_gpu/d5_local_reservoir.json python run_headless.py
+    SNAKE_CONFIG=configs/arch_v4_gpu/d5_ffinh_proposed_decorr1.json python run_headless.py  # five layers, ff inhibition
+    SNAKE_CONFIG=configs/arch_v4_gpu/d5_ffinh_reservoir.json python run_headless.py

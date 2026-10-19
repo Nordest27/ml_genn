@@ -27,8 +27,14 @@ import multiprocessing as mp
 import csv
 import snake_hparams
 
-# Hyperparameters: TTT_CONFIG=config.json overrides these (same keys as snake_hparams where they overlap).
+import snake_network
+
+# Hyperparameters: TTT_CONFIG=config.json overrides these. Every key of snake_hparams.DEFAULTS is accepted, so the
+# network and rule settings of a Snake config ("toroidal", "local", "network", "ei_layers", "hid_e", "hidden_rule",
+# "dale", "plastic_inhibition", "backend", ...) build the same network here (snake_network.py). The defaults below
+# keep tic-tac-toe's previous network and training settings where they differ from Snake's.
 TTT_DEFAULTS = {
+    **snake_hparams.DEFAULTS,
     "hidden_rule": None,         # None: monolithic compiler; else a preset or dict (ml_genn.compilers.eprop)
     "feedback_type": "random",
     "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
@@ -37,9 +43,19 @@ TTT_DEFAULTS = {
     "c_reg": 1e-2,
     "f_target": 10.0,
     "seed": None,
+    "toroidal": "legacy",        # the original sampler (tic-tac-toe's previous network)
+    "explicit_feedback": False,  # tic-tac-toe had no explicit feedback connections to the heads
     "csv_output": "outputs_ttt/weight_dist(1).csv",
 }
 HP = snake_hparams.load(TTT_DEFAULTS, "TTT_CONFIG")
+# Snake keys that tic-tac-toe does not use (its timing, discounting and entropy settings are the constants below)
+SNAKE_ONLY_KEYS = ("entropy_coeff", "entropy_decay_env", "entropy_bonus", "entropy_bonus_decay_env", "entropy_scale",
+                   "entropy_td_decay_env", "entropy_reward", "gamma_env", "td_lambda_env", "reward_decay_env",
+                   "board_size", "memory", "switch", "monitor", "monitor_every", "probe", "max_timesteps",
+                   "min_episodes", "csv_prefix", "repetition", "trace_log")
+_ignored = [k for k in SNAKE_ONLY_KEYS if HP[k] != snake_hparams.DEFAULTS[k]]
+if _ignored:
+    print(f"tic-tac-toe ignores these Snake settings of the config: {_ignored}")
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -94,21 +110,10 @@ FIRST_PLAYER = "random"                # "agent" | "opponent" | "random" | 1 | -
 INPUT_SHAPE = (BOARD_ROWS * OBS_SCALE, BOARD_COLS * OBS_SCALE, 3)  # (12, 12, 3)
 INPUT_SIZE     = int(np.prod(INPUT_SHAPE))
 
-HIDDEN_E_SHAPE = (20, 20, 3)
-HIDDEN_I_SHAPE = (15, 15, 3)
-NUM_HIDDEN_E   = int(np.prod(HIDDEN_E_SHAPE))
-NUM_HIDDEN_I   = int(np.prod(HIDDEN_I_SHAPE))
-
-CONNECTIVITY_TYPE = "toroidal"   # "toroidal" | "fixed"
-
-SIGMA_IN = 0.1
-SIGMA_H  = 0.05
-
-DESIRED_FAN_IN_IN = 300
-DESIRED_FAN_IN_H1 = 300
-DESIRED_FAN_IN_H2 = 300
-
-CONN_P = {"I-H": 0.1, "H-H": 0.1, "H-P": 0.5, "H-V": 0.5, "F": 1.0}
+# The hidden network (layers, sizes, connectivity, fields) is built by snake_network.py from HP, as in snake.py:
+# "hid_e" / "hid_i" (default 20 / 15), "ei_layers", "toroidal" (default here: "legacy", the original network),
+# "local" and "network". See snake_hparams.py.
+CONNECTIVITY_TYPE = "toroidal"   # kept for tic_tac_toe_2agents.py (no longer used by the builder)
 
 # ─── Temporal / learning constants ───────────────────────────────
 reward_decay          = 0.1  ** (1 / WAIT_INC)
@@ -140,317 +145,31 @@ def init_csv(path):
             "reward_rate", "voltage", "voltage_loss", "frequency", "first_player",
         ])
 
-# ─── Connectivity helpers (mirrors connect_four_snn.py) ──────────
-
-def make_connectivity(
-    connectivity_type,
-    src_shape,
-    desired_fan_in=None,
-    fan_in_scale=None,
-    p=None,
-    sigma=None,
-    sign=None,
-    mean_scale=0.1,
-    sd_scale=0.05,
-):
-    if connectivity_type == "fixed":
-        if p is None:
-            raise ValueError("Fixed connectivity requires p")
-        if sign is None:
-            sd_scale = 1.0
-        fan_in = p * np.prod(src_shape)
-        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
-        sd   = sd_scale / np.sqrt(fan_in)
-        return FixedProbability(p, Normal(mean=mean, sd=sd))
-
-    elif connectivity_type == "toroidal":
-        if sigma is None:
-            raise ValueError("Toroidal connectivity requires sigma")
-        if desired_fan_in is None:
-            raise ValueError("Toroidal connectivity requires desired_fan_in")
-        fan_in = desired_fan_in
-        if sign == -1:
-            mean_scale *= 3
-        elif sign is None:
-            sd_scale = 1.0
-        mean = (sign or 0) * mean_scale / np.sqrt(fan_in)
-        sd   = sd_scale / np.sqrt(fan_in)
-        return ToroidalGaussian2D(
-            sigma=sigma,
-            fan_in=desired_fan_in,
-            fan_in_scale=fan_in_scale,
-            weight=Normal(mean=mean, sd=sd),
-        )
-    else:
-        raise ValueError(f"Unknown connectivity_type: {connectivity_type}")
-
-
-@dataclass
-class EILayerConfig:
-    """Configuration for a single EI layer (identical to connect_four_snn.py)."""
-    e_shape: Tuple[int, ...]
-    i_shape: Tuple[int, ...]
-
-    v_thresh:   float = 0.61
-    tau_mem:    float = 10.0
-    tau_refrac: float = 3.0
-    tau_adapt:  float = 300.0
-    beta:       float = 0.0174
-
-    connectivity_type: str = "toroidal"
-    sigma: float = 0.05
-    desired_fan_in_ee: int = 300
-    desired_fan_in_ei: int = 300
-    desired_fan_in_ie: int = 300
-    desired_fan_in_ii: int = 300
-    p_ee: float = 0.005
-    p_ei: float = 0.005
-    p_ie: float = 0.005
-    p_ii: float = 0.005
-
-    mean_scale: float = 0.1
-    sd_scale:   float = 0.05
-
-
-class EILayer:
-    """
-    A single Excitatory-Inhibitory layer (mirrors connect_four_snn.py EILayer).
-    """
-
-    def __init__(self, cfg: EILayerConfig, name: str = ""):
-        self.cfg  = cfg
-        self.name = name
-        self.e: Optional[Population] = None
-        self.i: Optional[Population] = None
-        self._internal_connections: list = []
-
-    def build(self):
-        cfg    = self.cfg
-        neuron_kwargs = dict(
-            v_thresh=cfg.v_thresh,
-            tau_mem=cfg.tau_mem,
-            tau_refrac=cfg.tau_refrac,
-            tau_adapt=cfg.tau_adapt,
-            beta=cfg.beta,
-            integrate_during_refrac=True
-        )
-        self.e = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.e_shape)
-        self.i = Population(AdaptiveLeakyIntegrateFire(**neuron_kwargs), cfg.i_shape)
-
-        internal = [
-            (self.e, self.e, cfg.e_shape, cfg.desired_fan_in_ee, cfg.p_ee, +1),
-            (self.e, self.i, cfg.e_shape, cfg.desired_fan_in_ei, cfg.p_ei, +1),
-            (self.i, self.e, cfg.i_shape, cfg.desired_fan_in_ie, cfg.p_ie, -1),
-            (self.i, self.i, cfg.i_shape, cfg.desired_fan_in_ii, cfg.p_ii, -1),
-        ]
-        for pre, post, src_shape, fan_in, p, sign in internal:
-            conn = Connection(
-                pre, post,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=cfg.sigma,
-                    desired_fan_in=fan_in,
-                    sign=sign,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=sign,
-            )
-            self._internal_connections.append(conn)
-        return self
-
-    def connect_from(
-        self,
-        source: Population,
-        src_shape: Tuple,
-        connectivity_type: str = None,
-        desired_fan_in: int = 100,
-        p: float = 0.01,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        cfg    = self.cfg
-        c_type = connectivity_type or cfg.connectivity_type
-        sig    = sigma or cfg.sigma
-        for target in (self.e, self.i):
-            Connection(
-                source, target,
-                make_connectivity(
-                    connectivity_type=c_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=desired_fan_in,
-                    fan_in_scale=fan_in_scale,
-                    sign=+1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=+1,
-            )
-
-    def connect_to_next(
-        self,
-        next_layer: "EILayer",
-        p: float = 0.01,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        cfg = self.cfg
-        sig = sigma or cfg.sigma
-
-        for target in (next_layer.e, next_layer.i):
-            Connection(
-                self.e, target,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=cfg.e_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=cfg.desired_fan_in_ee,
-                    fan_in_scale=fan_in_scale,
-                    sign=+1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=+1,
-            )
-
-        for target in (next_layer.e, next_layer.i):
-            Connection(
-                self.i, target,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=cfg.i_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=cfg.desired_fan_in_ie,
-                    fan_in_scale=fan_in_scale,
-                    sign=-1,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=-1,
-            )
-
-    def connect_to_field(
-        self,
-        field: Population,
-        p: float = 0.5,
-        sigma: float = None,
-        fan_in_scale: float = None,
-    ):
-        cfg = self.cfg
-        sig = sigma or cfg.sigma
-        for src, sign, src_shape, fan_in in (
-            (self.e, +1, cfg.e_shape, cfg.desired_fan_in_ee),
-            (self.i, -1, cfg.i_shape, cfg.desired_fan_in_ie),
-        ):
-            Connection(
-                src, field,
-                make_connectivity(
-                    connectivity_type=cfg.connectivity_type,
-                    src_shape=src_shape,
-                    p=p,
-                    sigma=sig,
-                    desired_fan_in=fan_in,
-                    fan_in_scale=fan_in_scale,
-                    sign=sign,
-                    mean_scale=cfg.mean_scale,
-                    sd_scale=cfg.sd_scale,
-                ),
-                exc_inh_sign=sign,
-            )
-
-    def populations(self):
-        return self.e, self.i
-
-
 # ─── Build & compile network ─────────────────────────────────────
 
-def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
-    network = Network(default_params)
+BUILT = None   # the snake_network.Built of the last network built (populations, labels, layer lists)
 
-    ei_cfg = EILayerConfig(
-        e_shape=HIDDEN_E_SHAPE,
-        i_shape=HIDDEN_I_SHAPE,
-        connectivity_type=connectivity_type,
-        sigma=SIGMA_H,
-        desired_fan_in_ee=DESIRED_FAN_IN_H1,
-        desired_fan_in_ei=DESIRED_FAN_IN_H1,
-        desired_fan_in_ie=DESIRED_FAN_IN_H2,
-        desired_fan_in_ii=DESIRED_FAN_IN_H2,
-    )
 
-    with network:
-        # ── Populations ──────────────────────────────────────────
-        input_pop = Population(
-            PoissonInput(), INPUT_SHAPE
-        )
+def plastic_inhibition_connections(built):
+    """{Connection: settings} of the plastic inhibitory synapses (as snake.py): every layer's I -> E
+    ("plastic_inhibition") and I -> I ("plastic_inhibition_i"), restricted to "plastic_inhibition_layers"."""
+    layers = HP["plastic_inhibition_layers"]
+    if layers is not None and any(not 1 <= k <= len(built.inhibitory_to_e) for k in layers):
+        raise ValueError(f"plastic_inhibition_layers {layers}: the network has {len(built.inhibitory_to_e)} layers")
+    out = {}
+    for key, conns in (("plastic_inhibition", built.inhibitory_to_e), ("plastic_inhibition_i", built.inhibitory_to_i)):
+        if HP[key] is not None:
+            out.update({c: HP[key] for k, c in enumerate(conns, 1) if layers is None or k in layers})
+    return out
 
-        alif_params = dict(
-            v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300,
-            integrate_during_refrac=True
-        )
 
-        ei_layers = []
-        for i in range(1):
-            ei_layers.append(EILayer(ei_cfg, name=f"L{i+1}").build())
-
-        policy_field = Population(
-            AdaptiveLeakyIntegrateFire(**alif_params), HIDDEN_I_SHAPE
-        )
-        value_field = Population(
-            AdaptiveLeakyIntegrateFire(**alif_params), HIDDEN_I_SHAPE
-        )
-
-        policy = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), NUM_ACTIONS
-        )
-        value = Population(
-            LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1
-        )
-
-        # Input → first EI layer (excitatory only, using full connectivity_type)
-        ei_layers[0].connect_from(
-            input_pop, INPUT_SHAPE,
-            connectivity_type=connectivity_type,
-            desired_fan_in=DESIRED_FAN_IN_IN,
-            sigma=SIGMA_IN,
-        )
-
-        # Stack EI layers
-        for i in range(len(ei_layers) - 1):
-            ei_layers[i].connect_to_next(ei_layers[i+1])
-
-        # ── Last EI layer → field populations ────────────────────
-        ei_layers[-1].connect_to_field(policy_field, p=CONN_P["H-H"])
-        ei_layers[-1].connect_to_field(value_field,  p=CONN_P["H-H"])
-
-        # ── Field → output heads (forward + feedback) ────────────
-        for field, head, feedback_name, n_out in (
-            (policy_field, policy, "policy_feedback", NUM_ACTIONS),
-            (value_field,  value,  "value_feedback",  1),
-        ):
-            Connection(
-                field, head,
-                make_connectivity("fixed", src_shape=HIDDEN_I_SHAPE,
-                                  p=0.99999, sign=None),
-                exc_inh_sign=None,
-            )
-
-        # ── tde_transport: policy + all hidden → value ────────────
-        Connection(policy, value, Dense(weight=1.0),
-                   feedback_name="tde_transport")
-        for layer in ei_layers:
-            for pop in layer.populations():
-                Connection(pop, value, Dense(weight=1.0),
-                           feedback_name="tde_transport")
-        for field in (policy_field, value_field):
-            Connection(field, value, Dense(weight=1.0),
-                       feedback_name="tde_transport")
+def build_compiled_network(connectivity_type=None):
+    """The network of snake_network.py from HP (the same builder and keys as snake.py), compiled.
+    connectivity_type: unused (kept for tic_tac_toe_2agents.py); checkpoints restore the saved connectivity."""
+    global BUILT
+    spec = snake_network.spec_from_hparams(HP, INPUT_SHAPE, NUM_ACTIONS, channels=INPUT_SHAPE[2])
+    built = BUILT = snake_network.build_network(spec, default_params)
+    network, input_pop, policy, value = built.network, built.input, built.policy, built.value
 
     # ── Compiler ─────────────────────────────────────────────────
     if HP["hidden_rule"] is None:
@@ -458,7 +177,16 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
     else:
         from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
         compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"],
-                                                           "optimise_feedback": HP["optimise_feedback"]}
+                                                           "optimise_feedback": HP["optimise_feedback"],
+                                                           "train_readout": HP["train_readout"],
+                                                           "population_rules": built.population_rules}
+        if HP["dale"] is not None:
+            rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
+        if HP["inhibitory_reversal"] is not None:
+            rule_kwargs["inhibitory_reversal"] = HP["inhibitory_reversal"]
+        plastic = plastic_inhibition_connections(built)
+        if plastic:
+            rule_kwargs["plastic_inhibition"] = plastic
     if HP["optimiser"] == "adam":
         optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999, l2_init_strength=1e-5)
     else:
@@ -466,6 +194,9 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
     compiler = compiler_cls(
         **rule_kwargs,
         rng_seed=0 if HP["seed"] is None else HP["seed"] + 1,   # GeNN: 0 = random seed
+        # the CPU backend compiles without optimisation unless asked
+        **({"backend": HP["backend"], "optimize_code": True} if HP["backend"] == "single_threaded_cpu"
+           else {"backend": HP["backend"]} if HP["backend"] else {}),
         example_timesteps=1,
         losses={
             policy: "mean_square_error",
@@ -500,8 +231,7 @@ def build_compiled_network(connectivity_type=CONNECTIVITY_TYPE):
 
     compiled_net = compiler.compile(network)
 
-    hidden_layers = {i: pop
-                     for i, pop in enumerate(ei_layers[0].populations())}
+    hidden_layers = {i: pop for i, pop in enumerate(built.layers[0])}      # the first layer's E and I
     return compiled_net, network, input_pop, hidden_layers, policy, value
 
 
@@ -705,6 +435,10 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
 
         for _ in range(3):
             current_run.append(env.render())
+        # Dale's law during training (as snake.py): wrong-sign synapses reset or pruned and rewired at episode ends
+        if HP["dale"] is not None and ep % int(HP["dale"].get("every_episodes", 1)) == 0:
+            compiled_net.genn_model.custom_update("DalePrune")
+            compiled_net.genn_model.custom_update("DaleRewire")
         # ── periodic checkpoint ───────────────────────────────────
         if (ep + 1) % 1000 == 0:
             compiled_net.save_connectivity((f"{CHECKPOINT_SAVE_NAME}_ep{ep+1}",), serialiser)

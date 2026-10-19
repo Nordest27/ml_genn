@@ -9,7 +9,8 @@ with TD-error transport connections into the value head and, optionally, explici
 Config ("network" key of SNAKE_CONFIG), any subset, e.g.
     {"layers": [{"e": 30}, {"e": 20}, {"e": 10, "i": 8, "rule": {"preset": "eprop"}}],
      "fields": {"shape": 6}, "input": {"fan_in": 200}}
-Shapes given as an int n mean (n, n, channels). A layer or the fields may carry their own learning rule ("rule"), passed
+The layers list sets the depth: one entry per layer, {} for a layer with default settings (with ei_layers other than
+1 the two must agree). Shapes given as an int n mean (n, n, channels). A layer or the fields may carry their own learning rule ("rule"), passed
 to the compiler as population_rules (the layer split: e.g. perturbation-based in wide layers, e-prop in narrow ones).
 """
 from dataclasses import dataclass, field, fields as dc_fields, replace
@@ -49,6 +50,8 @@ class ConnSpec:
                                      # sheets = their E grids: the coarser sheet sets the neighbourhood, E and I of a
                                      # layer cover the same area, a sparser I population contributes fewer inputs)
     p_global: float = 0.0            # ... plus this probability for every pair: random long-range connections
+    p_surround: float = 0.0          # ... plus a broader Gaussian (sigma * surround_ratio, peak p_surround): a sparse
+    surround_ratio: float = 3.0      #     wide surround around the narrow centre (centre-surround kernel)
     mean_norm: str = "sqrt"          # ... mean weight mean_scale / sqrt(K) ("sqrt": total mean input grows as sqrt(K),
                                      # so pooling connections over-drive their targets) or mean_scale * sqrt(K_ref) / K
                                      # ("mean_field": total mean input independent of K; K_ref = the fan-in of the same
@@ -73,6 +76,7 @@ class LayerSpec:
     fan_in_e: float = 300            # fan-in of connections whose source is an E population (E->E, E->I, E->next)
     fan_in_i: float = 300            # fan-in of connections whose source is an I population
     internal: ConnSpec = field(default_factory=lambda: ConnSpec(p=0.005))   # the four recurrent E/I connections
+                                                                            # (type "none": no recurrence)
     internal_i: Optional[ConnSpec] = None                      # ... the two from the I population (None: internal)
     to_next: ConnSpec = field(default_factory=ConnSpec)        # this layer -> next layer (E and I sources)
     to_next_i: Optional[ConnSpec] = None                       # ... from the I population only (None: to_next). The
@@ -185,7 +189,7 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
             sheet_sigma = sigma_cells * max(1.0, src_sheet[0] / tgt_sheet[0])
             sigma_cells, sigma_ref = sheet_sigma * src_shape[0] / src_sheet[0], "source"
         kw = dict(sigma=sig, fan_in=0, p_max=conn.p_max, sigma_cells=sigma_cells, sigma_ref=sigma_ref,
-                  p_global=conn.p_global)
+                  p_global=conn.p_global, p_surround=conn.p_surround, surround_ratio=conn.surround_ratio)
         probe = ToroidalGaussian2D(weight=0.0, **kw)
         w_fan = conn.weight_fan_in
         if w_fan is None:
@@ -225,6 +229,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
                 spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
+                if spec_c.type == "none":                # no recurrent connection (e.g. a frozen input copy)
+                    continue
                 c = Connection(pre, post, connectivity(spec_c, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
                                                        same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
                                exc_inh_sign=sign)
@@ -425,6 +431,11 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                        explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"])
     net = dict(hp.get("network") or {})
     if "layers" in net:
+        if hp["ei_layers"] != 1 and len(net["layers"]) != hp["ei_layers"]:
+            # the list sets the depth (one entry per layer, {} = defaults): a mismatch with an explicit ei_layers is
+            # almost always an entry dropped by mistake (e.g. a trailing {} removed), which would silently change depth
+            raise ValueError(f"network.layers has {len(net['layers'])} entries but ei_layers is {hp['ei_layers']}: "
+                             f"give one entry per layer ({{}} for a layer with default settings)")
         layers = []
         for depth, ld in enumerate(net.pop("layers")):
             ld = dict(ld)

@@ -1511,7 +1511,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 if normaliser is not None and env.wait_count == env.wait_inc:
                     normaliser.move()
                 if probe is not None and env.wait_count == env.wait_inc and not done:
-                    probe.sample(env)
+                    probe.sample(env, obs, ep)
 
                 if env.wait_count == env.wait_inc:
                     for conn_pop in list(compiled_net.connection_populations.values())[::-1]:

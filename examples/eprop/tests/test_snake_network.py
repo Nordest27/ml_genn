@@ -151,3 +151,15 @@ def test_inhibitory_connection_lists_per_layer():
     for (e, i), ie, ii in zip(b.layers, b.inhibitory_to_e, b.inhibitory_to_i):
         assert ie.source() is i and ie.target() is e
         assert ii.source() is i and ii.target() is i
+
+
+def test_layers_list_must_match_explicit_ei_layers():
+    """A dropped trailing {} must not silently build one layer fewer than ei_layers."""
+    import snake_hparams
+    hp = {**snake_hparams.DEFAULTS, "ei_layers": 5, "toroidal": "local", "network": {"layers": [{}] * 4}}
+    with pytest.raises(ValueError, match="4 entries but ei_layers is 5"):
+        SN.spec_from_hparams(hp, (20, 20, 3), 4)
+    hp["network"] = {"layers": [{}] * 5}
+    assert len(SN.spec_from_hparams(hp, (20, 20, 3), 4).layers) == 5
+    hp = {**snake_hparams.DEFAULTS, "network": {"layers": [{}] * 3}}          # ei_layers default: the list sets depth
+    assert len(SN.spec_from_hparams(hp, (20, 20, 3), 4).layers) == 3

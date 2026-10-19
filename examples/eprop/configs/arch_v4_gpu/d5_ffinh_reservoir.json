@@ -1,0 +1,119 @@
+{
+ "toroidal": "local",
+ "local": {
+  "sigma_cells": 2.418,
+  "p_max": 0.831,
+  "input_sigma_cells": 1.791,
+  "inhibition_scale": 3.554,
+  "feedforward_inhibition": true,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 0.642
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 0.708,
+    "mean_scale": 0.8411949717627377,
+    "sd_scale": 0.16823899435254755
+   },
+   "shape": 20,
+   "conn_i": {
+    "sigma_cells": 0.708,
+    "mean_scale": 0.25,
+    "sd_scale": 0.05
+   }
+  },
+  "layers": [
+   {
+    "to_next": {
+     "sigma_cells": 0.791,
+     "mean_scale": 1.5141154941273796,
+     "sd_scale": 0.15141154941273796
+    },
+    "to_next_i": {
+     "sigma_cells": 0.791,
+     "mean_scale": 0.5,
+     "sd_scale": 0.05
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.791,
+     "mean_scale": 1.1802304542566338,
+     "sd_scale": 0.11802304542566339
+    },
+    "to_next_i": {
+     "sigma_cells": 0.791,
+     "mean_scale": 0.5,
+     "sd_scale": 0.05
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.791,
+     "mean_scale": 1.3711525032061462,
+     "sd_scale": 0.13711525032061464
+    },
+    "to_next_i": {
+     "sigma_cells": 0.791,
+     "mean_scale": 0.5,
+     "sd_scale": 0.05
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.791,
+     "mean_scale": 1.1515770343367342,
+     "sd_scale": 0.11515770343367343
+    },
+    "to_next_i": {
+     "sigma_cells": 0.791,
+     "mean_scale": 0.5,
+     "sd_scale": 0.05
+    }
+   },
+   {}
+  ]
+ },
+ "feedforward_targets": "both",
+ "ei_layers": 5,
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "c_reg": 0.0001,
+ "hidden_rule": {
+  "preset": "reservoir"
+ },
+ "_meta": {
+  "variant": "d5_ffinh_reservoir",
+  "architecture_search": {
+   "folder": "arch_search_full_v5_l5_unconstrained",
+   "idx": 5,
+   "score": 0.797,
+   "parts": {
+    "l1": 0.8511195931792994,
+    "fields": 0.8994660617951393,
+    "memory": 0.4834904423639542,
+    "later_kept": 0.9617966318591472,
+    "mixing": 0.9132341620426825,
+    "penalty": 0.0,
+    "wiring": 0.0
+   },
+   "genome": {
+    "sigma_cells": 2.4179865233900215,
+    "p_max": 0.8305680820582118,
+    "input_sigma_cells": 1.7914691026066978,
+    "inhibition_scale": 3.55350050175778,
+    "ff_sigma": 0.7913433673691237,
+    "field_sigma": 0.7079330739135573,
+    "field_shape": "excitatory",
+    "target_hz": 20.0,
+    "ff_inhibition": true,
+    "ff_targets": "both",
+    "inh_sigma_ratio": 0.6417206462396919
+   }
+  }
+ }
+}

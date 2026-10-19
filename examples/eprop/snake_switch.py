@@ -375,13 +375,24 @@ class PolicyMonitor:
 class ProbeRecorder:
     """Records, at every move, the hidden populations' membrane potentials and refractory state together with the
     task variables (apple relative to the head, danger in each direction, heading). Keeps the first `moves` and the
-    last `moves` samples of the run, for linear-probe analysis of what the hidden layer represents."""
-    DIRS = {"left": (0, -1), "up": (-1, 0), "right": (0, 1), "down": (1, 0)}
+    last `moves` samples of the run, for linear-probe analysis of what the hidden layer represents.
 
-    def __init__(self, compiled_net, populations, labels, moves=5000):
+    Timing: a sample is taken one simulation step after the NEXT frame has been presented, so the state mostly
+    reflects the frame before. Each sample also stores the frame the network has just been given (`inp`, uint8) and
+    extra variables (`extra`: tail relative to the head, snake length, previous heading, episode index), so an
+    analysis can pair the state at sample t with the frame and variables of sample t-1 of the same episode
+    (layer_probe_tests.py). adapt=True also stores every neuron's adaptation variable A (float16; large for big
+    networks), the slow state that carries memory across frames."""
+    DIRS = {"left": (0, -1), "up": (-1, 0), "right": (0, 1), "down": (1, 0)}
+    EXTRA = ["tail_dy", "tail_dx", "length", "prev_heading", "episode"]
+
+    def __init__(self, compiled_net, populations, labels, moves=5000, inputs=True, adapt=False):
         from collections import deque
         self.net, self.pops, self.labels, self.moves = compiled_net, list(populations), list(labels), int(moves)
+        self.inputs, self.adapt = bool(inputs), bool(adapt)
         self.first, self.last = [], deque(maxlen=self.moves)
+        self._prev_heading, self._episode = -1, None
+        self.board = 0
 
     @staticmethod
     def task_variables(env):
@@ -395,27 +406,55 @@ class ProbeRecorder:
         heading = list(ProbeRecorder.DIRS).index(env.direction)
         return np.array([ay - hy, ax - hx, *danger, heading], dtype=np.float32)
 
-    def sample(self, env):
-        feats = []
+    def sample(self, env, obs=None, episode=None):
+        feats, adapt = [], []
         for p in self.pops:
             npop = self.net.neuron_populations[p]
-            for v in ("V", "RefracTime"):
+            for v in ("V", "RefracTime") + (("A",) if self.adapt else ()):
                 npop.vars[v].pull_from_device()
             feats.append(np.asarray(npop.vars["V"].view, dtype=np.float32).ravel().copy())
             feats.append((np.asarray(npop.vars["RefracTime"].view).ravel() > 0).astype(np.float32))
-        row = (np.concatenate(feats), self.task_variables(env))
+            if self.adapt:
+                adapt.append(np.asarray(npop.vars["A"].view).ravel().astype(np.float16))
+        self.board = env.size
+        y = self.task_variables(env)
+        if episode != self._episode:                       # a new episode: no previous heading
+            self._prev_heading, self._episode = -1, episode
+        hy, hx = env.snake[0]
+        ty, tx = env.snake[-1]
+        extra = np.array([ty - hy, tx - hx, len(env.snake), self._prev_heading,
+                          -1 if episode is None else episode], dtype=np.float32)
+        self._prev_heading = int(y[6])
+        inp = None
+        if self.inputs and obs is not None:
+            inp = (np.clip(np.asarray(obs, dtype=np.float32), 0.0, 1.0) * 255).astype(np.uint8).ravel()
+        # board state (body head-first, padded with -1; apple) for labels computed offline, e.g. snake_strategy safety
+        body = np.full((env.size * env.size, 2), -1, np.int8)
+        body[:len(env.snake)] = np.asarray(env.snake, np.int8)
+        apple = np.asarray(env.apples[0] if env.apples else (-1, -1), np.int8)
+        row = (np.concatenate(feats), y, extra, inp, np.concatenate(adapt) if adapt else None, body, apple)
         if len(self.first) < self.moves:
             self.first.append(row)
         self.last.append(row)
 
     def dump(self, path):
-        def stack(rows):
-            if not rows:
-                return np.zeros((0, 0), np.float32), np.zeros((0, 7), np.float32)
-            return np.stack([r[0] for r in rows]), np.stack([r[1] for r in rows])
-        fx, fy = stack(self.first)
-        lx, ly = stack(list(self.last))
+        def stack(rows, i, dtype, width):
+            if not rows or rows[0][i] is None:
+                return np.zeros((0, width), dtype)
+            return np.stack([r[i] for r in rows])
+        out = {}
+        for name, rows in (("first", self.first), ("last", list(self.last))):
+            out[f"{name}_x"] = stack(rows, 0, np.float32, 0)
+            out[f"{name}_y"] = stack(rows, 1, np.float32, 7)
+            out[f"{name}_extra"] = stack(rows, 2, np.float32, len(self.EXTRA))
+            out[f"{name}_inp"] = stack(rows, 3, np.uint8, 0)
+            if self.adapt:
+                out[f"{name}_a"] = stack(rows, 4, np.float16, 0)
+            out[f"{name}_body"] = stack(rows, 5, np.int8, 0)
+            out[f"{name}_apple"] = stack(rows, 6, np.int8, 2)
         sizes = [int(np.prod(p.shape)) for p in self.pops]
-        np.savez(path, first_x=fx, first_y=fy, last_x=lx, last_y=ly, sizes=np.array(sizes),
-                 labels=np.array(self.labels), variables=np.array(["apple_dy", "apple_dx", "danger_left", "danger_up",
-                                                                   "danger_right", "danger_down", "heading"]))
+        shapes = np.array([tuple(p.shape) + (1,) * (3 - len(p.shape)) for p in self.pops], dtype=np.int64)
+        np.savez_compressed(path, **out, sizes=np.array(sizes), shapes=shapes, labels=np.array(self.labels),
+                            variables=np.array(["apple_dy", "apple_dx", "danger_left", "danger_up", "danger_right",
+                                                "danger_down", "heading"]), extra_names=np.array(self.EXTRA),
+                            board=np.array(self.board))

@@ -28,6 +28,16 @@ Score (higher is better, at most 1; every metric is stored, so --report re-ranks
 Disk: each candidate's GeNN build folder is deleted once its results are saved.
 GPU: needs a CUDA-enabled GeNN (CUDA_PATH set). One candidate at a time, in its own process.
 
+Prior (--prior relay): what training showed for deep networks. The layer-to-layer projections stay a near copy
+(ff_sigma 0.3-0.6, no surround or shortcuts) and mixing is left to the input projection, the recurrence and the
+fields; the score's middle term becomes the weakest stage (min over L2..Ln and the fields of what they keep of L1),
+so every step must preserve the information. Use with --min-fan-in 0 --min-cells 0 (a relay is sparse on purpose)
+and --seed-genomes to start from a known network.
+
+Feed-forward kernel (--ff-kernel): "gaussian" (default) or "surround", a narrow centre (ff_sigma) plus a sparse wide
+surround (genes ff_surround_p, ff_surround_ratio) on every layer-to-layer projection and the projection into the
+fields: the centre relays, the surround mixes. The surround counts toward the wiring minimum (it is local); --min-fan-in 0 --min-cells 0 turns the minimum off.
+
 Families (--shortcuts): "off" (default) searches purely local networks; "on" adds the gene global_fan_in, random
 long-range inputs per neuron (p_global = fan-in / E population size). The wiring minimum counts local synapses only
 (it is checked on the same network without the shortcuts), and every result stores long_range_fraction, the share
@@ -68,7 +78,13 @@ SPACE = {
     "global_fan_in": ("int", 1, 40, 4.0),           # random long-range inputs per neuron (--shortcuts on only):
                                                     # first samples 1-40, mutations +-4 (sd), no upper bound
     "inh_sigma_ratio": ("log", 0.5, 3.0),           # recurrent I -> E / I -> I spread relative to sigma_cells
+    "ff_surround_p": ("log", 0.005, 0.3),           # --ff-kernel surround: peak probability of the wide surround
+    "ff_surround_ratio": ("log", 2.0, 8.0),         # ... its spread relative to the feed-forward centre (ff_sigma)
 }
+SURROUND_GENES = ("ff_surround_p", "ff_surround_ratio")
+RELAY_FF = ("log", 0.3, 0.6)            # --prior relay: the layer-to-layer projection stays a near copy
+SURROUND_CENTRE = ("log", 0.3, 0.8)     # with a surround the feed-forward centre stays narrow (a relay): the surround
+                                        # has to provide the mixing, instead of a wide single Gaussian
 
 
 def sample_gene(rng, spec):
@@ -86,22 +102,29 @@ def sample_gene(rng, spec):
 GENE_DEFAULTS = {"ff_inhibition": False, "ff_targets": "both", "inh_sigma_ratio": 1.0}     # genomes from before these genes existed
 
 
-def random_genome(rng, layers, shortcuts=False):
+def random_genome(rng, layers, shortcuts=False, surround=False, relay=False):
     g = {k: sample_gene(rng, s) for k, s in SPACE.items()}
+    if relay and layers > 1:
+        g["ff_sigma"] = sample_gene(rng, RELAY_FF)
     if not shortcuts:
         g.pop("global_fan_in")                    # the purely local family
+    if not surround or layers == 1:
+        for k in SURROUND_GENES:
+            g.pop(k)                              # single-Gaussian feed-forward kernel
+    else:
+        g["ff_sigma"] = sample_gene(rng, SURROUND_CENTRE)
     if layers == 1:
         g.pop("ff_sigma")
         g.pop("ff_targets")                       # no layer-to-layer projection (ff_inhibition still acts on the fields)
     return g
 
 
-def mutate(rng, genome, layers):
+def mutate(rng, genome, layers, relay=False):
     g = {**GENE_DEFAULTS, **genome}
     if layers == 1:
         g.pop("ff_targets", None)
     keys = [k for k in SPACE if (layers > 1 or k not in ("ff_sigma", "ff_targets"))
-            and (k != "global_fan_in" or k in g)]       # a genome stays in its family (with / without shortcuts)
+            and (k not in ("global_fan_in",) + SURROUND_GENES or k in g)]   # a genome stays in its family
     for k in rng.sample(keys, rng.randint(1, 3)):
         spec = SPACE[k]
         if spec[0] == "choice":
@@ -110,6 +133,10 @@ def mutate(rng, genome, layers):
             g[k] = max(1, int(round(g[k] + rng.gauss(0.0, spec[3]))))
         else:                                   # multiplicative jitter within the bounds
             lo, hi = spec[1], spec[2]
+            if k == "ff_sigma" and "ff_surround_p" in g:
+                lo, hi = SURROUND_CENTRE[1], SURROUND_CENTRE[2]
+            if k == "ff_sigma" and relay:
+                lo, hi = RELAY_FF[1], RELAY_FF[2]
             g[k] = float(min(hi, max(lo, g[k] * math.exp(rng.gauss(0.0, 0.25)))))
     return g
 
@@ -128,8 +155,14 @@ def genome_to_hp(g, layers, size):
         local["input_sigma_ref"] = "source"
     net = {"fields": {"conn": {"sigma_cells": round(g["field_sigma"], 3)},
                       "shape": hid_i if g["field_shape"] == "inhibitory" else hid_e}}
+    if "ff_surround_p" in g:                      # the fields get the same centre-surround kernel (around field_sigma)
+        net["fields"]["conn"].update(p_surround=round(g["ff_surround_p"], 4),
+                                     surround_ratio=round(g["ff_surround_ratio"], 3))
     if layers > 1:
-        net["layers"] = [{"to_next": {"sigma_cells": round(g["ff_sigma"], 3)}}] * (layers - 1) + [{}]
+        to_next = {"sigma_cells": round(g["ff_sigma"], 3)}
+        if "ff_surround_p" in g:                  # centre-surround feed-forward kernel
+            to_next.update(p_surround=round(g["ff_surround_p"], 4), surround_ratio=round(g["ff_surround_ratio"], 3))
+        net["layers"] = [{"to_next": dict(to_next)} for _ in range(layers - 1)] + [{}]
     hp = {"toroidal": "local", "local": local, "network": net}
     if layers > 1:
         hp["feedforward_targets"] = g["ff_targets"]
@@ -181,7 +214,9 @@ def synapse_count(built):
 
 
 def score(result, layers):
-    """0.4 * layer 1 (absolute) + 0.4 * what the fields keep of it + 0.2 * the fields' memory - penalties."""
+    """0.4 * layer 1 (absolute) + 0.4 * what the fields keep of it + 0.2 * the fields' memory - penalties.
+    Under the relay prior (result["prior"] == "relay") the middle term is the WEAKEST stage instead of the fields:
+    every layer and the fields must preserve layer 1, a loss at one step cannot be made up elsewhere."""
     e = [p for p in result["per_pop"] if p["pop"].endswith("_E")]
     f = [p for p in result["per_pop"] if "field" in p["pop"]]
     l1 = e[0]
@@ -214,8 +249,10 @@ def score(result, layers):
     wire = float(np.mean([w["below_min"] for w in result.get("wiring", [])])) if result.get("wiring") else 0.0
     mem = [p["memory"] for p in f if p.get("memory")]
     memory = float(min(np.mean([np.mean(m) for m in mem]) / MEM_FULL, 1.0)) if mem else 0.0
-    return float(0.4 * l1_abs + 0.4 * fields + 0.2 * memory - pen - wire), {
-        "l1": l1_abs, "fields": fields, "memory": memory, "later_kept": later, "mixing": mix, "stages": [round(x, 3) for x in stages],
+    weakest = float(min(stages)) if stages else 0.0
+    keep = weakest if result.get("prior") == "relay" else fields
+    return float(0.4 * l1_abs + 0.4 * keep + 0.2 * memory - pen - wire), {
+        "l1": l1_abs, "fields": fields, "weakest": weakest, "memory": memory, "later_kept": later, "mixing": mix, "stages": [round(x, 3) for x in stages],
         "penalty": pen, "wiring": wire}
 
 
@@ -295,10 +332,12 @@ def seed_genomes(args, done):
     this search's family and depth: genes missing in them get GENE_DEFAULTS, genes this search does not use are
     dropped, and (shortcuts off) old p_global / global_fan_in values are removed. Genomes already evaluated here are
     skipped, so a resumed search does not evaluate its seeds twice."""
-    if not args.seed_from:
-        return []
     found = []
-    for folder in args.seed_from:
+    if getattr(args, "seed_genomes", None):
+        found += [{"genome": g, "score": float("inf")} for g in json.load(open(args.seed_genomes))]
+    if not args.seed_from and not found:
+        return []
+    for folder in (args.seed_from or []):
         res = [r for r in rescore(load_results(Path(folder).resolve()), args.layers) if "per_pop" in r]
         found += sorted(res, key=lambda r: -r["score"])[:args.seed_top]
     seen = [r["genome"] for r in done]
@@ -310,6 +349,12 @@ def seed_genomes(args, done):
             g.pop("global_fan_in", None)
         elif "global_fan_in" not in g:
             g["global_fan_in"] = 1
+        surround = getattr(args, "ff_kernel", "gaussian") == "surround" and args.layers > 1
+        if not surround:
+            for k in SURROUND_GENES:
+                g.pop(k, None)
+        elif "ff_surround_p" not in g:                   # start from a faint surround: close to the seed's own kernel
+            g.update(ff_surround_p=0.01, ff_surround_ratio=4.0)
         if args.layers == 1:
             g.pop("ff_sigma", None); g.pop("ff_targets", None)
         elif "ff_sigma" not in g:
@@ -340,7 +385,7 @@ def report(out, top=10, export=3):
     if not res:
         print("no results yet"); return
     print(f"{len(res)} candidates; best {top}:")
-    print(f"  {'idx':>5s} {'score':>6s} {'L1':>5s} {'field':>5s} {'mem':>5s} {'mix':>5s} {'pen':>4s} {'wire':>5s}  "
+    print(f"  {'idx':>5s} {'score':>6s} {'L1':>5s} {'field':>5s} {'weak':>5s} {'mem':>5s} {'mix':>5s} {'pen':>4s} {'wire':>5s}  "
           f"{'kept per stage (L2.., fields)':30s} genome")
     for r in res[:top]:
         p = r["parts"]
@@ -350,7 +395,8 @@ def report(out, top=10, export=3):
         st = " ".join(f"{x:.2f}" for x in p["stages"])
         if "long_range_fraction" in r:
             st = f"LR {r['long_range_fraction']:.2f} | " + st
-        print(f"  {r['idx']:5d} {r['score']:6.3f} {p['l1']:5.2f} {p.get('fields', 0):5.2f} {p.get('memory', 0):5.2f} "
+        print(f"  {r['idx']:5d} {r['score']:6.3f} {p['l1']:5.2f} {p.get('fields', 0):5.2f} {p.get('weakest', 0):5.2f} "
+              f"{p.get('memory', 0):5.2f} "
               f"{p.get('mixing', 0):5.2f} "
               f"{p['penalty']:4.1f} {p.get('wiring', 0):5.2f}  "
               f"{st:30s} {g}")
@@ -373,6 +419,12 @@ def main():
     ap.add_argument("--max", type=int, default=100000, help="stop after this many candidates in total")
     ap.add_argument("--random", type=int, default=20, help="random candidates before mutating the best")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--prior", default="none", choices=["none", "relay"],
+                    help="relay: layer-to-layer projections stay a near copy (ff_sigma 0.3-0.6) and the score asks every "
+                         "stage to preserve layer 1 (weakest stage instead of the fields); use with --min-fan-in 0")
+    ap.add_argument("--seed-genomes", help="JSON file with a list of genomes to evaluate first (e.g. a known network)")
+    ap.add_argument("--ff-kernel", default="gaussian", choices=["gaussian", "surround"],
+                    help="feed-forward kernel between layers: one Gaussian, or a narrow centre plus a sparse wide surround")
     ap.add_argument("--shortcuts", default="off", choices=["off", "on"],
                     help="network family: purely local, or with random long-range inputs (gene global_fan_in)")
     ap.add_argument("--seed-from", nargs="+", default=[], metavar="DIR",
@@ -404,13 +456,17 @@ def main():
         if queue:
             genome = queue.pop(0)
         elif idx < args.random or rng.random() < 0.3:
-            genome = random_genome(rng, args.layers, args.shortcuts == "on")
+            genome = random_genome(rng, args.layers, args.shortcuts == "on", args.ff_kernel == "surround",
+                                   args.prior == "relay")
         else:
             top = sorted(done, key=lambda r: -r["score"])[:5]
-            genome = mutate(rng, rng.choice(top)["genome"], args.layers)
+            genome = mutate(rng, rng.choice(top)["genome"], args.layers, args.prior == "relay")
         task = (idx, genome, args.layers, args.size, args.backend, str(frames_path), str(out), args.min_fan_in,
                 args.min_cells)
         res = run_isolated(ctx, task, args.timeout)
+        if args.prior != "none" and "per_pop" in res:        # scored under the search's prior
+            res["prior"] = args.prior
+            res["score"], res["parts"] = score(res, args.layers)
         if "error" in res:                                   # a broken candidate must not stop the search
             res.update(idx=idx, genome=genome, score=-1e9,
                        parts={"l1": 0, "fields": 0, "memory": 0, "later_kept": 0, "mixing": 0, "stages": [],

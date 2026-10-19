@@ -39,7 +39,9 @@ class ToroidalGaussian2D(SparseBase):
     sigma_ref="coarser" measures sigma_cells in cells of the coarser of the two grids (per axis): from a big to a small
     layer each target then pools its own share of the source (every source is used; the neighbourhood is sigma_cells
     of the target grid), from small to big it is unchanged. p_global adds a uniform probability for every pair
-    (sparse random long-range connections on top of the local ones: a small-world graph). "source" (default) keeps sigma in source cells, so a big
+    (sparse random long-range connections on top of the local ones: a small-world graph). p_surround adds a broader
+    Gaussian (sigma * surround_ratio, peak probability p_surround): a centre-surround kernel, a strong narrow centre
+    with a sparse wide surround. "source" (default) keeps sigma in source cells, so a big
     to small connection subsamples (at ratios above ~3 part of the source connects to nothing).
     """
 
@@ -55,7 +57,9 @@ class ToroidalGaussian2D(SparseBase):
                  p_max: Optional[float] = None,
                  sigma_cells: Optional[float] = None,
                  sigma_ref: str = "source",
-                 p_global: float = 0.0):
+                 p_global: float = 0.0,
+                 p_surround: float = 0.0,
+                 surround_ratio: float = 3.0):
 
         super(ToroidalGaussian2D, self).__init__(weight, delay)
 
@@ -71,6 +75,8 @@ class ToroidalGaussian2D(SparseBase):
             raise ValueError(f"sigma_ref must be 'source' or 'coarser', not {sigma_ref!r}")
         self.sigma_ref = sigma_ref
         self.p_global = p_global
+        self.p_surround = p_surround
+        self.surround_ratio = surround_ratio
 
     def _euclidean_distance(self, x1, y1, x2, y2):
         dx = x1 - x2
@@ -127,6 +133,14 @@ class ToroidalGaussian2D(SparseBase):
             return sig * max(1.0, src_h / tgt_h), sig * max(1.0, src_w / tgt_w)
         return sig, sig
 
+    def _prob(self, z2):
+        """Connection probability at squared distance z2 (in units of sigma): the centre Gaussian, a broader
+        surround Gaussian (sigma x surround_ratio, peak p_surround) and the uniform long-range term."""
+        p = self.p_max * np.exp(-z2 / 2) + self.p_global
+        if self.p_surround > 0:
+            p = p + self.p_surround * np.exp(-z2 / (2 * self.surround_ratio ** 2))
+        return np.clip(p, 0, 1)
+
     @staticmethod
     def _toroidal_z2(src_hw, tgt_rc, sigmas):
         """Squared toroidal distance from a target cell centre to every source cell centre, in units of sigma."""
@@ -146,7 +160,7 @@ class ToroidalGaussian2D(SparseBase):
         for r in range(tgt_h):
             for c in range(tgt_w):
                 z2 = self._toroidal_z2((src_h, src_w), ((r + 0.5) / tgt_h, (c + 0.5) / tgt_w), sigmas)
-                total += np.clip(self.p_max * np.exp(-z2 / 2) + self.p_global, 0, 1).sum()
+                total += self._prob(z2).sum()
         return src_c * total / (tgt_h * tgt_w)
 
     def _connect_bernoulli(self, source, target, src_shape, tgt_shape):
@@ -158,7 +172,7 @@ class ToroidalGaussian2D(SparseBase):
         for r in range(tgt_h):
             for c in range(tgt_w):
                 z2 = self._toroidal_z2((src_h, src_w), ((r + 0.5) / tgt_h, (c + 0.5) / tgt_w), sigmas)
-                p = np.repeat(np.clip(self.p_max * np.exp(-z2 / 2) + self.p_global, 0, 1).ravel(), src_c)
+                p = np.repeat(self._prob(z2).ravel(), src_c)
                 for ch in range(tgt_c):
                     id_post = (r * tgt_w + c) * tgt_c + ch
                     keep = np.random.random(p.shape) < p
