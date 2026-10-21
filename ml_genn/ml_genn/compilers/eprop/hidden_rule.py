@@ -79,7 +79,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     # A single combined trace suffices when drift and gradient share the TD-error modulator and no
     # term needs one of them separately.
     needs_split = (cfg.center_drift or cfg.homeostat != 0 or exact
-                   or route is LocalRoute.GRADIENT_TRACE)
+                   or route is LocalRoute.GRADIENT_TRACE or cfg.surprise_drift != 0 or cfg.drift_td != 1.0)
+    use_abs_td = cfg.homeostat != 0 or cfg.surprise_drift != 0
     use_P = needs_split and (cfg.drift != 0 or cfg.homeostat != 0)
     use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE)
     use_combined = (not needs_split) and (cfg.drift != 0 or cfg.gradient != 0)
@@ -152,7 +153,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     for name, used in (("FAvg", use_favg), ("FAvgTrace", use_rate_local), ("Z", use_dvc),
                        ("PrevV", use_prevv), ("DVc", use_dvc), ("PsiBar", uses_psibar),
                        ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
-                       ("TdMean", cfg.center_drift), ("AbsTd", cfg.homeostat != 0),
+                       ("TdMean", cfg.center_drift), ("AbsTd", use_abs_td),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
                        ("ZDec", use_decorr), ("ZDecMean", use_decorr)):
         if used:
@@ -202,7 +203,7 @@ else {
                             "PsiTargetN = fmax(PsiBar, 1e-4); }")
     if cfg.center_drift:
         post_dyn.append(f"TdMean = {_f(cfg.td_stats_decay)} * TdMean + {_f(1 - cfg.td_stats_decay)} * (TdE_post + PRew_post);")
-    if cfg.homeostat != 0:
+    if use_abs_td:
         post_dyn.append(f"AbsTd = {_f(cfg.td_stats_decay)} * AbsTd + {_f(1 - cfg.td_stats_decay)} * fabs(TdE_post + PRew_post);")
     if use_local_post:
         terms = []
@@ -259,6 +260,12 @@ else {
         dg.append("reward * RLNoiseTrace")
     if use_P and cfg.drift != 0:
         mod = "(reward - TdMean)" if cfg.center_drift else "reward"
+        if cfg.drift_td != 1.0:
+            mod = f"{_f(cfg.drift_td)} * {mod}" if cfg.drift_td != 0 else ""
+        if cfg.surprise_drift != 0:   # salience: |delta| above its running mean freezes, below it sensitises
+            surprise = f"{_f(cfg.surprise_drift)} * (fabs(reward) - AbsTd)"
+            mod = f"{mod} + {surprise}" if mod else surprise
+        mod = f"({mod})" if mod else "0.0"
         dg.append(_scaled(cfg.drift, f"{mod} * RLNoisePtrace"))
     if use_G and cfg.gradient != 0:
         dg.append(_scaled(cfg.gradient, "reward * RLNoiseGtrace"))

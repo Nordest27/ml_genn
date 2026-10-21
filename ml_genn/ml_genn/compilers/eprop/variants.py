@@ -207,6 +207,10 @@ class HiddenRuleConfig:
     drift: float = 1.0               # c_P: TD error x lambda-trace of the drift part
     gradient: float = 1.0            # c_G: TD error x lambda-trace of the gradient part
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
+    drift_td: float = 1.0            # weight of the TD error in the drift's modulator (0: no outcome sign)
+    surprise_drift: float = 0.0      # c_S: adds c_S * (|delta| - mean|delta|) to the drift's modulator: the drift then
+                                     # freezes responses around surprising moments (good or bad) and keeps routine
+                                     # ones plastic (salience-gated consolidation); drift_td=0 leaves surprise only
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at

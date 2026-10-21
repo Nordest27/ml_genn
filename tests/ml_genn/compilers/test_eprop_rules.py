@@ -837,3 +837,17 @@ def test_homeostat_floor_is_one_sided():
     one = syn(HiddenRuleConfig(homeostat=1.0, psi_target=0.02, homeostat_floor=True))
     assert "fmin((PsiBar - 0.02), 0.0)" in one and "fmin(" not in two
     assert hidden_rule_from_dict({"preset": "proposed", "homeostat": 1.0, "homeostat_floor": True}).homeostat_floor
+
+
+def test_surprise_drift_modulator():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = lambda cfg: build_td_hidden_model(cfg, **kw)["model"]
+    syn = lambda cfg: model(cfg)["synapse_dynamics_code"]
+    base = syn(HiddenRuleConfig())
+    mixed = model(HiddenRuleConfig(surprise_drift=0.5))
+    only = syn(HiddenRuleConfig(drift_td=0.0, surprise_drift=1.0))
+    assert "AbsTd" not in base
+    assert "(reward + 0.5 * (fabs(reward) - AbsTd)) * RLNoisePtrace" in mixed["synapse_dynamics_code"]
+    assert "AbsTd = " in mixed["post_dynamics_code"]                        # running mean |delta| is tracked
+    assert "(1.0 * (fabs(reward) - AbsTd)) * RLNoisePtrace" in only        # outcome sign removed from the drift
+    assert "reward * RLNoiseGtrace" in only                                 # the gradient part keeps delta
