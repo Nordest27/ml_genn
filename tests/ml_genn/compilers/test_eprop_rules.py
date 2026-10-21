@@ -827,3 +827,13 @@ def test_cancellation_reward_tracks_excitatory_drive_and_changes_learning(reques
 
 
 _CANCEL_W = {}
+
+
+def test_homeostat_floor_is_one_sided():
+    from ml_genn.compilers.eprop import hidden_rule_from_dict
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    syn = lambda cfg: build_td_hidden_model(cfg, **kw)["model"]["synapse_dynamics_code"]
+    two = syn(HiddenRuleConfig(homeostat=1.0, psi_target=0.02))
+    one = syn(HiddenRuleConfig(homeostat=1.0, psi_target=0.02, homeostat_floor=True))
+    assert "fmin((PsiBar - 0.02), 0.0)" in one and "fmin(" not in two
+    assert hidden_rule_from_dict({"preset": "proposed", "homeostat": 1.0, "homeostat_floor": True}).homeostat_floor

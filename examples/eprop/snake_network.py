@@ -89,6 +89,14 @@ class LayerSpec:
                                                                # E_n -> I_n+1 -> E_n+1); "e": to its E population only,
                                                                # so the next layer's I cells are driven by their own
                                                                # layer (feedback inhibition only)
+    to_prev: ConnSpec = field(default_factory=lambda: ConnSpec(type="none"))   # this layer -> previous layer's E and I
+                                                               # (backward, E and I sources; "none": strictly
+                                                               # feedforward). With to_next and the recurrence it makes
+                                                               # the stack a 3D volume whose depth axis is the layer index
+    to_prev_i: Optional[ConnSpec] = None                       # ... from the I population only (None: to_prev)
+    to_prev_targets: str = "both"                              # "both": onto the previous layer's E and I; "i": onto
+                                                               # its I population only (top-down signals then regulate
+                                                               # the previous layer through its inhibition, never drive it)
 
 
 @dataclass
@@ -273,6 +281,19 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                     Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape,
                                                          src_sheet=ls.e_shape, tgt_sheet=spec.layers[k + 1].e_shape),
                                exc_inh_sign=sign)
+        # layer k -> layer k-1 (backward: with to_next a 3D volume with local connections in both depth directions)
+        for k in range(1, len(layers)):
+            ls = spec.layers[k]
+            for src, src_shape, fan, sign, conn in ((layers[k][0], ls.e_shape, ls.fan_in_e, +1, ls.to_prev),
+                                                    (layers[k][1], ls.i_shape, ls.fan_in_i, -1, ls.to_prev_i or ls.to_prev)):
+                if conn.type == "none":
+                    continue
+                if ls.to_prev_targets not in ("both", "i"):
+                    raise ValueError(f"to_prev_targets must be 'both' or 'i', not {ls.to_prev_targets!r}")
+                for target in (layers[k - 1] if ls.to_prev_targets == "both" else layers[k - 1][1:]):
+                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape,
+                                                         src_sheet=ls.e_shape, tgt_sheet=spec.layers[k - 1].e_shape),
+                               exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
         if fields is not None:
             fs = spec.fields
@@ -334,8 +355,10 @@ def _merge(obj, d):
             raise KeyError(f"{type(obj).__name__} has no field '{k}' (fields: {sorted(names)})")
         cur = getattr(obj, k)
         off = cur is None or getattr(cur, "type", None) == "none"
-        if off and k == "to_next_i" and isinstance(v, dict):
-            cur = obj.to_next                   # inhibitory feedforward: start from the layer's to_next settings
+        if off and k in ("to_next_i", "to_prev") and isinstance(v, dict):
+            cur = obj.to_next                   # inhibitory feedforward / backward: start from the to_next settings
+        if off and k == "to_prev_i" and isinstance(v, dict):
+            cur = obj.to_prev if getattr(obj.to_prev, "type", "none") != "none" else obj.to_next
         if off and k == "conn_i" and isinstance(v, dict):
             cur = obj.conn
         if off and k == "internal_i" and isinstance(v, dict):
@@ -370,6 +393,10 @@ def _merge(obj, d):
 # weight_fan_in: scale every weight by 1/sqrt(weight_fan_in) instead of the expected fan-in. 300 = the legacy weight
 # scale (legacy scaled by the requested 300 but realised 45-147 inputs: ~2.3x weaker synapses than "local", with the
 # fixed-size weight noise correspondingly larger relative to the weights).
+# backward_gain: projections from every layer back to the previous one (E sources; I sources too with
+# feedforward_inhibition), with the same connectivity as the forward projection into the previous layer and
+# mean_scale backward_gain (0: none, strictly feedforward). backward_gain = ff_gain makes the stack a symmetric 3D volume
+# (depth = layer index, spread one layer in depth); smaller values bias the volume towards the forward direction.
 # mean_norm "mean_field": each neuron's total mean input does not depend on its fan-in. Not the default: with "sqrt"
 # pooling connections over-drive their targets (a 20 -> 8 input puts an 8x8 layer at ~40 Hz), but the E/I balance of
 # the standard 20/15 layers relies on it (E 20x20 -> I 15x15 pools); "mean_field" weakens I and every layer runs hotter.
@@ -377,7 +404,7 @@ LOCAL_DEFAULTS = {"p_max": 1.0, "sigma_cells": 1.75, "input_sigma_cells": 2.5, "
                   "p_global": 0.0, "feedforward_inhibition": False, "ff_gain": 0.5, "inhibition_sigma_ratio": None,
                   "field_gain": 0.25, "mean_norm": "sqrt",
                   "input_sigma_ref": "coarser", "weight_fan_in": None,
-                  "sigma_ref": "sheet", "inhibition_scale": 3.0}
+                  "sigma_ref": "sheet", "inhibition_scale": 3.0, "backward_gain": 0.0}
 
 
 def spec_from_hparams(hp, input_shape, num_actions, channels=3):
@@ -420,10 +447,14 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         internal_i = None
         if mode == "local" and loc["inhibition_sigma_ratio"] is not None:     # I -> E / I -> I spread: ratio x E's
             internal_i = replace(conn(k), sigma_cells=conn(k).sigma_cells * loc["inhibition_sigma_ratio"])
+        to_prev, to_prev_i = ConnSpec(type="none"), None
+        if mode == "local" and loc["backward_gain"] and k > 0:    # into depth k - 1, like the forward projection there
+            to_prev, to_prev_i = replace(conn(k - 1), mean_scale=loc["backward_gain"]), ff_i
         return LayerSpec(e_shape=(hp["hid_e"],) * 2 + (channels,), i_shape=(hp["hid_i"],) * 2 + (channels,),
                          fan_in_e=hp["fan_in"], fan_in_i=hp["fan_in"], internal=conn(k), internal_i=internal_i,
                          to_next=conn(k + 1, ff=True),
-                         to_next_i=ff_i, to_next_targets=hp.get("feedforward_targets", "both"))
+                         to_next_i=ff_i, to_next_targets=hp.get("feedforward_targets", "both"),
+                         to_prev=to_prev, to_prev_i=to_prev_i)
     spec = NetworkSpec(input_shape=input_shape, num_actions=num_actions, input=input_conn,
                        layers=[base_layer(k) for k in range(hp["ei_layers"])],
                        fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], ff="field", p=0.005),

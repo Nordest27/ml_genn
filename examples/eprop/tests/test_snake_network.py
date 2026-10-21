@@ -163,3 +163,33 @@ def test_layers_list_must_match_explicit_ei_layers():
     assert len(SN.spec_from_hparams(hp, (20, 20, 3), 4).layers) == 5
     hp = {**snake_hparams.DEFAULTS, "network": {"layers": [{}] * 3}}          # ei_layers default: the list sets depth
     assert len(SN.spec_from_hparams(hp, (20, 20, 3), 4).layers) == 3
+
+
+def test_backward_connections_make_a_volume():
+    """to_prev (or local backward_gain) adds layer k -> layer k-1 projections; the default stays feedforward."""
+    def back(b, k):      # (source index in layer k, target index in layer k-1) pairs: 0 = E, 1 = I
+        return {(j, t) for c in b.network.connections for j, p in enumerate(b.layers[k])
+                for t, q in enumerate(b.layers[k - 1]) if c.source() is p and c.target() is q}
+    np.random.seed(0)
+    ff = build(toroidal="local", ei_layers=3)
+    assert not back(ff, 1) and not back(ff, 2)
+    np.random.seed(0)
+    vol = build(toroidal="local", ei_layers=3, local={"backward_gain": 0.25})
+    assert back(vol, 1) == back(vol, 2) == {(0, 0), (0, 1)}          # E sources only (no feedforward inhibition)
+    conn = next(c for c in vol.network.connections if c.source() is vol.layers[1][0] and c.target() is vol.layers[0][0])
+    assert conn.connectivity.weight.mean > 0 and conn.exc_inh_sign == +1
+    np.random.seed(0)
+    one = build(toroidal="local", ei_layers=2, local={"feedforward_inhibition": True},
+                network={"layers": [{}, {"to_prev": {"mean_scale": 0.2}}]})
+    assert back(one, 1) == {(0, 0), (0, 1), (1, 0), (1, 1)}        # to_prev starts from to_next (I sources included)
+    neg = next(c for c in one.network.connections if c.source() is one.layers[1][1] and c.target() is one.layers[0][0])
+    assert neg.connectivity.weight.mean < 0 and neg.exc_inh_sign == -1
+
+
+def test_backward_onto_inhibition_only():
+    np.random.seed(0)
+    b = build(toroidal="local", ei_layers=2, network={"layers": [{}, {"to_prev": {"mean_scale": 0.2},
+                                                                    "to_prev_targets": "i"}]})
+    targets = {t for c in b.network.connections for t, q in enumerate(b.layers[0])
+               if c.source() in b.layers[1] and c.target() is q}
+    assert targets == {1}                                            # only the previous layer's I population

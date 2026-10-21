@@ -212,6 +212,11 @@ class HiddenRuleConfig:
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
                                      # this time (ms) and the homeostat defends that value from then on (off before);
                                      # neuron-local, unlike a target taken from the population
+    homeostat_floor: bool = False    # one-sided homeostat: c_H * mean|delta| * min(0, psibar - psi_target), i.e. it
+                                     # only raises the sensitivity of neurons below psi_target (dying: silent or
+                                     # saturated) and is zero for the rest, so it does not compete with local rewards
+                                     # such as the decorrelation reward over the healthy range (use a low psi_target,
+                                     # e.g. 0.02)
     psi_target_spread: float = 0.0   # heterogeneous homeostat targets: psi_target * exp(spread * z_i), z_i a fixed
                                      # standard-uniform-in-log draw per neuron (from its index, so every synapse
                                      # group targeting the neuron agrees); neurons settle at different sparseness

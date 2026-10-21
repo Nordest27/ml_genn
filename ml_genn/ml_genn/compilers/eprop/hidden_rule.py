@@ -271,6 +271,8 @@ else {
             target = f"({target} * exp({_f(cfg.psi_target_spread)} * zPsi))"
         deviation = (f"(PsiBar - {target})" if cfg.psi_target_warmup is None
                      else "(PsiTargetN > 0.0 ? (PsiBar - PsiTargetN) : 0.0)")
+        if cfg.homeostat_floor:   # one-sided: only neurons below the target are pushed (up)
+            deviation = f"fmin({deviation}, 0.0)"
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
     if use_eprop:
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
