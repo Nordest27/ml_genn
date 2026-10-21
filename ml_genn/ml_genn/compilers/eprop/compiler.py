@@ -201,6 +201,9 @@ class EPropCompiler(Compiler):
         dale_local_rewiring:         Dale rewiring of topographic (ToroidalGaussian2D) connections draws new
                                     synapses around the presynaptic neuron with the connection's own spread
                                     instead of uniformly (keeps the connectivity local; see dale_rewiring)
+        dale_connections:           if given, Dale rewiring applies only to these connections (e.g. every layer's
+                                    I -> E, so the inhibition a neuron receives stays inhibitory); None: every
+                                    connection with an excitatory / inhibitory sign
         inhibitory_reversal:         None (default): current-based synapses. A value E_inh < 0
                                     (rest 0, threshold ~0.61): inhibitory hidden synapses
                                     (exc_inh_sign -1) act through the driving force
@@ -250,6 +253,7 @@ class EPropCompiler(Compiler):
                  value_feedback_ret_e: float = 0.0,
                  inhibitory_reversal: Optional[float] = None,
                  dale_local_rewiring: bool = False,
+                 dale_connections=None,
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
                  population_rules: dict = None,
@@ -299,7 +303,8 @@ class EPropCompiler(Compiler):
         # an inhibitory input channel (ISynInh) when inhibition acts through a reversal potential or a rule needs
         # to know the inhibition its neurons receive (decorrelation reward)
         self.inhibitory_channel = (inhibitory_reversal is not None or
-                                   any(r.local is not None and r.local.decorr != 0 for r in rules))
+                                   any(r.local is not None and (r.local.decorr != 0 or r.local.cancel != 0)
+                                       for r in rules))
         self.inhibition_scaling = {}
         for c, cfg in self.plastic_inhibition.items():
             if cfg.scaling > 0:
@@ -309,6 +314,7 @@ class EPropCompiler(Compiler):
         self.value_feedback_ret_e = value_feedback_ret_e
         self.inhibitory_reversal = inhibitory_reversal
         self.dale_local_rewiring = dale_local_rewiring
+        self.dale_connections = None if dale_connections is None else set(dale_connections)
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
         self.value_reg = value_reg
@@ -448,6 +454,8 @@ class EPropCompiler(Compiler):
             local = self.rule_for(pop).local
             if local is not None and local.decorr != 0:
                 neuron_logic.add_decorr_tracking(model_copy, local.decorr_tau, self.dt)
+            if local is not None and local.cancel != 0:
+                neuron_logic.add_cancel_tracking(model_copy, local.cancel_tau, self.dt)
         if pop in self.inhibition_scaling and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             tau, warmup = self.inhibition_scaling[pop]
             neuron_logic.add_inhibition_tracking(model_copy, tau, warmup, self.dt,
@@ -570,7 +578,7 @@ class EPropCompiler(Compiler):
                     deep_r_record_rewirings_ccus.append(
                         (deep_r_2_ccu, self.deep_r_record_rewirings[c]))
 
-            if dale_sign is not None:
+            if dale_sign is not None and (self.dale_connections is None or c in self.dale_connections):
                 dale_rewiring_required = True
                 geometry = None
                 con = c.connectivity

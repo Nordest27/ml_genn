@@ -88,8 +88,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                    or (route is LocalRoute.GRADIENT_INSTANT and not exact))
     use_eprop = cfg.eprop != 0
     use_local_post = route in (LocalRoute.GRADIENT_INSTANT, LocalRoute.GRADIENT_TRACE)
-    use_dvc = local is not None and local.dv != 0 and local.dv_mode is DVMode.CORRECT
-    use_prevv = local is not None and local.dv != 0
+    use_cancel = local is not None and local.cancel != 0
+    use_dvc = local is not None and ((local.dv != 0 and local.dv_mode is DVMode.CORRECT) or use_cancel)
+    use_prevv = local is not None and (local.dv != 0 or use_cancel)
     vreg_w = (c_reg if local is None or local.vreg is None else local.vreg)
     rate_w = (c_reg if local is None or local.rate is None else local.rate)
     use_rate_local = local is not None and rate_w != 0
@@ -98,6 +99,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         raise ValueError(f"decorr_norm must be 'covariance' or 'correlation', not {local.decorr_norm!r}")
     if use_decorr and not use_local_post:
         raise ValueError("the decorrelation reward needs a GRADIENT_INSTANT or GRADIENT_TRACE local route")
+    if use_cancel and not use_local_post:
+        raise ValueError("the cancellation reward needs a GRADIENT_INSTANT or GRADIENT_TRACE local route")
     use_favg = cfg.fire_rate_gradient or use_rate_local
     use_backprop = cfg.backprop != 0
     send_back = send_back and use_backprop
@@ -211,6 +214,10 @@ else {
             terms.append(f"- {_f(vreg_w)} * (fmax(0.0, V_post - thrL) + fmax(0.0, -V_post - thrL))")
         if rate_w != 0:
             terms.append(f"+ {_f(rate_w)} * (FAvgTrace - fabs(FAvg - FTarget))")
+        if use_cancel:
+            # the membrane change left over from the change of the excitatory drive: small when it is cancelled in time
+            post_refs.update({"DExc_post": "DExc", "DExcMean_post": "DExcMean"})
+            terms.append(f"- {_f(local.cancel)} * DVc / (DExc_post + {_f(local.cancel_eps)} * DExcMean_post + 1e-6)")
         if use_decorr:
             # spiking in step with the received inhibition = redundancy with the cells that drive it
             if local.decorr_norm == "correlation":

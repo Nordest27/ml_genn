@@ -294,6 +294,20 @@ def add_inhibitory_channel(model_copy):
     model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + ISynInh")
 
 
+def add_cancel_tracking(model_copy, tau, dt):
+    """Neuron state for the cancellation reward: DExc, the change of the excitatory drive this step (with the
+    inhibitory channel, Isyn holds the excitatory input only), and DExcMean, its running average (time constant tau)."""
+    model_copy.add_var("PrevExc", "scalar", 0.0)
+    model_copy.add_var("DExc", "scalar", 0.0)
+    model_copy.add_var("DExcMean", "scalar", 0.0)
+    decay = float(np.exp(-dt / tau))
+    model_copy.append_sim_code(f"""
+        DExc = fabs(Isyn - PrevExc);
+        DExcMean = {decay!r} * DExcMean + {1.0 - decay!r} * DExc;
+        PrevExc = Isyn;
+        """)
+
+
 def add_decorr_tracking(model_copy, tau, dt):
     """Neuron state for the decorrelation reward: InhNow, the magnitude of the inhibitory input this step, and
     InhMean, its running average (time constant tau)."""

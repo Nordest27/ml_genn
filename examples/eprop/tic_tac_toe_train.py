@@ -29,22 +29,13 @@ import snake_hparams
 
 import snake_network
 
-# Hyperparameters: TTT_CONFIG=config.json overrides these. Every key of snake_hparams.DEFAULTS is accepted, so the
-# network and rule settings of a Snake config ("toroidal", "local", "network", "ei_layers", "hid_e", "hidden_rule",
-# "dale", "plastic_inhibition", "backend", ...) build the same network here (snake_network.py). The defaults below
-# keep tic-tac-toe's previous network and training settings where they differ from Snake's.
+# Hyperparameters: the defaults are snake_hparams.DEFAULTS, unchanged, so tic-tac-toe uses the same network and rule
+# settings as Snake ("toroidal", "local", "network", "ei_layers", "hid_e", "hidden_rule", "lr", "c_reg", "dale",
+# "plastic_inhibition", "backend", ...), built by snake_network.py. Editing snake_hparams.DEFAULTS changes both.
+# TTT_CONFIG=config.json overrides them, like SNAKE_CONFIG for Snake (a Snake config can be used directly).
+# Only "csv_output" is tic-tac-toe's own key.
 TTT_DEFAULTS = {
     **snake_hparams.DEFAULTS,
-    "hidden_rule": None,         # None: monolithic compiler; else a preset or dict (ml_genn.compilers.eprop)
-    "feedback_type": "random",
-    "optimise_feedback": False,  # learn the feedback weights (adaptive e-prop; modular compiler only)
-    "optimiser": "adam",         # "adam" (beta 0.9/0.999) | "adabelief" (beta 0.99/0.99999)
-    "lr": 1e-5,
-    "c_reg": 1e-2,
-    "f_target": 10.0,
-    "seed": None,
-    "toroidal": "legacy",        # the original sampler (tic-tac-toe's previous network)
-    "explicit_feedback": False,  # tic-tac-toe had no explicit feedback connections to the heads
     "csv_output": "outputs_ttt/weight_dist(1).csv",
 }
 HP = snake_hparams.load(TTT_DEFAULTS, "TTT_CONFIG")
@@ -111,8 +102,7 @@ INPUT_SHAPE = (BOARD_ROWS * OBS_SCALE, BOARD_COLS * OBS_SCALE, 3)  # (12, 12, 3)
 INPUT_SIZE     = int(np.prod(INPUT_SHAPE))
 
 # The hidden network (layers, sizes, connectivity, fields) is built by snake_network.py from HP, as in snake.py:
-# "hid_e" / "hid_i" (default 20 / 15), "ei_layers", "toroidal" (default here: "legacy", the original network),
-# "local" and "network". See snake_hparams.py.
+# "hid_e" / "hid_i", "ei_layers", "toroidal", "local" and "network", with Snake's defaults. See snake_hparams.py.
 CONNECTIVITY_TYPE = "toroidal"   # kept for tic_tac_toe_2agents.py (no longer used by the builder)
 
 # ─── Temporal / learning constants ───────────────────────────────
@@ -182,6 +172,13 @@ def build_compiled_network(connectivity_type=None):
                                                            "population_rules": built.population_rules}
         if HP["dale"] is not None:
             rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
+            which = HP["dale"].get("connections", "all")         # which connections keep their sign
+            if which == "i_to_e":
+                rule_kwargs["dale_connections"] = list(built.inhibitory_to_e)
+            elif which == "inhibitory":
+                rule_kwargs["dale_connections"] = list(built.inhibitory_to_e) + list(built.inhibitory_to_i)
+            elif which != "all":
+                raise ValueError(f"dale.connections must be 'all', 'i_to_e' or 'inhibitory', not {which!r}")
         if HP["inhibitory_reversal"] is not None:
             rule_kwargs["inhibitory_reversal"] = HP["inhibitory_reversal"]
         plastic = plastic_inhibition_connections(built)

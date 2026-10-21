@@ -126,6 +126,14 @@ class LocalObjectives:
                                      # with the cells that drive that inhibition). Neuron-local: its own spikes and
                                      # its own total inhibitory input (GRADIENT_* routes only)
     decorr_tau: float = 1000.0       # ... time constant (ms) of the running means zbar and Ibar_inh
+    cancel: float = 0.0              # weight of the cancellation reward -|dV| / (|dI_exc| + cancel_eps * mean|dI_exc|):
+                                     # the neuron's own membrane change relative to the change of its excitatory
+                                     # drive. Small when inhibition / recurrence cancel input changes in time (a
+                                     # predictive-coding-like balance); scaling the input weights down does not help
+                                     # (dV and dI_exc shrink together), unlike the plain dV reward. Needs the separate
+                                     # inhibitory channel (switched on automatically) and a GRADIENT_* route
+    cancel_tau: float = 1000.0       # ... time constant (ms) of the running mean of |dI_exc|
+    cancel_eps: float = 0.1          # ... floor of the denominator, as a fraction of that mean
     decorr_norm: str = "covariance"  # "covariance": the reward above (its size also shrinks when the neuron fires
                                      # less, so going quiet lowers the penalty); "correlation": divided by the
                                      # neuron's spiking spread sqrt(zbar (1 - zbar)) and its inhibition's s.d.:

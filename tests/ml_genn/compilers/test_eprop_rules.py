@@ -580,6 +580,51 @@ def test_dale_rewiring_restores_signs_and_local_mode_keeps_new_synapses_local(re
         assert far > 0.3                          # uniform rewiring scatters them across the layer
 
 
+def test_dale_connections_restricts_rewiring_to_the_chosen_connections(request):
+    """dale_connections: only the listed connections keep their sign (here the inhibitory one); the excitatory
+    connection, every weight of which violates Dale's law, is left as it is."""
+    np.random.seed(0)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, e, Dense(weight=0.3))
+        Connection(inp, i, Dense(weight=0.3))
+        # every weight violates its sign: excitatory weights negative, inhibitory weights positive
+        e_to_e = Connection(e, e, FixedProbability(0.5, Normal(mean=-0.05, sd=0.001)), exc_inh_sign=+1)
+        i_to_e = Connection(i, e, FixedProbability(0.8, Normal(mean=0.05, sd=0.001)), exc_inh_sign=-1)
+        Connection(e, pol, Dense(weight=0.0))
+        Connection(e, val, Dense(weight=0.0))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(0.0, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="proposed", dale_connections=[i_to_e])
+    compiled = compiler.compile(net, request.node.name)
+    with compiled:
+        compiled.genn_model.custom_update("DaleInit")
+        for _ in range(30):
+            compiled.genn_model.custom_update("DalePrune")
+            compiled.genn_model.custom_update("DaleRewire")
+        g = {}
+        for name, c in (("ee", e_to_e), ("ie", i_to_e)):
+            sg = compiled.connection_populations[c]
+            sg.vars["g"].pull_from_device()
+            g[name] = np.asarray(sg.vars["g"].values)
+    assert np.all(g["ie"] <= 0.0)                     # the chosen inhibitory connection is inhibitory again
+    assert np.all(g["ee"] < 0.0)                      # the excitatory one was not touched: still all negative
+
+
 @pytest.mark.parametrize("SCALING", [0.0, 0.02])
 def test_local_scaling_holds_received_inhibition_near_its_warmup_level(request, SCALING):
     """Covariance plasticity moves the total inhibition (here it shrinks it); local synaptic scaling (synapse weight x
@@ -721,3 +766,64 @@ def test_decorrelation_reward_routes_inhibition_and_changes_learning(request, DE
 
 
 _DECORR_W = {}
+
+
+@pytest.mark.parametrize("CANCEL", [0.0, 0.5])
+def test_cancellation_reward_tracks_excitatory_drive_and_changes_learning(request, CANCEL):
+    """The cancellation local reward -|dV| / (|dI_exc| + eps mean): inhibition goes to its own channel, the neuron
+    tracks the change of its excitatory drive (DExc / DExcMean), and the reward changes how the weights learn."""
+    rule = {"preset": "proposed", "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0,
+                                            "cancel": CANCEL}}
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        alif = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+        e = Population(AdaptiveLeakyIntegrateFire(**alif), N_HID)
+        i = Population(AdaptiveLeakyIntegrateFire(**alif), 6)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        inp_e = Connection(inp, e, Dense(np.full((N_IN, N_HID), 0.06, np.float32)))
+        Connection(inp, i, Dense(weight=0.08))
+        i_to_e = Connection(i, e, FixedProbability(1.0, -0.05), exc_inh_sign=-1)
+        Connection(e, pol, Dense(weight=0.0))
+        Connection(e, val, Dense(weight=0.0))
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for src in (e, i):
+            Connection(src, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=0.0, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False, entropy_coeff=0.0,
+        entropy_coeff_decay=1.0, entropy_coeff_min=0.0, policy_heads={pol: PolicyType.GENERIC},
+        value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule=rule)
+    compiled = compiler.compile(net, request.node.name)
+    sg, npop = compiled.connection_populations[i_to_e], compiled.neuron_populations[e]
+    if CANCEL != 0:
+        assert sg.post_target_var == "ISynInh" and "DExcMean" in npop.vars
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    upd = 0
+    rng = np.random.default_rng(0)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        for step in range(300):
+            if step % 30 == 0:                            # the input changes: something to cancel
+                compiled.set_input({inp: rng.uniform(0.2, 0.9, N_IN).astype(np.float32)})
+            compiled.step_time(cb)
+            compiled.genn_model.custom_update("GradientLearn")
+            for o, cus in compiled.optimisers:
+                for c in cus:
+                    upd += 1; o.set_step(c, upd)
+        if CANCEL != 0:
+            npop.vars["DExcMean"].pull_from_device()
+            assert np.all(npop.vars["DExcMean"].view > 0)              # the neuron senses its drive changing
+        w = compiled.connection_populations[inp_e]
+        w.vars["g"].pull_from_device()
+        _CANCEL_W[CANCEL] = np.asarray(w.vars["g"].values).copy()
+    if CANCEL != 0 and 0.0 in _CANCEL_W:                               # the reward changes what is learned
+        assert np.abs(_CANCEL_W[CANCEL] - _CANCEL_W[0.0]).max() > 1e-6
+        assert np.all(np.isfinite(_CANCEL_W[CANCEL]))
+
+
+_CANCEL_W = {}

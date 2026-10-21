@@ -258,6 +258,9 @@ class NeuronMonitor:
         # Dale's law is not enforced during continuous training: fraction of each sign-constrained group's synapses
         # whose weight has crossed to the other sign (E source: g < 0; I source: g > 0)
         cols += [f"flip|{name}" for name, *_, sign in self.weight_groups if sign is not None]
+        # net sign of each sign-constrained group, sign * sum(g) / sum|g|: 1 = every synapse keeps its population's
+        # sign, 0 = the group's excitation and inhibition cancel, < 0 = the group acts with the opposite sign
+        cols += [f"net|{name}" for name, *_, sign in self.weight_groups if sign is not None]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
 
@@ -307,14 +310,15 @@ class NeuronMonitor:
             self.prev_dead[i] = dead
             self.psi_sum[i][:] = 0
             self.spikes[i][:] = 0
-        flips = []
+        flips, nets = [], []
         for name, sg, w0, n0, sign in self.weight_groups:
             sg.vars["g"].pull_from_device()
             g = np.asarray(sg.vars["g"].values, dtype=np.float64)
             row.append(float(np.linalg.norm(g - w0) / n0))
             if sign is not None:
                 flips.append(float(np.mean(sign * g < 0)))
-        row += flips
+                nets.append(float(sign * g.sum() / (np.abs(g).sum() + 1e-12)))
+        row += flips + nets
         self.samples = 0
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])

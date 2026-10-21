@@ -43,6 +43,11 @@ with the frame and task variables of sample t-1 (same episode only).
    the adaptation), (c) a non-linear map (random features) of the same history. (b) - (a): linear integration over
    time; (c) - (b): the non-linear part of the transformation; what (c) leaves: noise and input-independent dynamics.
 
+7. Anticipation (does the state predict the input?): how much of the input two frames ahead of the processed one
+   (the frame after the one presented just before the sample) each population's state (V, and adaptation A when
+   recorded) recovers BEYOND what the processed frame and the next one already predict. ~0: the population represents
+   the present (and past) only.
+
 Compare windows (first vs last moves: before vs after learning) and runs (rule vs reservoir; with lesions, later).
 """
 import argparse
@@ -377,11 +382,33 @@ def test_linearity(run, n_targets=20):
         print(f"     {lab:16s} {r_cur:11.3f} {r_lin:11.3f} {r_nl:11.3f} {r_nl - r_lin:+15.3f} {1 - max(r_nl, r_lin):11.3f}")
 
 
+def test_anticipation(run, ridge=10.0, cut=0.7):
+    inp, t, ep = run["inp_all"].astype(np.float32) / 255.0, run["t_index"], run["ep_all"]
+    n = len(inp)
+    ok = (t + 1 < n)
+    ok &= ep[np.clip(t + 1, 0, n - 1)] == ep[t]               # the future frame belongs to the same episode
+    idx = np.flatnonzero(ok)
+    k = int(cut * len(idx))
+    z = pcs(inp, int(cut * n))
+    seen = np.hstack([z[t[idx] - 1], z[t[idx]], np.ones((len(idx), 1))])   # processed frame + the one just shown
+    future = z[t[idx] + 1]
+    w = np.linalg.solve(seen[:k].T @ seen[:k] + ridge * np.eye(seen.shape[1]), seen[:k].T @ future[:k])
+    target = future - seen @ w                                  # what the frames seen so far do not predict
+    print("  7. anticipation: R2 of the next frame beyond the frames seen so far (state: V"
+          f"{' + A' if run['adapt'] is not None else ''})")
+    for lab, _, v, _, a in blocks(run):
+        if not (lab.endswith("_E") or "field" in lab):
+            continue
+        state = np.hstack([v, a]) if a is not None else v
+        r = ridge_r2(pcs(state[idx], k), target, ridge=ridge, cut=cut)
+        print(f"     {lab:16s} {max(r, 0.0):.3f}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("paths", nargs="+")
     ap.add_argument("--window", default="both", choices=["first", "last", "both"])
-    ap.add_argument("--tests", default="123456")
+    ap.add_argument("--tests", default="1234567")
     args = ap.parse_args()
     files = []
     for p in args.paths:
@@ -402,6 +429,8 @@ def main():
                 test_representation(run)
             if "6" in args.tests:
                 test_linearity(run)
+            if "7" in args.tests:
+                test_anticipation(run)
 
 
 if __name__ == "__main__":
