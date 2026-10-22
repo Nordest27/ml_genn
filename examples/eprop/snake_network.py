@@ -110,6 +110,18 @@ class FieldSpec:
 
 
 @dataclass
+class RelaySpec:
+    """Reward relay: the value head's decaying reward variable (the reward context, like tonic dopamine) relayed to the
+    first layer by its own set of connections. ON neurons fire with max(r, 0), OFF neurons with max(-r, 0) (rates set
+    from the value head every step by the training script); fixed-probability excitatory connections into the first
+    layer's E and I populations, plastic under the hidden rule like every other synapse."""
+    n: int = 10                      # neurons per channel (ON, OFF)
+    p: float = 0.5                   # connection probability to every first-layer neuron
+    mean_scale: float = 0.1          # weight mean mean_scale / sqrt(fan-in), fan-in = p * 2n
+    sd_scale: float = 0.05
+
+
+@dataclass
 class NetworkSpec:
     input_shape: Shape = (20, 20, 3)
     input: ConnSpec = field(default_factory=lambda: ConnSpec(fan_in=300, sigma=0.1))   # input -> first layer
@@ -121,6 +133,7 @@ class NetworkSpec:
     explicit_feedback: bool = True   # random feedback connections from every hidden population to the heads
     feedback_p: float = 1.0          # ... from the EI layers (from the fields: readout_p)
     node_sigma: float = 1e-2         # membrane-noise s.d. of every hidden neuron (used by node-noise rules only)
+    reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
 
 
 @dataclass
@@ -135,6 +148,7 @@ class Built:
     population_rules: dict    # Population -> rule (only populations with their own rule)
     inhibitory_to_e: list = field(default_factory=list)   # the I -> E connection of every layer
     inhibitory_to_i: list = field(default_factory=list)   # the I -> I connection of every layer
+    reward_relay: Optional[Population] = None              # the relay population (ON then OFF neurons) or None
 
     @property
     def hidden(self):
@@ -268,6 +282,15 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         for target in layers[0]:
             Connection(inp, target, connectivity(spec.input, spec.input_shape, +1, first.fan_in_e, first.sigma,
                                                  tgt_shape=target.shape, tgt_sheet=first.e_shape), exc_inh_sign=+1)
+        # reward relay -> first layer (its own connections; excitatory, plastic like the input)
+        relay = None
+        if spec.reward_relay is not None:
+            rs = spec.reward_relay
+            relay = Population(PoissonInput(), (2 * rs.n,))
+            for target in layers[0]:
+                Connection(relay, target, connectivity(ConnSpec(type="fixed", p=rs.p, mean_scale=rs.mean_scale,
+                                                                sd_scale=rs.sd_scale), (2 * rs.n,), +1),
+                           exc_inh_sign=+1)
         # layer k -> layer k+1
         for k in range(len(layers) - 1):
             ls = spec.layers[k]
@@ -334,7 +357,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                         Connection(pop, head, FixedProbability(spec.feedback_p,
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
-    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i)
+    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -482,6 +505,9 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                     ld[k] = _shape(ld[k], channels)
             layers.append(_merge(replace(base_layer(depth), **short), ld))
         spec = replace(spec, layers=layers)
+    if "reward_relay" in net:
+        rr = net.pop("reward_relay")
+        spec = replace(spec, reward_relay=None if rr is None else _merge(RelaySpec(), rr))
     if "fields" in net:
         fd = net.pop("fields")
         if fd is None:

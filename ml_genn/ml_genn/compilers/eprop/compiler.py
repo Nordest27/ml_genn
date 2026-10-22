@@ -228,6 +228,14 @@ class EPropCompiler(Compiler):
         value_reg:                   Weight of the value head's smoothness
                                     regulariser (0.0 as in the original
                                     implementation).
+        value_afterglow:             {"lr": eta, "max": w_max}: learned weight of
+                                    the remaining reward trace in the value head
+                                    (None: off, as in the original implementation).
+        value_transform:             "sqrt": the value head learns h(V) with a
+                                    compressive transformed TD target and the
+                                    network receives that (compressed) TD error;
+                                    "sqrt_head": the network receives the TD error
+                                    in the original units (None: off).
     """
     def __init__(self, example_timesteps: int, losses, optimiser="adam",
                  tau_reg: float = 500.0, c_reg: float = 0.001,
@@ -259,6 +267,8 @@ class EPropCompiler(Compiler):
                  population_rules: dict = None,
                  plastic_inhibition: dict = None,
                  value_reg: float = 0.0,
+                 value_afterglow: dict = None,
+                 value_transform: str = None,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -318,6 +328,8 @@ class EPropCompiler(Compiler):
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
         self.value_reg = value_reg
+        self.value_afterglow = value_afterglow
+        self.value_transform = value_transform
         self._configure_rl(gamma, td_lambda, self.policy_heads, value_head)
 
     def _configure_rl(self, gamma, td_lambda, policy_heads, value_head):

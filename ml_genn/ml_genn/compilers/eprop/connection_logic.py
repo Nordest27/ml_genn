@@ -25,10 +25,13 @@ def _build_rl_feedback_wum(conn, connect_snippet, compiler, compile_state,
 
     if name.endswith("tde_transport"):
         compile_state.tde_transport_connections.append(conn)
+        # the transported TD error: the value head's E, or its original-unit TD error when only the head's
+        # values are transformed (value_transform "sqrt_head")
+        source = "TdBroadcast" if getattr(compiler, "value_transform", None) == "sqrt_head" else "E"
         return WeightUpdateModel(
             model=get_feedback_model(FeedbackRule.RANDOM_ERROR),
             var_vals={"g": connect_snippet.weight},
-            post_neuron_var_refs={"E_post": "E"})
+            post_neuron_var_refs={"E_post": source})
 
     if name.endswith("policy_reward"):
         compile_state.policy_reward_connections.append(conn)

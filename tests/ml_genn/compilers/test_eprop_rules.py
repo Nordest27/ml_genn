@@ -851,3 +851,73 @@ def test_surprise_drift_modulator():
     assert "AbsTd = " in mixed["post_dynamics_code"]                        # running mean |delta| is tracked
     assert "(1.0 * (fabs(reward) - AbsTd)) * RLNoisePtrace" in only        # outcome sign removed from the drift
     assert "reward * RLNoiseGtrace" in only                                 # the gradient part keeps delta
+
+
+def test_value_afterglow_weight_learns_the_remaining_reward(request):
+    """The learned afterglow weight starts at 0, grows while rewards leave a decaying trace the head does not
+    predict, and stays within [0, max]; without the option the head has no such variable."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name + "_ag", PolicyType.GENERIC,
+                                            hidden_rule="reservoir", value_afterglow={"lr": 0.05, "max": 50.0})
+    seen = {}
+    def probe(c, when):
+        v = c.neuron_populations[val].vars["AgW"]; v.pull_from_device()
+        seen[when] = float(np.asarray(v.view).ravel()[0])
+    _run(compiled, inp, pol, val, steps=40 * K, probe=probe)
+    assert seen["start"] == 0.0 and 0.0 < seen["end"] <= 50.0
+    plain, _, _, _, pval = _compile(EPropCompiler, request.node.name + "_plain", PolicyType.GENERIC,
+                                    hidden_rule="reservoir")
+    assert "AgW" not in plain.neuron_populations[pval].vars
+
+
+def test_value_transform_is_invertible_and_matches_the_generated_code():
+    import math
+    from ml_genn.compilers.eprop.neuron_logic import (value_transform_h, value_transform_h_inv, _h_code,
+                                                      _h_inv_code, VALUE_TRANSFORM_EPS as eps)
+    x = np.array([-500.0, -20.0, -1.0, -0.01, 0.0, 0.3, 2.0, 50.0, 1e4])
+    assert np.allclose(value_transform_h_inv(value_transform_h(x)), x, rtol=1e-6, atol=1e-8)
+    assert abs(value_transform_h(100.0)) < 10.0                       # large values are compressed
+    env = {"copysign": math.copysign, "fabs": abs, "sqrt": math.sqrt}
+    for v in x:
+        assert eval(_h_code(repr(float(v)), eps), env) == pytest.approx(value_transform_h(v), rel=1e-9, abs=1e-12)
+        assert eval(_h_inv_code(repr(float(v)), eps), env) == pytest.approx(value_transform_h_inv(v), rel=1e-9,
+                                                                             abs=1e-12)
+
+
+def test_value_transform_runs_in_the_value_head(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule="proposed", value_transform="sqrt")
+    seen = {}
+    def probe(c, when):
+        e = c.neuron_populations[val].vars["E"]; e.pull_from_device()
+        seen[when] = float(np.asarray(e.view).ravel()[0])
+    hist = _run(compiled, inp, pol, val, steps=20 * K, probe=probe)
+    assert np.isfinite(seen["end"]) and np.all(np.isfinite(hist))
+    with pytest.raises(ValueError):
+        _compile(EPropCompiler, request.node.name + "_bad", PolicyType.GENERIC, hidden_rule="proposed",
+                 value_transform="sqrt", value_afterglow={"lr": 0.1})
+
+
+def test_value_transform_head_only_broadcasts_the_original_units(request):
+    """sqrt_head: the hidden neurons receive r + gamma h^-1(V_h) - h^-1(V_h previous), not the transformed error."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule="proposed", value_transform="sqrt_head")
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    bc, err, tde = [], [], []
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        vpop, hpop = compiled.neuron_populations[val], compiled.neuron_populations[hid]
+        for t in range(20 * K):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(vpop, "reward", 3.0 if (t // K) % 2 == 0 else -3.0)
+            compiled.step_time(cb)
+            compiled.genn_model.custom_update("GradientLearn")
+            for name, out in (("TdBroadcast", bc), ("E", err)):
+                v = vpop.vars[name]; v.pull_from_device(); out.append(float(np.asarray(v.view).ravel()[0]))
+            hpop.vars["TdE"].pull_from_device(); tde.append(float(np.asarray(hpop.vars["TdE"].view).ravel()[0]))
+    bc, err, tde = map(np.array, (bc, err, tde))
+    lag = lambda a, k: (a[k:], tde[:len(tde) - k]) if k == 0 else (a[:-k], tde[k:])
+    best = min(np.max(np.abs(x - y)) for x, y in (lag(bc, 0), lag(bc, 1)))
+    worst_e = min(np.max(np.abs(x - y)) for x, y in (lag(err, 0), lag(err, 1)))
+    assert best < 1e-4 * max(1.0, np.abs(bc).max())                 # the hidden TD error is the broadcast
+    assert worst_e > 1e-3                                           # ... and not the transformed error

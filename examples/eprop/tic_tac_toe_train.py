@@ -351,10 +351,11 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
             total_reward += reward
             reward_trace  = reward_trace * reward_decay + reward
 
-            if reward != 0:
+            if reward != 0:                    # added to the value head's decaying reward (as reward_trace)
+                _vpop = compiled_net.neuron_populations[value]
+                _vpop.vars["reward"].pull_from_device()
                 compiled_net.losses[value].set_var(
-                    compiled_net.neuron_populations[value], "reward", reward
-                )
+                    _vpop, "reward", float(np.asarray(_vpop.vars["reward"].view).ravel()[0]) + reward)
 
             # ── per-step diagnostics (mirrors connect_four_snn.py) ──
             # Fires at the START of every think-phase (agent's OR

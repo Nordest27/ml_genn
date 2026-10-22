@@ -39,7 +39,18 @@ from typing import Optional, Tuple, Union
 import os 
 import csv
 
-HP = snake_hparams.load()
+# Options defined here rather than in snake_hparams.DEFAULTS (a machine's snake_hparams.py keeps its own defaults;
+# values there or in the config file override these):
+# reward_decay_normalise: scale the delivered reward (and entropy reward) by (1 - d) / (1 - d0), d the per-step reward
+#     decay and d0 that of reward_decay_env = 0.1, so one reward delivers the same total to the value head whatever the
+#     decay (a slower decay otherwise also means a larger reward)
+# value_afterglow: {"lr": eta, "max": w_max} or None - learned weight of the remaining reward trace in the value head
+#     (modular compiler; see ml_genn.compilers.eprop.neuron_logic.add_value_head_code)
+# value_transform: None or "sqrt" - compressive value transform in the value head (modular compiler; the logged
+#     values are then in transformed units, h(V))
+SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None,
+                        "value_transform": None}
+HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
     """
@@ -603,6 +614,7 @@ KERNEL_PROFILING = False
 
 
 reward_decay = HP["reward_decay_env"] ** (1/WAIT_INC)
+reward_scale = ((1.0 - reward_decay) / (1.0 - 0.1 ** (1/WAIT_INC))) if HP["reward_decay_normalise"] else 1.0
 gamma = HP["gamma_env"] ** (1/WAIT_INC)
 td_lambda = HP["td_lambda_env"] ** (1/WAIT_INC)
 td_error_trace_discount = 0.001**(1/WAIT_INC)
@@ -646,6 +658,8 @@ def build_compiled_network(connectivity_type="fixed"):
     dale_l1_reg = 0
     print("L1 reg strength:", dale_l1_reg)
     if HP["hidden_rule"] is None:
+        if HP["value_afterglow"] is not None or HP["value_transform"] is not None:
+            raise ValueError("value_afterglow / value_transform need the modular compiler (set hidden_rule)")
         compiler_cls, rule_kwargs = EPropCompiler, {}
     else:
         from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
@@ -653,6 +667,10 @@ def build_compiled_network(connectivity_type="fixed"):
                                                            "optimise_feedback": HP["optimise_feedback"],
                                                            "train_readout": HP["train_readout"],
                                                            "population_rules": built.population_rules}
+        if HP["value_afterglow"] is not None:
+            rule_kwargs["value_afterglow"] = HP["value_afterglow"]
+        if HP["value_transform"] is not None:
+            rule_kwargs["value_transform"] = HP["value_transform"]
         if HP["dale"] is not None:
             rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
             which = HP["dale"].get("connections", "all")         # which connections keep their sign
@@ -728,6 +746,24 @@ def build_compiled_network(connectivity_type="fixed"):
 
 compiled_net, network, input_pop, hidden_layers, policy, value, built = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
+
+RELAY_POP = built.reward_relay
+
+
+def relay_reward_context():
+    """Reward relay (network.reward_relay): the value head's decaying reward variable, read every step, sets the relay
+    population's rates (ON: tanh(max(r, 0) / s), OFF: tanh(max(-r, 0) / s) times the input rate scale, s the size of
+    one delivered reward)."""
+    if RELAY_POP is None:
+        return
+    vpop = compiled_net.neuron_populations[value]
+    vpop.vars["reward"].pull_from_device()
+    r = float(np.asarray(vpop.vars["reward"].view).ravel()[0]) / reward_scale
+    n = RELAY_POP.shape[0] // 2
+    rates = np.empty(2 * n, dtype=np.float32)
+    rates[:n] = INPUT_RATE_SCALE * np.tanh(max(r, 0.0))
+    rates[n:] = INPUT_RATE_SCALE * np.tanh(max(-r, 0.0))
+    compiled_net.set_input({RELAY_POP: rates})
 
 train_callback_list = CallbackList(
     [*set(compiled_net.base_train_callbacks)] + [Checkpoint(serialiser)],
@@ -1476,16 +1512,14 @@ def train_snake_agent_with_ipc(episodes=10000,
                 total_reward += reward
                 gamma_disc_reward += reward
                 reward_trace = reward_trace * reward_decay + reward * 1.0
-                if reward != 0:
-                    compiled_net.losses[value].set_var(
-                        compiled_net.neuron_populations[value], "reward", reward * 1.0 + ent_r
-                )
-                elif ent_r != 0:
-                    # add the entropy reward to the value head's decaying reward trace (not replace it)
+                if reward != 0 or ent_r != 0:
+                    # add to the value head's decaying reward (as reward_trace above): rewards in quick succession
+                    # used to overwrite each other's remaining trace
                     _vpop = compiled_net.neuron_populations[value]
                     _vpop.vars["reward"].pull_from_device()
                     compiled_net.losses[value].set_var(
-                        _vpop, "reward", float(np.asarray(_vpop.vars["reward"].view).ravel()[0]) + ent_r)
+                        _vpop, "reward", float(np.asarray(_vpop.vars["reward"].view).ravel()[0])
+                        + reward_scale * (reward * 1.0 + ent_r))
                 ent_r = 0.0
                 
                 # frame_img = (obs*255).astype(int)
@@ -1511,6 +1545,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 # )
                 # compiled_net.set_input({input_pop: [spikes]})
 
+                relay_reward_context()
                 compiled_net.step_time(train_callback_list)
 
                 if monitor is not None and env.wait_count == env.wait_inc:
@@ -1652,6 +1687,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                 )
 
                 reward_trace = reward_trace * reward_decay
+                relay_reward_context()
                 compiled_net.step_time(train_callback_list)
                 
                 compiled_net.genn_model.custom_update("GradientLearn")

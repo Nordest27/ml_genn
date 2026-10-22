@@ -193,3 +193,14 @@ def test_backward_onto_inhibition_only():
     targets = {t for c in b.network.connections for t, q in enumerate(b.layers[0])
                if c.source() in b.layers[1] and c.target() is q}
     assert targets == {1}                                            # only the previous layer's I population
+
+
+def test_reward_relay_projects_to_the_first_layer_only():
+    np.random.seed(0)
+    assert build(ei_layers=2).reward_relay is None
+    b = build(ei_layers=2, network={"layers": [{}, {}], "reward_relay": {"n": 5, "p": 1.0}})
+    relay = b.reward_relay
+    assert tuple(relay.shape) == (10,)
+    conns = [c for c in b.network.connections if c.source() is relay]
+    assert {c.target() for c in conns} == set(b.layers[0])                 # first layer's E and I only
+    assert all(c.exc_inh_sign == +1 and c.connectivity.weight.mean > 0 for c in conns)

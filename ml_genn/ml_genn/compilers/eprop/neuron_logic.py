@@ -121,14 +121,83 @@ def add_generic_policy_code(model_copy):
     )
 
 
-def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0):
+# Compressive value transform (Pohlen et al. 2018): h(x) = sign(x) (sqrt(|x| + 1) - 1) + eps x and its exact inverse.
+# The head learns V_h ~ h(V) with the transformed TD target h(r + gamma h^-1(V_h)): returns are unchanged (exact for
+# deterministic transitions), large values are compressed, and the broadcast TD error is compressed with them.
+VALUE_TRANSFORM_EPS = 1e-3
+
+
+def value_transform_h(x, eps=VALUE_TRANSFORM_EPS):
+    return np.sign(x) * (np.sqrt(np.abs(x) + 1.0) - 1.0) + eps * x
+
+
+def value_transform_h_inv(y, eps=VALUE_TRANSFORM_EPS):
+    return np.sign(y) * (((np.sqrt(1.0 + 4.0 * eps * (np.abs(y) + 1.0 + eps)) - 1.0) / (2.0 * eps)) ** 2 - 1.0)
+
+
+def _h_code(x, eps):
+    return f"(copysign(sqrt(fabs({x}) + 1.0) - 1.0, {x}) + {eps!r} * ({x}))"
+
+
+def _h_inv_code(y, eps):
+    root = f"((sqrt(1.0 + {4.0 * eps!r} * (fabs({y}) + {1.0 + eps!r})) - 1.0) / {2.0 * eps!r})"
+    return f"copysign({root} * {root} - 1.0, {y})"
+
+
+def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglow=None, transform=None):
     """TD error of the value (critic) head: E = gamma V_t + r_t - V_{t-1}, with the reward decaying by
     reward_decay per step. value_reg > 0 adds a smoothness regulariser value_reg * (V_t - V_{t-1})
-    (ValReg, used by the value readout's update); 0 reproduces the original implementation."""
+    (ValReg, used by the value readout's update); 0 reproduces the original implementation.
+
+    afterglow = {"lr": eta, "max": w_max}: the head's value is V = output + AgW * reward, where the decaying reward
+    variable is the reward still to come from past rewards (its exact value is gamma d / (1 - gamma d) * reward). AgW
+    starts at 0 and is learned by TD on that one feature, clipped to [0, w_max]: while AgW is small the reward trace
+    spreads credit over the following steps, as it approaches the exact value the TD error approaches that of an
+    instantaneous reward (eta sets how fast credit goes from coarse to fine)."""
     model_copy.add_var("ValReg", "scalar", 0.0)
     model_copy.add_var("PrevVal", "scalar", 0.0)
     out = model_copy.output_var_name
     reg = f"ValReg = {value_reg!r} * ({out} - PrevVal);\n" if value_reg != 0 else ""
+    if transform is not None:
+        # "sqrt": the TD error is in transformed units everywhere (the broadcast is compressed too);
+        # "sqrt_head": the readout learns from the transformed error, the network receives the TD error in the
+        # original units, r + gamma h^-1(V_h) - h^-1(V_h previous) (TdBroadcast, read by the TD-error transport)
+        if transform not in ("sqrt", "sqrt_head"):
+            raise ValueError(f"value transform must be None, 'sqrt' or 'sqrt_head', not {transform!r}")
+        if afterglow:
+            raise ValueError("value_afterglow and value_transform cannot be combined")
+        eps = VALUE_TRANSFORM_EPS
+        target = _h_code(f"(reward + {gamma} * {_h_inv_code(out, eps)})", eps)
+        broadcast = ""
+        if transform == "sqrt_head":
+            model_copy.add_var("TdBroadcast", "scalar", 0.0)
+            broadcast = (f"TdBroadcast = reward + {gamma} * {_h_inv_code(out, eps)} - "
+                         f"{_h_inv_code('PrevVal', eps)};\n")
+        model_copy.append_sim_code(
+            f"""
+            E = {target} - PrevVal; // TD error in transformed units
+            {broadcast}{reg}PrevVal = {out};
+            reward *= {reward_decay};
+            tdError = 0;
+            """
+        )
+        return
+    if afterglow:
+        model_copy.add_var("AgW", "scalar", 0.0)
+        model_copy.add_var("PrevRew", "scalar", 0.0)
+        lr, w_max = float(afterglow.get("lr", 1e-4)), float(afterglow.get("max", 1e6))
+        model_copy.append_sim_code(
+            f"""
+            const scalar valNow = {out} + AgW * reward;
+            E = valNow * {gamma} + reward - PrevVal; // TD error
+            {reg.replace(out, "valNow")}PrevVal = valNow;
+            AgW = fmin(fmax(AgW + {lr!r} * E * PrevRew, 0.0), {w_max!r});
+            PrevRew = reward;
+            reward *= {reward_decay};
+            tdError = 0;
+            """
+        )
+        return
     model_copy.append_sim_code(
         f"""
         E = {out} * {gamma} + reward - PrevVal; // TD error
@@ -161,7 +230,8 @@ def add_rl_output_head_code(model_copy, pop, compiler):
                entropy_coeff_decay=compiler.entropy_coeff_decay,
                entropy_coeff_min=compiler.entropy_coeff_min)
     else:
-        add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay, compiler.value_reg)
+        add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay, compiler.value_reg,
+                            getattr(compiler, "value_afterglow", None), getattr(compiler, "value_transform", None))
 
 
 def add_supervised_error_code(model_copy):
