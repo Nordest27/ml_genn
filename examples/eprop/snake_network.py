@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 import numpy as np
 
 from ml_genn import Connection, Network, Population
-from ml_genn.connectivity import Dense, FixedProbability, ToroidalGaussian2D
+from ml_genn.connectivity import Dense, FixedProbability, LocalPermutation, ToroidalGaussian2D
 from ml_genn.initializers import Normal
 from ml_genn.neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrate, PoissonInput
 
@@ -29,7 +29,12 @@ Shape = Tuple[int, int, int]
 @dataclass
 class ConnSpec:
     """How one population connects to another (sign given by the source: E +1, I -1, readout None)."""
-    type: str = "toroidal"           # "toroidal" | "fixed" | "none" (no connection; e.g. to_next_i, conn_i)
+    type: str = "toroidal"           # "toroidal" | "fixed" | "permutation" | "none" (no connection; e.g. to_next_i)
+    centre_shift: int = 0            # p_max kernels: every target's Gaussian is centred on a cell up to this many
+                                     # cells away (a local permutation of the centres; 0: centred on itself)
+    perm_radius: int = 1             # permutation: one-to-one, every cell moved at most this many cells per axis
+                                     # (a random local permutation, ml_genn LocalPermutation); between grids of
+                                     # different shape (e.g. into an I population) the toroidal settings are used
     fan_in: Optional[float] = None   # toroidal: requested fan-in (None: the layer's default)
     sigma: Optional[float] = None    # toroidal: Gaussian width in units of the grid (None: the layer's sigma)
     p: float = 0.01                  # fixed: connection probability
@@ -68,6 +73,18 @@ class NeuronSpec:
 
 
 @dataclass
+class SlowSpec:
+    """A slow excitatory sub-population of a layer (a filter bank: fast and slow neurons side by side). It sits on the
+    layer's E sheet, receives what the layer's E population receives (the input or the previous layer's projection),
+    is recurrently connected with the layer's E, I and itself (the layer's internal spec), and projects forward like E
+    (to the next layer, or to the fields). Its own neuron settings, typically a longer tau_mem."""
+    shape: Optional[Shape] = None    # None: the layer's E shape
+    neuron: NeuronSpec = field(default_factory=lambda: NeuronSpec(tau_mem=40.0))
+    in_gain: float = 1.0             # factor on the excitatory weights into it from outside the layer (a slow neuron
+                                     # integrates more, so it needs its own calibration)
+
+
+@dataclass
 class LayerSpec:
     e_shape: Shape = (20, 20, 3)
     i_shape: Shape = (15, 15, 3)
@@ -97,6 +114,7 @@ class LayerSpec:
     to_prev_targets: str = "both"                              # "both": onto the previous layer's E and I; "i": onto
                                                                # its I population only (top-down signals then regulate
                                                                # the previous layer through its inhibition, never drive it)
+    slow: Optional[SlowSpec] = None                            # a slow excitatory sub-population (None: none)
 
 
 @dataclass
@@ -148,12 +166,23 @@ class Built:
     population_rules: dict    # Population -> rule (only populations with their own rule)
     inhibitory_to_e: list = field(default_factory=list)   # the I -> E connection of every layer
     inhibitory_to_i: list = field(default_factory=list)   # the I -> I connection of every layer
+    slow: list = field(default_factory=list)              # per layer: its slow sub-population, or None
+    inhibitory_to_slow: list = field(default_factory=list)   # I -> slow connections (I onto excitatory, like I -> E)
     reward_relay: Optional[Population] = None              # the relay population (ON then OFF neurons) or None
 
     @property
     def hidden(self):
-        pops = [p for layer in self.layers for p in layer]
+        pops = []
+        for k, layer in enumerate(self.layers):
+            pops += list(layer)
+            if k < len(self.slow) and self.slow[k] is not None:
+                pops.append(self.slow[k])
         return pops + list(self.fields or ())
+
+    def layer_pops(self, k):
+        """Every population of layer k: E, I and the slow sub-population if any."""
+        s = self.slow[k] if k < len(self.slow) else None
+        return list(self.layers[k]) + ([s] if s is not None else [])
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -182,9 +211,14 @@ def legacy_fan_in(src_shape, tgt_shape, sigma, fan_in, same):
 
 
 def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_shape=None, same=False,
-                 src_sheet=None, tgt_sheet=None):
+                 src_sheet=None, tgt_sheet=None, centre_offsets=None):
     """The connectivity object of one connection (same weight scaling as snake.py's make_connectivity)."""
     mean_scale, sd_scale = conn.mean_scale, conn.sd_scale
+    if conn.type == "permutation":
+        if tgt_shape is not None and tuple(src_shape) == tuple(tgt_shape):
+            m = mean_scale * (conn.inh_scale if sign == -1 else 1.0)    # fan-in 1: no 1 / sqrt(fan_in)
+            return LocalPermutation(conn.perm_radius, Normal(mean=(sign or 0) * m, sd=sd_scale))
+        conn = replace(conn, type="toroidal")                          # different grids: the toroidal fallback
     if conn.type == "fixed":
         fan = conn.p * np.prod(src_shape)
         if sign is None:
@@ -211,7 +245,8 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
             sheet_sigma = sigma_cells * max(1.0, src_sheet[0] / tgt_sheet[0])
             sigma_cells, sigma_ref = sheet_sigma * src_shape[0] / src_sheet[0], "source"
         kw = dict(sigma=sig, fan_in=0, p_max=conn.p_max, sigma_cells=sigma_cells, sigma_ref=sigma_ref,
-                  p_global=conn.p_global, p_surround=conn.p_surround, surround_ratio=conn.surround_ratio)
+                  p_global=conn.p_global, p_surround=conn.p_surround, surround_ratio=conn.surround_ratio,
+                  centre_shift=conn.centre_shift, centre_offsets=centre_offsets)
         probe = ToroidalGaussian2D(weight=0.0, **kw)
         w_fan = conn.weight_fan_in
         if w_fan is None:
@@ -239,12 +274,23 @@ def _alif(neuron: NeuronSpec, node_sigma):
                                       tau_adapt=neuron.tau_adapt, beta=neuron.beta, perturbation_eps_std=node_sigma)
 
 
+def _gain(conn: ConnSpec, g: float) -> ConnSpec:
+    return conn if g == 1.0 else replace(conn, mean_scale=conn.mean_scale * g, sd_scale=conn.sd_scale * g)
+
+
 def build_network(spec: NetworkSpec, default_params) -> Built:
     network = Network(default_params)
-    labels, rules, i_to_e, i_to_i = {}, {}, [], []
+    labels, rules, i_to_e, i_to_i, i_to_s = {}, {}, [], [], []
+    slows = []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
         layers = []
+
+        def into(target, conn, k, sign):
+            """A projection's spec into a population of layer k: the slow sub-population's external excitatory
+            inputs carry its in_gain."""
+            s = slows[k] if k < len(slows) else None
+            return _gain(conn, spec.layers[k].slow.in_gain) if (s is not None and target is s and sign > 0) else conn
         for k, ls in enumerate(spec.layers):
             e = Population(_alif(ls.neuron, spec.node_sigma), ls.e_shape)
             i = Population(_alif(ls.neuron, spec.node_sigma), ls.i_shape)
@@ -263,7 +309,29 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
+            s = None
+            if ls.slow is not None:                  # slow sub-population: recurrent with E, I and itself
+                s_shape = ls.slow.shape or ls.e_shape
+                s = Population(_alif(ls.slow.neuron, spec.node_sigma), s_shape)
+                for pre, post, src_shape, fan, sign in ((e, s, ls.e_shape, ls.fan_in_e, +1), (s, e, s_shape, ls.fan_in_e, +1),
+                                                        (s, s, s_shape, ls.fan_in_e, +1), (s, i, s_shape, ls.fan_in_e, +1),
+                                                        (i, s, ls.i_shape, ls.fan_in_i, -1)):
+                    spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
+                    if spec_c.type == "none":
+                        continue
+                    c = Connection(pre, post, connectivity(spec_c, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
+                                                           same=pre is post, src_sheet=ls.e_shape,
+                                                           tgt_sheet=ls.e_shape), exc_inh_sign=sign)
+                    if pre is i:
+                        i_to_s.append(c)
+                labels[s] = f"L{k + 1}_S"
+                if ls.rule is not None:
+                    rules[s] = ls.rule
+            slows.append(s)
             layers.append((e, i))
+        lpops = lambda k: list(layers[k]) + ([slows[k]] if slows[k] is not None else [])
+        src_pops = lambda k: [(layers[k][0], spec.layers[k].e_shape, spec.layers[k].fan_in_e, +1)] + (
+            [(slows[k], slows[k].shape, spec.layers[k].fan_in_e, +1)] if slows[k] is not None else [])
 
         fields = None
         if spec.fields is not None:
@@ -279,9 +347,10 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
 
         # input -> first layer (excitatory)
         first = spec.layers[0]
-        for target in layers[0]:
-            Connection(inp, target, connectivity(spec.input, spec.input_shape, +1, first.fan_in_e, first.sigma,
-                                                 tgt_shape=target.shape, tgt_sheet=first.e_shape), exc_inh_sign=+1)
+        for target in lpops(0):
+            Connection(inp, target, connectivity(into(target, spec.input, 0, +1), spec.input_shape, +1, first.fan_in_e,
+                                                 first.sigma, tgt_shape=target.shape, tgt_sheet=first.e_shape),
+                       exc_inh_sign=+1)
         # reward relay -> first layer (its own connections; excitatory, plastic like the input)
         relay = None
         if spec.reward_relay is not None:
@@ -291,18 +360,28 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 Connection(relay, target, connectivity(ConnSpec(type="fixed", p=rs.p, mean_scale=rs.mean_scale,
                                                                 sd_scale=rs.sd_scale), (2 * rs.n,), +1),
                            exc_inh_sign=+1)
-        # layer k -> layer k+1
+        # layer k -> layer k+1 (centre_shift: one displacement field per step, on the target layer's sheet, shared by
+        # all its populations so that neighbouring E, I and slow neurons are displaced together)
+        from ml_genn.connectivity.local_permutation import local_shift_field
         for k in range(len(layers) - 1):
             ls = spec.layers[k]
-            for src, src_shape, fan, sign, conn in ((layers[k][0], ls.e_shape, ls.fan_in_e, +1, ls.to_next),
-                                                    (layers[k][1], ls.i_shape, ls.fan_in_i, -1, ls.to_next_i or ls.to_next)):
+            shift = max(ls.to_next.centre_shift, (ls.to_next_i or ls.to_next).centre_shift)
+            sheet = spec.layers[k + 1].e_shape
+            offsets = local_shift_field(sheet[0], sheet[1], shift, np.random) if shift > 0 else None
+            sources = [(p, sh, f, sg, ls.to_next) for p, sh, f, sg in src_pops(k)] + [
+                (layers[k][1], ls.i_shape, ls.fan_in_i, -1, ls.to_next_i or ls.to_next)]
+            for src, src_shape, fan, sign, conn in sources:
                 if conn.type == "none":
                     continue
                 if ls.to_next_targets not in ("both", "e"):
                     raise ValueError(f"to_next_targets must be 'both' or 'e', not {ls.to_next_targets!r}")
-                for target in (layers[k + 1] if ls.to_next_targets == "both" else layers[k + 1][:1]):
-                    Connection(src, target, connectivity(conn, src_shape, sign, fan, ls.sigma, tgt_shape=target.shape,
-                                                         src_sheet=ls.e_shape, tgt_sheet=spec.layers[k + 1].e_shape),
+                targets = lpops(k + 1) if ls.to_next_targets == "both" else [t for t in lpops(k + 1)
+                                                                              if t is not layers[k + 1][1]]
+                for target in targets:
+                    Connection(src, target, connectivity(into(target, conn, k + 1, sign), src_shape, sign, fan, ls.sigma,
+                                                         tgt_shape=target.shape, src_sheet=ls.e_shape,
+                                                         tgt_sheet=spec.layers[k + 1].e_shape,
+                                                         centre_offsets=offsets),
                                exc_inh_sign=sign)
         # layer k -> layer k-1 (backward: with to_next a 3D volume with local connections in both depth directions)
         for k in range(1, len(layers)):
@@ -321,9 +400,9 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         if fields is not None:
             fs = spec.fields
             for fld in fields:                                   # last layer -> fields
-                for src, src_shape, fan, sign, conn in ((last[0], last_spec.e_shape, last_spec.fan_in_e, +1, fs.conn),
-                                                        (last[1], last_spec.i_shape, last_spec.fan_in_i, -1,
-                                                         fs.conn_i or fs.conn)):
+                for src, src_shape, fan, sign, conn in ([(p, sh, f, sg, fs.conn) for p, sh, f, sg in src_pops(len(layers) - 1)]
+                                                        + [(last[1], last_spec.i_shape, last_spec.fan_in_i, -1,
+                                                            fs.conn_i or fs.conn)]):
                     if conn.type == "none":
                         continue
                     Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape,
@@ -336,28 +415,29 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                     Connection(fld, head, FixedProbability(fs.readout_p, Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                feedback_name=name, exc_inh_sign=None)
         else:                                                    # heads read the last layer directly
-            for src, src_shape in ((last[0], last_spec.e_shape), (last[1], last_spec.i_shape)):
+            for src, src_shape in [(p, sh) for p, sh, _, _ in src_pops(len(layers) - 1)] + [(last[1], last_spec.i_shape)]:
                 for head in (policy, value):
                     Connection(src, head, connectivity(ConnSpec(type="fixed", p=spec.direct_readout_p), src_shape, None),
                                exc_inh_sign=None)
 
         # TD-error transport into the value head: from the policy head and every hidden population
         Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
-        for e, i in layers:
-            for pop in (e, i):
+        for k in range(len(layers)):
+            for pop in lpops(k):
                 Connection(pop, value, Dense(weight=1.0), feedback_name="tde_transport")
         for fld in (fields or ()):
             Connection(fld, value, Dense(weight=1.0), feedback_name="tde_transport")
 
         # explicit random feedback from the EI layers
         if spec.explicit_feedback:
-            for e, i in layers:
-                for pop in (e, i):
+            for k in range(len(layers)):
+                for pop in lpops(k):
                     for head, name in ((policy, "policy_feedback"), (value, "value_feedback")):
                         Connection(pop, head, FixedProbability(spec.feedback_p,
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
-    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay)
+    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay,
+                 slow=slows, inhibitory_to_slow=i_to_s)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -386,6 +466,8 @@ def _merge(obj, d):
             cur = obj.conn
         if off and k == "internal_i" and isinstance(v, dict):
             cur = obj.internal
+        if cur is None and k == "slow" and isinstance(v, dict):
+            cur = SlowSpec()
         kw[k] = _merge(cur, v) if hasattr(cur, "__dataclass_fields__") and isinstance(v, dict) else v
     return replace(obj, **kw)
 
@@ -503,6 +585,8 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             for k in ("e_shape", "i_shape"):
                 if k in ld:
                     ld[k] = _shape(ld[k], channels)
+            if isinstance(ld.get("slow"), dict) and ld["slow"].get("shape") is not None:
+                ld["slow"] = {**ld["slow"], "shape": _shape(ld["slow"]["shape"], channels)}
             layers.append(_merge(replace(base_layer(depth), **short), ld))
         spec = replace(spec, layers=layers)
     if "reward_relay" in net:

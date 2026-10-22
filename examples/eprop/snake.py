@@ -674,10 +674,11 @@ def build_compiled_network(connectivity_type="fixed"):
         if HP["dale"] is not None:
             rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
             which = HP["dale"].get("connections", "all")         # which connections keep their sign
-            if which == "i_to_e":
-                rule_kwargs["dale_connections"] = list(built.inhibitory_to_e)
+            if which == "i_to_e":                                 # I onto excitatory (E and slow sub-populations)
+                rule_kwargs["dale_connections"] = list(built.inhibitory_to_e) + list(built.inhibitory_to_slow)
             elif which == "inhibitory":
-                rule_kwargs["dale_connections"] = list(built.inhibitory_to_e) + list(built.inhibitory_to_i)
+                rule_kwargs["dale_connections"] = (list(built.inhibitory_to_e) + list(built.inhibitory_to_slow)
+                                                   + list(built.inhibitory_to_i))
             elif which != "all":
                 raise ValueError(f"dale.connections must be 'all', 'i_to_e' or 'inhibitory', not {which!r}")
         if HP["inhibitory_reversal"] is not None:

@@ -37,6 +37,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 STEPS_PER_MOVE = 30
+EARLY_STEP = 10              # responsiveness: the state this many steps into a frame
 INPUT_RATE_SCALE = 0.7
 
 
@@ -137,9 +138,12 @@ class Sim:
         if perturb is not None:
             ppop = self.net.neuron_populations[perturb[0]]
         model = self.net.genn_model
+        # per population: spike counts in the first EARLY_STEP steps of every frame (responsiveness)
+        self.early_counts = [np.zeros_like(c) for c in counts]
         for f, r in enumerate(rates):
             self.net.set_input({self.b.input: r.reshape(self.b.input.shape)})
-            for _ in range(STEPS_PER_MOVE):
+            t_start = float(self.net.genn_model.t)
+            for step in range(STEPS_PER_MOVE):
                 if ppop is not None:                     # optional perturbation measure: per-step host access
                     ppop.vars["V"].pull_from_device()
                     ppop.vars["V"].view[:] += (perturb[1] * perturb[2][f]).reshape(ppop.vars["V"].view.shape)
@@ -148,8 +152,11 @@ class Sim:
             # the recording buffer holds exactly one decision (STEPS_PER_MOVE steps): one transfer per frame
             model.pull_recording_buffers_from_device()
             for i, npop in enumerate(npops):
-                _, ids = npop.spike_recording_data[0]
-                counts[i][f] = np.bincount(np.asarray(ids, dtype=np.int64), minlength=counts[i].shape[1])
+                times, ids = npop.spike_recording_data[0]
+                ids = np.asarray(ids, dtype=np.int64)
+                counts[i][f] = np.bincount(ids, minlength=counts[i].shape[1])
+                early_ids = ids[np.asarray(times) < t_start + EARLY_STEP * float(self.net.genn_model.dt) - 1e-6]
+                self.early_counts[i][f] = np.bincount(early_ids, minlength=counts[i].shape[1])
                 npop.vars["RefracTime"].pull_from_device() if record else None
             if record:
                 row, psi_row, a_row = [], [], []
@@ -169,10 +176,12 @@ class Sim:
     def hz(self, counts):
         return [1000.0 * c.mean() / STEPS_PER_MOVE for c in counts]
 
-    def scale_into(self, targets, factor, key=None):
-        """Multiply the excitatory feed-forward weights into the target populations by factor."""
+    def scale_into(self, targets, factor, key=None, internal=None):
+        """Multiply the excitatory feed-forward weights into the target populations by factor (connections from the
+        `internal` populations, default the targets themselves, are not feed-forward and stay)."""
+        internal = set(targets) if internal is None else set(internal)
         for c, sg in self.net.connection_populations.items():
-            if c.target() in targets and c.source() not in targets and getattr(c, "exc_inh_sign", None) == 1 \
+            if c.target() in targets and c.source() not in internal and getattr(c, "exc_inh_sign", None) == 1 \
                     and not c.is_feedback:
                 sg.vars["g"].pull_from_device()
                 sg.vars["g"].values = sg.vars["g"].values * factor
@@ -183,17 +192,27 @@ class Sim:
 
 def calibrate(sim, rates, target_hz, moves=120, rounds=5, log=print):
     """Layer by layer (then the fields): rescale the excitatory input until the layer's E rate is near target."""
-    groups = [list(l) for l in sim.b.layers] + ([list(sim.b.fields)] if sim.b.fields else [])
-    for k, group in enumerate(groups):
-        idx = sim.pops.index(group[0])
+    # (measured population, scaled targets, populations whose connections count as internal, factor key): a layer's
+    # projection also reaches its slow sub-population, which is then calibrated on its own (key ("S", k))
+    groups = []
+    slow = getattr(sim.b, "slow", None) or [None] * len(sim.b.layers)
+    for k, layer in enumerate(sim.b.layers):
+        whole = list(layer) + ([slow[k]] if slow[k] is not None else [])
+        groups.append((layer[0], whole, whole, k + 1))
+        if slow[k] is not None:
+            groups.append((slow[k], [slow[k]], whole, ("S", k + 1)))
+    if sim.b.fields:
+        groups.append((sim.b.fields[0], list(sim.b.fields), list(sim.b.fields), "fields"))
+    for g, (measured, targets, internal, key) in enumerate(groups):
+        idx = sim.pops.index(measured)
         for r in range(rounds):
-            start = (k * rounds + r) * moves % max(1, len(rates) - moves)
+            start = (g * rounds + r) * moves % max(1, len(rates) - moves)
             counts, _ = sim.run(rates[start:start + moves])
             hz = sim.hz(counts)[idx]
             if abs(np.log(max(hz, 1e-3) / target_hz)) < 0.15:
                 break
             factor = float(np.clip((target_hz / max(hz, 0.5)) ** 0.5, 0.5, 3.0))
-            sim.scale_into(set(group), factor, key=("fields" if k == len(sim.b.layers) else k + 1))
+            sim.scale_into(set(targets), factor, key=key, internal=internal)
             log(f"    calibrate {sim.labels[idx]}: {hz:6.1f} Hz -> x{factor:.2f}")
 
 
@@ -320,23 +339,30 @@ def evaluate(sim, rates, ys):
     adapt = [np.array([row[i] for row in sim.adapt]) for i in range(len(sim.pops))]   # adaptation A, same layout
     prev_e = None
     out, off = [], 0
-    for lab, n, c, ps in zip(sim.labels, sizes, counts, psi):
+    zs = lambda a: (a - a.mean(0)) / (a.std(0) + 1e-6)     # per-feature scale, so no group dominates the PCs
+    for k, (lab, n, c, ps) in enumerate(zip(sim.labels, sizes, counts, psi)):
         v = states[:, off:off + n]; off += 2 * n
-        x = states[:, off - 2 * n:off]
+        # what a readout of the population can use: V, refractory flags, adaptation A and the frame's spike counts
+        # (with a long tau_mem a firing neuron's V is a reset phase and its history is in the spikes, not in V)
+        x = np.hstack([zs(states[:, off - 2 * n:off]), zs(adapt[k]), zs(c)])
         out.append({"pop": lab, "n": n, "hz": 1000.0 * c.mean() / STEPS_PER_MOVE,
                     "dim": participation_ratio(v), "dim_counts": participation_ratio(c),
                     "decode": decode[lab], "active": float(np.mean(c.sum(0) > 0)),
                     "input_r2": ridge_r2(x, rates, ridge=10.0),
+                    # responsiveness: the current frame from the spike counts of the frame's first EARLY_STEP steps,
+                    # and (reference) from the whole frame's counts
+                    "input_r2_early": ridge_r2(zs(sim.early_counts[k]), rates, ridge=10.0),
+                    "input_r2_counts": ridge_r2(zs(c), rates, ridge=10.0),
                     # learnability for the rule: mean psi, and the fraction of neurons almost never near threshold
                     "psi": float(ps.mean()), "psi_dead": float(np.mean(ps.mean(0) < 0.01)),
                     # mixing: receptive-field spread in input cells, and (E of layers >= 2, fields) how much of the layer's
                     # spike counts a linear map from the previous layer's E counts explains (1 = a relay)
                     "rf_spread": rf_spread(c, rates, tuple(sim.pops[sim.labels.index(lab)].shape)),
                     "pred_from_prev": (ridge_r2(prev_e, c, ridge=10.0) if prev_e is not None
-                                       and (lab.endswith("_E") or "field" in lab) else float("nan")),
+                                       and (lab.endswith("_E") or lab.endswith("_S") or "field" in lab) else float("nan")),
                     # memory: the input 1, 2, 3 frames ago recovered beyond what the current frame predicts
-                    "memory": (memory_r2(np.hstack([v, adapt[len(out)]]), rates)
-                               if lab.endswith("_E") or "field" in lab else None)})
+                    "memory": (memory_r2(np.hstack([zs(v), zs(adapt[k]), zs(c)]), rates)
+                               if lab.endswith("_E") or lab.endswith("_S") or "field" in lab else None)})
         if lab.endswith("_E"):
             prev_e = c
     return out
@@ -407,6 +433,12 @@ def snake_config(hp_over, factors, layers, size):
             if ls.to_next_i is None:
                 lay[k - 2]["to_next_i"] = {**own, "mean_scale": src.mean_scale, "sd_scale": src.sd_scale}
             lay[k - 2]["to_next"] = {**own, "mean_scale": src.mean_scale * f, "sd_scale": src.sd_scale * f}
+    for k in range(1, layers + 1):                 # slow sub-populations: their own calibration in in_gain
+        f = factors.get(("S", k), 1.0)
+        if f != 1.0 and spec.layers[k - 1].slow is not None:
+            sl = dict(lay[k - 1].get("slow", {}))
+            sl["in_gain"] = spec.layers[k - 1].slow.in_gain * f
+            lay[k - 1]["slow"] = sl
     net["layers"] = lay
     if factors.get("fields", 1.0) != 1.0 and spec.fields is not None:
         f = factors["fields"]

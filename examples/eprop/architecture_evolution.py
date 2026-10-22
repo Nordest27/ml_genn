@@ -15,7 +15,7 @@ Score (higher is better, at most 1; every metric is stored, so --report re-ranks
 - l1: layer 1 in absolute terms, (input reconstruction + min(dimensionality / DIM_REF, 1)) / 2;
 - fields: how much of layer 1 the fields keep, (min(input_r2 / L1's, 1) + min(dim / L1's, 1)) / 2, capped at 1 so a
   weak layer 1 cannot inflate it. The layers in between only matter through what reaches the fields;
-- memory: how much of the input 1-3 frames ago the fields' state (V and adaptation A) recovers beyond what the current frame predicts
+- memory: how much of the input 1-3 frames ago the fields' state (V, adaptation A and the frame's spike counts) recovers beyond what the current frame predicts
   (reservoir_search.memory_r2), mean over the lags, / MEM_FULL, capped at 1;
 - reported, not scored: kept per layer, and mixing (per stage, min((1 - R2) / MIX_FULL, 1), R2 = how much of its
   spike counts a linear map from the previous layer's E counts explains; a relay that copies has R2 ~ 1). Copies are
@@ -80,7 +80,30 @@ SPACE = {
     "inh_sigma_ratio": ("log", 0.5, 3.0),           # recurrent I -> E / I -> I spread relative to sigma_cells
     "ff_surround_p": ("log", 0.005, 0.3),           # --ff-kernel surround: peak probability of the wide surround
     "ff_surround_ratio": ("log", 2.0, 8.0),         # ... its spread relative to the feed-forward centre (ff_sigma)
+    # --time-constants on: network-wide neuron time constants (the e-prop compiler needs one tau_mem and one tau_adapt
+    # for every hidden neuron, so they are not per layer); defaults 10 ms, 300 ms, 0.0174
+    "tau_mem": ("log", 10.0, 80.0),                 # membrane (ms); a frame lasts 30 ms
+    "tau_adapt": ("log", 100.0, 3000.0),            # threshold adaptation (ms)
+    "beta": ("log", 0.005, 0.1),                    # adaptation strength
 }
+TIME_GENES = ("tau_mem", "tau_adapt", "beta")
+PERM_GENE = ("int", 0, 3, 1.0)          # ff_perm_radius (optional): layer-to-layer relays as local permutations
+# --time-constants per_layer: one tau_mem gene per layer and one for the fields (tau_adapt, beta stay network-wide);
+# the compiler gives every connection its target population's decays, so the populations may differ
+LAYER_TAU = ("log", 3.0, 80.0)
+
+
+def layer_tau_keys(layers):
+    return [f"tau_mem_L{k}" for k in range(1, layers + 1)] + ["tau_mem_fields"]
+
+
+def is_layer_tau(k):
+    """Per-population membrane time constant genes: tau_mem_L{k}, tau_mem_fields, and slow_tau_L{k} (layer k has a
+    slow excitatory sub-population with this tau_mem; the gene's presence adds the population)."""
+    return k.startswith("tau_mem_L") or k == "tau_mem_fields" or k.startswith("slow_tau_L")
+TIME_DEFAULTS = {"tau_mem": 10.0, "tau_adapt": 300.0, "beta": 0.0174}
+OPTIONAL_GENES = ("global_fan_in", "ff_surround_p", "ff_surround_ratio") + TIME_GENES + ("ff_perm_radius",
+                                                                                      "ff_centre_shift")
 SURROUND_GENES = ("ff_surround_p", "ff_surround_ratio")
 RELAY_FF = ("log", 0.3, 0.6)            # --prior relay: the layer-to-layer projection stays a near copy
 SURROUND_CENTRE = ("log", 0.3, 0.8)     # with a surround the feed-forward centre stays narrow (a relay): the surround
@@ -102,8 +125,14 @@ def sample_gene(rng, spec):
 GENE_DEFAULTS = {"ff_inhibition": False, "ff_targets": "both", "inh_sigma_ratio": 1.0}     # genomes from before these genes existed
 
 
-def random_genome(rng, layers, shortcuts=False, surround=False, relay=False):
+def random_genome(rng, layers, shortcuts=False, surround=False, relay=False, time_constants=False):
     g = {k: sample_gene(rng, s) for k, s in SPACE.items()}
+    if not time_constants:
+        for k in TIME_GENES:
+            g.pop(k)                              # neuron time constants at their defaults
+    elif time_constants == "per_layer":
+        g.pop("tau_mem")                          # replaced by one gene per layer and the fields
+        g.update({k: sample_gene(rng, LAYER_TAU) for k in layer_tau_keys(layers)})
     if relay and layers > 1:
         g["ff_sigma"] = sample_gene(rng, RELAY_FF)
     if not shortcuts:
@@ -124,9 +153,11 @@ def mutate(rng, genome, layers, relay=False):
     if layers == 1:
         g.pop("ff_targets", None)
     keys = [k for k in SPACE if (layers > 1 or k not in ("ff_sigma", "ff_targets"))
-            and (k not in ("global_fan_in",) + SURROUND_GENES or k in g)]   # a genome stays in its family
+            and (k not in OPTIONAL_GENES or k in g)]   # a genome stays in its family
+    keys += [k for k in g if is_layer_tau(k)] + [k for k in ("ff_perm_radius", "ff_centre_shift") if k in g]
     for k in rng.sample(keys, rng.randint(1, 3)):
-        spec = SPACE[k]
+        spec = (LAYER_TAU if is_layer_tau(k) else PERM_GENE if k in ("ff_perm_radius", "ff_centre_shift")
+                else SPACE[k])
         if spec[0] == "choice":
             g[k] = rng.choice(spec[1])
         elif spec[0] == "int":                  # additive steps, at least 1
@@ -162,7 +193,19 @@ def genome_to_hp(g, layers, size):
         to_next = {"sigma_cells": round(g["ff_sigma"], 3)}
         if "ff_surround_p" in g:                  # centre-surround feed-forward kernel
             to_next.update(p_surround=round(g["ff_surround_p"], 4), surround_ratio=round(g["ff_surround_ratio"], 3))
+        if "ff_centre_shift" in g:                # Gaussian relay with locally permuted centres
+            to_next["centre_shift"] = int(max(0, g["ff_centre_shift"]))
+        if "ff_perm_radius" in g:                 # one-to-one local permutation relay (E -> next E); the Gaussian
+            to_next.update(type="permutation", perm_radius=int(max(0, g["ff_perm_radius"])))   # settings reach I
         net["layers"] = [{"to_next": dict(to_next)} for _ in range(layers - 1)] + [{}]
+    if "tau_mem" in g or "tau_mem_L1" in g:       # time constants: network-wide, or tau_mem per layer and fields
+        neuron = {"tau_adapt": round(g["tau_adapt"], 1), "beta": round(g["beta"], 5)}
+        net.setdefault("layers", [{} for _ in range(layers)])
+        for k, layer in enumerate(net["layers"], 1):
+            layer["neuron"] = {**neuron, "tau_mem": round(g.get(f"tau_mem_L{k}", g.get("tau_mem", 10.0)), 2)}
+            if f"slow_tau_L{k}" in g:              # a slow excitatory sub-population beside the layer's E
+                layer["slow"] = {"neuron": {**neuron, "tau_mem": round(g[f"slow_tau_L{k}"], 2)}}
+        net["fields"]["neuron"] = {**neuron, "tau_mem": round(g.get("tau_mem_fields", g.get("tau_mem", 10.0)), 2)}
     hp = {"toroidal": "local", "local": local, "network": net}
     if layers > 1:
         hp["feedforward_targets"] = g["ff_targets"]
@@ -251,9 +294,16 @@ def score(result, layers):
     memory = float(min(np.mean([np.mean(m) for m in mem]) / MEM_FULL, 1.0)) if mem else 0.0
     weakest = float(min(stages)) if stages else 0.0
     keep = weakest if result.get("prior") == "relay" else fields
-    return float(0.4 * l1_abs + 0.4 * keep + 0.2 * memory - pen - wire), {
+    # responsiveness: the current frame decoded a third into the frame relative to its end, for layer 1 and the
+    # fields (1 = settled early; long time constants smear the previous frames into the early state)
+    resp_pops = [l1] + f
+    resp_vals = [min(max(p["input_r2_early"], 0.0) / max(p.get("input_r2_counts", p["input_r2"]), 1e-6), 1.0)
+                 for p in resp_pops if "input_r2_early" in p]
+    resp = float(np.mean(resp_vals)) if resp_vals else None
+    latency_pen = result.get("latency_weight", 0.0) * (1.0 - resp) if resp is not None else 0.0
+    return float(0.4 * l1_abs + 0.4 * keep + 0.2 * memory - pen - wire - latency_pen), {
         "l1": l1_abs, "fields": fields, "weakest": weakest, "memory": memory, "later_kept": later, "mixing": mix, "stages": [round(x, 3) for x in stages],
-        "penalty": pen, "wiring": wire}
+        "penalty": pen, "wiring": wire, "responsive": resp, "latency_penalty": latency_pen}
 
 
 def rescore(results, layers):
@@ -355,11 +405,24 @@ def seed_genomes(args, done):
                 g.pop(k, None)
         elif "ff_surround_p" not in g:                   # start from a faint surround: close to the seed's own kernel
             g.update(ff_surround_p=0.01, ff_surround_ratio=4.0)
+        tc = getattr(args, "time_constants", "off")
+        if tc == "on":
+            g = {**TIME_DEFAULTS, **g}                   # seeds start at the default time constants
+        elif tc == "per_layer":
+            base = g.pop("tau_mem", TIME_DEFAULTS["tau_mem"])
+            g = {**{k: v for k, v in TIME_DEFAULTS.items() if k != "tau_mem"}, **g}
+            for k in layer_tau_keys(args.layers):
+                g.setdefault(k, base)
+        else:
+            for k in TIME_GENES:
+                g.pop(k, None)
         if args.layers == 1:
             g.pop("ff_sigma", None); g.pop("ff_targets", None)
         elif "ff_sigma" not in g:
             continue                                     # a 1-layer genome has no feed-forward spread to start from
-        g = {k: v for k, v in g.items() if k in SPACE}
+        # keep every gene this search knows, including the optional ones outside SPACE (dropping one silently
+        # evaluates a different network than the seed)
+        g = {k: v for k, v in g.items() if k in SPACE or is_layer_tau(k) or k in OPTIONAL_GENES}
         if g not in seen and g not in out:
             out.append(g)
     return out
@@ -385,7 +448,7 @@ def report(out, top=10, export=3):
     if not res:
         print("no results yet"); return
     print(f"{len(res)} candidates; best {top}:")
-    print(f"  {'idx':>5s} {'score':>6s} {'L1':>5s} {'field':>5s} {'weak':>5s} {'mem':>5s} {'mix':>5s} {'pen':>4s} {'wire':>5s}  "
+    print(f"  {'idx':>5s} {'score':>6s} {'L1':>5s} {'field':>5s} {'weak':>5s} {'mem':>5s} {'mix':>5s} {'resp':>5s} {'pen':>4s} {'wire':>5s}  "
           f"{'kept per stage (L2.., fields)':30s} genome")
     for r in res[:top]:
         p = r["parts"]
@@ -398,6 +461,7 @@ def report(out, top=10, export=3):
         print(f"  {r['idx']:5d} {r['score']:6.3f} {p['l1']:5.2f} {p.get('fields', 0):5.2f} {p.get('weakest', 0):5.2f} "
               f"{p.get('memory', 0):5.2f} "
               f"{p.get('mixing', 0):5.2f} "
+              f"{(p.get('responsive') if p.get('responsive') is not None else float('nan')):5.2f} "
               f"{p['penalty']:4.1f} {p.get('wiring', 0):5.2f}  "
               f"{st:30s} {g}")
     best = out / "best_configs"
@@ -433,6 +497,12 @@ def main():
     ap.add_argument("--timeout", type=float, default=3600.0, help="seconds before a candidate counts as failed")
     ap.add_argument("--min-fan-in", type=int, default=MIN_FAN_IN, help="feed-forward synapses every target needs")
     ap.add_argument("--min-cells", type=int, default=MIN_CELLS, help="source grid cells every target needs")
+    ap.add_argument("--time-constants", default="off", choices=["off", "on", "per_layer"],
+                    help="on: search the network-wide neuron time constants (genes tau_mem, tau_adapt, beta); "
+                         "per_layer: one tau_mem per layer and one for the fields (tau_adapt, beta network-wide)")
+    ap.add_argument("--latency-weight", type=float, default=0.0,
+                    help="penalty weight on slow settling: weight * (1 - responsive), responsive = the current frame "
+                         "decoded a third into the frame relative to its end (layer 1 and the fields)")
     ap.add_argument("--report", action="store_true", help="only print the ranking and export the best configs")
     args = ap.parse_args()
     out = Path(args.out).resolve()
@@ -457,15 +527,19 @@ def main():
             genome = queue.pop(0)
         elif idx < args.random or rng.random() < 0.3:
             genome = random_genome(rng, args.layers, args.shortcuts == "on", args.ff_kernel == "surround",
-                                   args.prior == "relay")
+                                   args.prior == "relay",
+                                   {"off": False, "on": True}.get(args.time_constants, args.time_constants))
         else:
             top = sorted(done, key=lambda r: -r["score"])[:5]
             genome = mutate(rng, rng.choice(top)["genome"], args.layers, args.prior == "relay")
         task = (idx, genome, args.layers, args.size, args.backend, str(frames_path), str(out), args.min_fan_in,
                 args.min_cells)
         res = run_isolated(ctx, task, args.timeout)
-        if args.prior != "none" and "per_pop" in res:        # scored under the search's prior
-            res["prior"] = args.prior
+        if "per_pop" in res and (args.prior != "none" or args.latency_weight):   # scored under the search's settings
+            if args.prior != "none":
+                res["prior"] = args.prior
+            if args.latency_weight:
+                res["latency_weight"] = args.latency_weight
             res["score"], res["parts"] = score(res, args.layers)
         if "error" in res:                                   # a broken candidate must not stop the search
             res.update(idx=idx, genome=genome, score=-1e9,

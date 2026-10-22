@@ -62,7 +62,7 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, rho: float,
                           f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float,
-                          send_back: bool = False):
+                          send_back: bool = False, readout_kappa: float = None):
     """Return the keyword arguments of a ``WeightUpdateModel`` (model dict and initial values).
 
     send_back: this synapse's presynaptic neuron is a hidden neuron that receives the backward signal
@@ -131,6 +131,11 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
               ("AlphaFAv", "scalar"), ("Vthresh_post", "scalar"), ("Lambda", "scalar")]
     param_vals = {"CReg": c_reg, "Alpha": alpha, "Rho": rho, "FTarget": f_target,
                   "AlphaFAv": alpha_fav, "Vthresh_post": v_thresh, "Lambda": td_lambda}
+    # kappa: the readout's membrane decay, which low-pass filters the eligibility for learning signals that come
+    # through the leaky readout (e-prop: e_bar = F_kappa(e), Bellec et al. 2020); alpha (the target neuron's decay)
+    # filters the presynaptic trace inside e. Equal by default (heads and hidden neurons 10 ms).
+    params.append(("Kappa", "scalar"))
+    param_vals["Kappa"] = alpha if readout_kappa is None else readout_kappa
     vars_ = [("g", "scalar", VarAccess.READ_ONLY), ("DeltaG", "scalar"), ("epsilonA", "scalar")]
     var_vals = {"DeltaG": 0.0, "epsilonA": 0.0}
     if use_efiltered:
@@ -313,7 +318,7 @@ else {
     syn.append("const scalar e = Psi * ZFilter - Psi * Beta_post * epsA;")
     syn.append("epsilonA = Psi * ZFilter + (Rho * epsA) - Psi * Beta_post * epsA;")
     if use_efiltered:
-        syn.append("eFiltered = (eFiltered * Alpha) + e;")
+        syn.append("eFiltered = (eFiltered * Kappa) + e;")
     if cfg.fire_rate_gradient:
         syn.append("DeltaG += CReg * (FAvg - FTarget) * eFiltered;")
     if use_combined:

@@ -59,7 +59,9 @@ class ToroidalGaussian2D(SparseBase):
                  sigma_ref: str = "source",
                  p_global: float = 0.0,
                  p_surround: float = 0.0,
-                 surround_ratio: float = 3.0):
+                 surround_ratio: float = 3.0,
+                 centre_shift: int = 0,
+                 centre_offsets=None):
 
         super(ToroidalGaussian2D, self).__init__(weight, delay)
 
@@ -77,6 +79,9 @@ class ToroidalGaussian2D(SparseBase):
         self.p_global = p_global
         self.p_surround = p_surround
         self.surround_ratio = surround_ratio
+        self.centre_shift = int(centre_shift)
+        self.centre_offsets = centre_offsets       # (H, W, 2) fractional offsets on a sheet (local_shift_field), shared
+                                                   # by every population of a layer; overrides centre_shift
 
     def _euclidean_distance(self, x1, y1, x2, y2):
         dx = x1 - x2
@@ -169,9 +174,24 @@ class ToroidalGaussian2D(SparseBase):
         sigmas = self._sigmas((src_h, src_w), (tgt_h, tgt_w))
         same = source is target
         all_pre, all_post = [], []
+        # centre_shift: every target's kernel is centred on the position of another target cell at most centre_shift
+        # cells away (a local permutation of the centres): still a local, averaging kernel, but the topography is
+        # reorganised from one population to the next
+        centre = None
+        if self.centre_shift > 0 and self.centre_offsets is None:
+            from .local_permutation import local_block_permutation
+            centre = local_block_permutation(tgt_h, tgt_w, self.centre_shift, np.random)
+        off = None if self.centre_offsets is None else np.asarray(self.centre_offsets)
         for r in range(tgt_h):
             for c in range(tgt_w):
-                z2 = self._toroidal_z2((src_h, src_w), ((r + 0.5) / tgt_h, (c + 0.5) / tgt_w), sigmas)
+                if off is not None:                # the offset of the sheet cell this target lies on
+                    fy, fx = (r + 0.5) / tgt_h, (c + 0.5) / tgt_w
+                    oy, ox = off[int(fy * off.shape[0]), int(fx * off.shape[1])]
+                    centre_y, centre_x = (fy + oy) % 1.0, (fx + ox) % 1.0
+                else:
+                    cr, cc = (r, c) if centre is None else divmod(int(centre[r, c]), tgt_w)
+                    centre_y, centre_x = (cr + 0.5) / tgt_h, (cc + 0.5) / tgt_w
+                z2 = self._toroidal_z2((src_h, src_w), (centre_y, centre_x), sigmas)
                 p = np.repeat(self._prob(z2).ravel(), src_c)
                 for ch in range(tgt_c):
                     id_post = (r * tgt_w + c) * tgt_c + ch

@@ -209,7 +209,11 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
         compile_state.backprop_connections.append(conn)
     elif compiler.gamma_lambda is not None:
         compile_state.pert_eps_transport_connections.append(conn)
-    rho = np.exp(-compiler.dt / compile_state.tau_adapt)
+    # adaptation decay of the TARGET neuron (the eligibility's epsilonA follows the postsynaptic adaptation)
+    tau_a = getattr(target_neuron, "tau_adapt", None)
+    if tau_a is None:
+        tau_a = compile_state._tau_adapt
+    rho = float(np.exp(-compiler.dt / float(tau_a))) if tau_a is not None else 0.0
     base_params = {"CReg": compiler.c_reg, "Alpha": alpha, "Rho": rho,
                   "FTarget": (compiler.f_target * compiler.dt) / 1000.0,
                   "AlphaFAv": np.exp(-compiler.dt / compiler.tau_reg),
@@ -227,7 +231,7 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
                                  "A_post": "A", "E_post": "E"})
 
     kw = build_td_hidden_model(
-        rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho,
+        rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho, readout_kappa=compiler.readout_kappa(),
         f_target=(compiler.f_target * compiler.dt) / 1000.0,
         alpha_fav=np.exp(-compiler.dt / compiler.tau_reg),
         v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda, send_back=send_back)

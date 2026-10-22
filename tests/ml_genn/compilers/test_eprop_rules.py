@@ -921,3 +921,51 @@ def test_value_transform_head_only_broadcasts_the_original_units(request):
     worst_e = min(np.max(np.abs(x - y)) for x, y in (lag(err, 0), lag(err, 1)))
     assert best < 1e-4 * max(1.0, np.abs(bc).max())                 # the hidden TD error is the broadcast
     assert worst_e > 1e-3                                           # ... and not the transformed error
+
+
+def test_populations_with_different_time_constants_get_their_own_eligibility_decays(request):
+    """Every connection's eligibility decays with its TARGET population's constants (alpha from tau_mem, rho from
+    tau_adapt); before, the compiler refused networks with more than one tau."""
+    rng = np.random.default_rng(0)
+    w = lambda shape, mean, sd: (mean + sd * rng.standard_normal(shape)).astype(np.float32)
+    alif = lambda tm, ta: AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=tm, tau_refrac=3.0, tau_adapt=ta)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        fast, slow = Population(alif(10.0, 300.0), N_HID), Population(alif(40.0, 1000.0), N_HID)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        c_in = Connection(inp, fast, Dense(w((N_IN, N_HID), 0.15, 0.05)))
+        c_fs = Connection(fast, slow, Dense(w((N_HID, N_HID), 0.1, 0.05)))
+        c_ss = Connection(slow, slow, Dense(w((N_HID, N_HID), 0.0, 0.05)))
+        c_out = Connection(slow, pol, Dense(w((N_HID, 4), 0.0, 0.5)))
+        Connection(slow, val, Dense(w((N_HID, 1), 0.0, 0.5)))
+        Connection(slow, pol, Dense(w((N_HID, 4), 0.0, 0.5)), feedback_name="policy_feedback")
+        Connection(slow, val, Dense(w((N_HID, 1), 0.0, 0.5)), feedback_name="value_feedback")
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        for h in (fast, slow):
+            Connection(h, val, Dense(weight=1.0), feedback_name="tde_transport")
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=0.5 ** (1 / K), td_lambda=0.8 ** (1 / K),
+        train_output_bias=False, reset_time_between_batches=False,
+        entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND, hidden_rule="eprop")
+    seen = {}                                   # the parameters the compiler gives every connection's update model
+    build = compiler.build_weight_update_model
+    def spy(conn, *args, **kw):
+        wum = build(conn, *args, **kw)
+        seen[conn] = dict(wum.param_vals)
+        return wum
+    compiler.build_weight_update_model = spy
+    compiled = compiler.compile(net, request.node.name)
+    params = lambda c: seen[c]
+    a = lambda tau: np.exp(-1.0 / tau)
+    assert params(c_in)["Alpha"] == pytest.approx(a(10.0)) and params(c_in)["Rho"] == pytest.approx(a(300.0))
+    assert params(c_fs)["Alpha"] == pytest.approx(a(40.0)) and params(c_fs)["Rho"] == pytest.approx(a(1000.0))
+    assert params(c_ss)["Alpha"] == pytest.approx(a(40.0))
+    assert params(c_out)["Alpha"] == pytest.approx(a(10.0))            # the readout's own membrane decay
+    # the filtered eligibility (e-prop's F_kappa) uses the READOUT's decay, whatever the target's tau_mem
+    assert params(c_fs)["Kappa"] == pytest.approx(a(10.0)) and params(c_in)["Kappa"] == pytest.approx(a(10.0))
+    _run(compiled, inp, pol, val, steps=4 * K)                           # and it runs

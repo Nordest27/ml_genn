@@ -204,3 +204,68 @@ def test_reward_relay_projects_to_the_first_layer_only():
     conns = [c for c in b.network.connections if c.source() is relay]
     assert {c.target() for c in conns} == set(b.layers[0])                 # first layer's E and I only
     assert all(c.exc_inh_sign == +1 and c.connectivity.weight.mean > 0 for c in conns)
+
+
+def test_slow_subpopulation_is_wired_like_e_with_its_own_time_constant():
+    np.random.seed(0)
+    b = build(toroidal="local", ei_layers=2, network={"layers": [{"slow": {"neuron": {"tau_mem": 40.0},
+                                                                            "in_gain": 0.5}}, {}]})
+    (e1, i1), (e2, i2) = b.layers
+    s1 = b.slow[0]
+    assert b.slow[1] is None and b.labels[s1] == "L1_S" and s1 in b.hidden
+    assert float(s1.neuron.tau_mem) == 40.0 and float(e1.neuron.tau_mem) != 40.0
+    pairs = {(c.source(), c.target()) for c in b.network.connections if not c.is_feedback}
+    assert (b.input, s1) in pairs                                     # receives the input like E
+    assert {(e1, s1), (s1, e1), (s1, s1), (s1, i1), (i1, s1)} <= pairs    # recurrent within the layer
+    assert {(s1, e2), (s1, i2)} <= pairs                              # projects forward like E
+    assert len(b.inhibitory_to_slow) == 1 and b.inhibitory_to_slow[0].source() is i1
+    w = lambda s, t: next(c for c in b.network.connections if c.source() is s and c.target() is t
+                          and not c.is_feedback).connectivity.weight.mean
+    assert w(b.input, s1) == pytest.approx(0.5 * w(b.input, e1))     # in_gain on its external input only
+    assert w(e1, s1) == pytest.approx(w(e1, e1), rel=0.2)            # internal weights unscaled
+    np.random.seed(0)
+    plain = build(toroidal="local", ei_layers=2)
+    assert plain.slow == [None, None] and len(plain.hidden) == 6
+
+
+def test_local_permutation_and_shifted_centres():
+    from types import SimpleNamespace
+    from ml_genn.connectivity import LocalPermutation, ToroidalGaussian2D
+    grid = SimpleNamespace(shape=(8, 8, 3))
+    d = lambda a, b, n: np.minimum(abs(a - b), n - abs(a - b))
+    for r in (0, 1, 2):
+        c = LocalPermutation(r, 1.0, seed=r); c.connect(grid, grid)
+        assert sorted(c.pre_ind) == sorted(c.post_ind) == list(range(8 * 8 * 3))      # one-to-one
+        (py, px), (qy, qx) = np.divmod(c.pre_ind // 3, 8), np.divmod(c.post_ind // 3, 8)
+        assert max(d(py, qy, 8).max(), d(px, qx, 8).max()) <= r and np.all(c.pre_ind % 3 == c.post_ind % 3)
+    fans, offs = [], []
+    for shift in (0, 2):
+        np.random.seed(0)
+        c = ToroidalGaussian2D(sigma=0.0, fan_in=0, weight=1.0, p_max=1.0, sigma_cells=0.6, sigma_ref="source",
+                               centre_shift=shift)
+        c.connect(grid, SimpleNamespace(shape=(8, 8, 3)))            # between two layers (no self-exclusion)
+        (py, px), (qy, qx) = np.divmod(c.pre_ind // 3, 8), np.divmod(c.post_ind // 3, 8)
+        fans.append(len(c.pre_ind) / (8 * 8 * 3)); offs.append(np.mean(d(py, qy, 8) + d(px, qx, 8)))
+    assert abs(fans[0] - fans[1]) < 0.5 and offs[1] > offs[0] + 0.5   # same fan-in, displaced centres
+
+
+def test_centre_shift_displaces_a_layers_e_and_i_together():
+    """One displacement field per layer-to-layer step: an I target receives from the same displaced neighbourhood
+    as the E targets at its sheet position, so local inhibition still follows local excitation."""
+    np.random.seed(0)
+    b = build(toroidal="local", ei_layers=2, hid_e=12, hid_i=8, local={"sigma_cells": 0.6},
+              network={"layers": [{"to_next": {"centre_shift": 2, "sigma_cells": 0.6}}, {}]})
+    (e1, _), (e2, i2) = b.layers
+    def centroids(tgt):
+        c = next(c for c in b.network.connections if c.source() is e1 and c.target() is tgt)
+        pre, post = np.asarray(c.connectivity.pre_ind), np.asarray(c.connectivity.post_ind)
+        h, w, ch = tgt.shape
+        ang = 2 * np.pi * np.stack(np.divmod(pre // 3, 12), 1) / 12.0            # source position on the E1 sheet
+        cy = np.angle(np.bincount(post, np.cos(ang[:, 0]), h * w * ch) + 1j * np.bincount(post, np.sin(ang[:, 0]), h * w * ch))
+        cx = np.angle(np.bincount(post, np.cos(ang[:, 1]), h * w * ch) + 1j * np.bincount(post, np.sin(ang[:, 1]), h * w * ch))
+        return np.stack([cy, cx], 1) * 12 / (2 * np.pi)                           # in E1 cells
+    ce, ci = centroids(e2), centroids(i2)
+    iy, ix = np.divmod(np.arange(8 * 8 * 3) // 3, 8)
+    ecell = (np.floor((iy + 0.5) / 8 * 12).astype(int) * 12 + np.floor((ix + 0.5) / 8 * 12).astype(int)) * 3
+    diff = np.abs(ci - ce[ecell]); diff = np.minimum(diff, 12 - diff)
+    assert np.median(diff.sum(1)) < 1.0            # same displaced neighbourhood (independent shuffles: ~2 cells)

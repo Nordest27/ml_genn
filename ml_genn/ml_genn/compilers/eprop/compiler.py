@@ -112,14 +112,14 @@ class CompileState:
         assert self._tau_mem is not None
         return self._tau_mem
 
+    # The first hidden population's time constants: only a fallback. Every connection's eligibility decays with
+    # its own TARGET population's constants (alpha = exp(-dt / tau_mem), rho = exp(-dt / tau_adapt), see
+    # target_alpha / connection_logic.build_hidden_wum): the presynaptic trace of synapse i -> j is filtered with
+    # neuron j's membrane decay, so populations with different time constants are supported.
     @tau_mem.setter
     def tau_mem(self, tau_mem):
         if self._tau_mem is None:
             self._tau_mem = tau_mem
-        if self._tau_mem != tau_mem:
-            raise NotImplementedError("E-prop compiler doesn't "
-                                      "support neurons with "
-                                      "different time constants")
 
     @property
     def tau_adapt(self):
@@ -130,10 +130,15 @@ class CompileState:
     def tau_adapt(self, tau_adapt):
         if self._tau_adapt is None:
             self._tau_adapt = tau_adapt
-        if self._tau_adapt != tau_adapt:
-            raise NotImplementedError("E-prop compiler doesn't "
-                                      "support neurons with "
-                                      "different time constants")
+
+
+def target_alpha(conn, dt, compile_state):
+    """Membrane decay of the connection's target population (the decay of the presynaptic trace in its
+    eligibility); the first hidden population's tau_mem when the target has none."""
+    tau = getattr(conn.target().neuron, "tau_mem", None)
+    if tau is None or not is_value_constant(tau):
+        tau = compile_state.tau_mem
+    return float(np.exp(-dt / float(tau)))
 
 
 class EPropCompiler(Compiler):
@@ -385,7 +390,7 @@ class EPropCompiler(Compiler):
             raise NotImplementedError("E-prop compiler only "
                                       "support heterogeneous delays")
 
-        alpha = np.exp(-self.dt / compile_state.tau_mem)
+        alpha = target_alpha(conn, self.dt, compile_state)
         target_pop = conn.target()
         target_neuron = target_pop.neuron
 
@@ -488,6 +493,19 @@ class EPropCompiler(Compiler):
         compile_state.tau_mem = pop.neuron.tau_mem
         if isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             compile_state.tau_adapt = pop.neuron.tau_adapt
+
+    def readout_kappa(self):
+        """Membrane decay of the readout heads (the policy head's; the value head's if there is none), or None.
+        It filters the eligibility for learning signals that arrive through the leaky readout (F_kappa in e-prop)."""
+        heads = list(self.policy_heads or {}) + ([self.value_head] if self.value_head is not None else [])
+        taus = [getattr(p.neuron, "tau_mem", None) for p in heads]
+        taus = [float(t) for t in taus if t is not None and is_value_constant(t)]
+        if not taus:
+            return None
+        if len(set(taus)) > 1:
+            logger.warning(f"readout heads with different time constants {sorted(set(taus))}: "
+                           f"the eligibility filter uses the first ({taus[0]} ms)")
+        return float(np.exp(-self.dt / taus[0]))
 
     def rule_for(self, pop):
         """The hidden rule of the synapses targeting `pop`: its own rule if given in population_rules, else the
