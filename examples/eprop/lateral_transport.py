@@ -7,6 +7,9 @@ For every genome (built and calibrated as in architecture_evolution), per hidden
   around that same position only (V and spike counts per frame; ridge, held-out R2), averaged over positions;
 - global: the input decoded from the whole population (the search's input_r2 measure, top principal components).
 Information that moves sideways without being lost keeps global high while local falls with depth.
+- global_lin / global_nl (--nonlinear): the same input decoded from the population's top 50 principal components,
+  linearly and through random Fourier features (an RBF-kernel decoder, layer_probe_tests.random_features): if the
+  non-linear decoder recovers what the linear one misses, the information is transformed rather than lost.
 """
 import argparse
 import json
@@ -52,7 +55,7 @@ def local_r2(feats, shape, rates, in_hw=(20, 20), in_c=3, radius=1, max_position
     return float(np.mean(out)) if out else float("nan")
 
 
-def analyse(genome, layers, size, frames, name, work, backend="cuda"):
+def analyse(genome, layers, size, frames, name, work, backend="cuda", nonlinear=False):
     import architecture_evolution as ae
     import reservoir_search as rs
     d = np.load(frames)
@@ -74,6 +77,14 @@ def analyse(genome, layers, size, frames, name, work, backend="cuda"):
             glob = rs.ridge_r2(np.hstack([(v - v.mean(0)) / (v.std(0) + 1e-6),
                                           (counts[k] - counts[k].mean(0)) / (counts[k].std(0) + 1e-6)]), ev, ridge=10.0)
             res["pops"][lab] = {"local": local_r2(feats, shape, ev), "global": glob}
+            if nonlinear:
+                from layer_probe_tests import random_features
+                x = np.hstack([(v - v.mean(0)) / (v.std(0) + 1e-6),
+                               (counts[k] - counts[k].mean(0)) / (counts[k].std(0) + 1e-6)])
+                cut = int(0.7 * len(x))
+                pcs = rs._pcs(x, cut, n=50)
+                res["pops"][lab]["global_lin"] = held_out_r2(pcs, ev, ridge=10.0)
+                res["pops"][lab]["global_nl"] = held_out_r2(random_features(pcs, cut), ev, ridge=1.0)
     return res
 
 
@@ -83,6 +94,7 @@ def main():
     ap.add_argument("--layers", type=int, default=5); ap.add_argument("--size", default="full")
     ap.add_argument("--frames", required=True); ap.add_argument("--names", nargs="*")
     ap.add_argument("--backend", default="cuda", choices=["cuda", "single_threaded_cpu"])
+    ap.add_argument("--nonlinear", action="store_true", help="also linear vs random-feature decoding of the whole population")
     args = ap.parse_args()
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     gs = json.load(open(args.genomes))
@@ -90,10 +102,11 @@ def main():
     results = []
     for g, n in zip(gs, names):
         work = out / "work" / n; work.mkdir(parents=True, exist_ok=True)
-        r = analyse(g, args.layers, args.size, args.frames, n, work, args.backend)
-        print(f"\n{n}\n  {'pop':12s} {'local':>6s} {'global':>7s}")
+        r = analyse(g, args.layers, args.size, args.frames, n, work, args.backend, args.nonlinear)
+        print(f"\n{n}\n  {'pop':12s} {'local':>6s} {'global':>7s} {'lin50':>6s} {'nl50':>6s}")
         for lab, p in r["pops"].items():
-            print(f"  {lab:12s} {p['local']:6.2f} {p['global']:7.2f}", flush=True)
+            print(f"  {lab:12s} {p['local']:6.2f} {p['global']:7.2f} {p.get('global_lin', float('nan')):6.2f} "
+                  f"{p.get('global_nl', float('nan')):6.2f}", flush=True)
         results.append(r)
         (out / "results.json").write_text(json.dumps(results, indent=1))
 

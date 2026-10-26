@@ -226,6 +226,13 @@ class HiddenRuleConfig:
                                      # group targeting the neuron agrees); neurons settle at different sparseness
     eprop: float = 0.0               # e-prop learning signal: lambda-trace of eFiltered * (PG - eprop_value * VE)
     eprop_value: float = 0.1
+    eprop_center_value: bool = False     # the critic part of e-prop's update uses delta minus its running mean: a
+                                         # biased critic (E[delta] != 0) otherwise pushes every neuron's incoming
+                                         # weights coherently (the eligibility is >= 0), by the sign of its value
+                                         # feedback weight; the policy part keeps delta (its score has zero mean)
+    eprop_center_td: bool = False        # the whole e-prop update uses delta minus its running mean: the critic part
+                                         # as above, and for the policy part a baseline (no change in expectation,
+                                         # lower variance, since the score has zero mean)
     eprop_scope: "EpropScope" = None     # None = EpropScope.ALL
     diagnose_gradients: bool = False     # diagnostic: synapses with an e-prop term (and noise) also accumulate
                                          # AccE = sum delta * e-prop trace, AccG = sum delta * gradient-part trace

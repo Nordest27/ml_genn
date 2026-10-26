@@ -1,0 +1,58 @@
+{
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "toroidal": "local",
+ "network": {
+  "layers": [
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "mean_scale": 0.7977576115811069,
+     "sd_scale": 0.07977576115811069
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "mean_scale": 0.7629139340525046,
+     "sd_scale": 0.07629139340525047
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "mean_scale": 0.8930657865288912,
+     "sd_scale": 0.08930657865288913
+    }
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "mean_scale": 0.753844879164093,
+     "sd_scale": 0.07538448791640931
+    }
+   },
+   {}
+  ],
+  "fields": {
+   "conn": {
+    "sigma_cells": 0.45,
+    "mean_scale": 0.48272815041561684,
+    "sd_scale": 0.09654563008312338
+   }
+  },
+  "input": {
+   "mean_scale": 0.07847888080496555,
+   "sd_scale": 0.03923944040248278
+  }
+ },
+ "ei_layers": 5,
+ "hidden_rule": {
+  "preset": "eprop",
+  "eprop_center_value": true
+ },
+ "c_reg": 0.0001
+}

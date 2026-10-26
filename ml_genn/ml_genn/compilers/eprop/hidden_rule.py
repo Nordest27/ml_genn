@@ -149,6 +149,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         vars_.append(("FreshEps", "scalar")); var_vals["FreshEps"] = 0.0
     for name, used in (("RLNoiseTrace", use_combined), ("RLNoisePtrace", use_P),
                        ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop),
+                       ("RLValueTrace", use_eprop and cfg.eprop_center_value),
                        ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
@@ -158,7 +159,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     for name, used in (("FAvg", use_favg), ("FAvgTrace", use_rate_local), ("Z", use_dvc),
                        ("PrevV", use_prevv), ("DVc", use_dvc), ("PsiBar", uses_psibar),
                        ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
-                       ("TdMean", cfg.center_drift), ("AbsTd", use_abs_td),
+                       ("TdMean", cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
+                       ("AbsTd", use_abs_td),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
                        ("ZDec", use_decorr), ("ZDecMean", use_decorr)):
         if used:
@@ -206,7 +208,7 @@ else {
             # group of the neuron: they all compute the same PsiBar from the same postsynaptic state)
             post_dyn.append(f"if (PsiTargetN == 0.0 && t >= {float(cfg.psi_target_warmup)!r}) {{ "
                             "PsiTargetN = fmax(PsiBar, 1e-4); }")
-    if cfg.center_drift:
+    if cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td)):
         post_dyn.append(f"TdMean = {_f(cfg.td_stats_decay)} * TdMean + {_f(1 - cfg.td_stats_decay)} * (TdE_post + PRew_post);")
     if use_abs_td:
         post_dyn.append(f"AbsTd = {_f(cfg.td_stats_decay)} * AbsTd + {_f(1 - cfg.td_stats_decay)} * fabs(TdE_post + PRew_post);")
@@ -286,7 +288,11 @@ else {
         if cfg.homeostat_floor:   # one-sided: only neurons below the target are pushed (up)
             deviation = f"fmin({deviation}, 0.0)"
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
-    if use_eprop:
+    if use_eprop and cfg.eprop_center_td:         # both parts with delta - its mean (one combined trace)
+        dg.append(_scaled(cfg.eprop, "(reward - TdMean) * RLTrace"))
+    elif use_eprop and cfg.eprop_center_value:    # policy part with delta, critic part with delta - its mean
+        dg.append(_scaled(cfg.eprop, f"(reward * RLTrace - {_f(cfg.eprop_value)} * (reward - TdMean) * RLValueTrace)"))
+    elif use_eprop:
         dg.append(_scaled(cfg.eprop, "reward * RLTrace"))
     if use_backprop:
         dg.append(_scaled(cfg.backprop, "reward * RLBackTrace"))
@@ -335,7 +341,11 @@ else {
     if use_G:
         syn.append(f"RLNoiseGtrace = Lambda * RLNoiseGtrace + {g_score};")
     if use_eprop:
-        syn.append(f"RLTrace = Lambda * RLTrace + eFiltered * (PG_post - {_f(cfg.eprop_value)} * VE_post);")
+        if cfg.eprop_center_value and not cfg.eprop_center_td:   # separate traces: the policy and the critic part
+            syn.append("RLTrace = Lambda * RLTrace + eFiltered * PG_post;")
+            syn.append("RLValueTrace = Lambda * RLValueTrace + eFiltered * VE_post;")
+        else:
+            syn.append(f"RLTrace = Lambda * RLTrace + eFiltered * (PG_post - {_f(cfg.eprop_value)} * VE_post);")
     if use_backprop:
         syn.append("RLBackTrace = Lambda * RLBackTrace + eFiltered * Back_post;")
     if diag:

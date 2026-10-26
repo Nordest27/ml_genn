@@ -969,3 +969,32 @@ def test_populations_with_different_time_constants_get_their_own_eligibility_dec
     # the filtered eligibility (e-prop's F_kappa) uses the READOUT's decay, whatever the target's tau_mem
     assert params(c_fs)["Kappa"] == pytest.approx(a(10.0)) and params(c_in)["Kappa"] == pytest.approx(a(10.0))
     _run(compiled, inp, pol, val, steps=4 * K)                           # and it runs
+
+
+def test_eprop_center_value_splits_the_critic_part_and_centres_its_delta():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = lambda cfg: build_td_hidden_model(cfg, **kw)["model"]
+    plain = model(PRESETS["eprop"])
+    cent = model(replace(PRESETS["eprop"], eprop_center_value=True))
+    assert "RLValueTrace" not in plain["synapse_dynamics_code"] and "TdMean" not in plain["post_dynamics_code"]
+    syn = cent["synapse_dynamics_code"]
+    assert "RLTrace = Lambda * RLTrace + eFiltered * PG_post;" in syn
+    assert "RLValueTrace = Lambda * RLValueTrace + eFiltered * VE_post;" in syn
+    assert "(reward * RLTrace - 0.1 * (reward - TdMean) * RLValueTrace)" in syn
+    assert "TdMean = " in cent["post_dynamics_code"]
+
+
+def test_eprop_center_value_runs(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "eprop", "eprop_center_value": True})
+    hist = _run(compiled, inp, pol, val, steps=20 * K)
+    assert np.all(np.isfinite(hist)) and np.abs(hist[-1] - hist[0]).sum() > 0      # finite, and it learns
+
+
+def test_eprop_center_td_centres_the_whole_update():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    m = build_td_hidden_model(replace(PRESETS["eprop"], eprop_center_td=True), **kw)["model"]
+    syn = m["synapse_dynamics_code"]
+    assert "(reward - TdMean) * RLTrace" in syn and "RLValueTrace" not in syn
+    assert "RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);" in syn     # the combined trace
+    assert "TdMean = " in m["post_dynamics_code"]
