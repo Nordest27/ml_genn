@@ -241,6 +241,9 @@ class EPropCompiler(Compiler):
                                     network receives that (compressed) TD error;
                                     "sqrt_head": the network receives the TD error
                                     in the original units (None: off).
+        value_centring:              {"mode": "reward" | "td", "rate": r}: the value
+                                    head's TD error uses the reward minus a running
+                                    estimate of its average (reward centring; None: off).
     """
     def __init__(self, example_timesteps: int, losses, optimiser="adam",
                  tau_reg: float = 500.0, c_reg: float = 0.001,
@@ -274,6 +277,7 @@ class EPropCompiler(Compiler):
                  value_reg: float = 0.0,
                  value_afterglow: dict = None,
                  value_transform: str = None,
+                 value_centring: dict = None,
                  **genn_kwargs):
         supported_matrix_types = [SynapseMatrixType.SPARSE,
                                   SynapseMatrixType.DENSE]
@@ -335,6 +339,7 @@ class EPropCompiler(Compiler):
         self.value_reg = value_reg
         self.value_afterglow = value_afterglow
         self.value_transform = value_transform
+        self.value_centring = value_centring
         self._configure_rl(gamma, td_lambda, self.policy_heads, value_head)
 
     def _configure_rl(self, gamma, td_lambda, policy_heads, value_head):

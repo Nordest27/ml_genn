@@ -327,6 +327,12 @@ else {
         syn.append("eFiltered = (eFiltered * Kappa) + e;")
     if cfg.fire_rate_gradient:
         syn.append("DeltaG += CReg * (FAvg - FTarget) * eFiltered;")
+    if cfg.vreg_gradient != 0:
+        # d/dW of 1/2 [max(0, V - th)^2 + max(0, -V - th)^2], th = Vthresh + Beta A, with dV/dW = ZFilter and
+        # dA/dW = epsA: p (ZFilter - Beta epsA) - n (ZFilter + Beta epsA) (th rises with A on both sides)
+        syn.append("const scalar thV = Vthresh_post + Beta_post * A_post;")
+        syn.append("const scalar vregP = fmax(0.0, V_post - thV);\nconst scalar vregN = fmax(0.0, -V_post - thV);")
+        syn.append(f"DeltaG += {_f(cfg.vreg_gradient)} * ((vregP - vregN) * ZFilter - (vregP + vregN) * Beta_post * epsA);")
     if use_combined:
         # gate = drift * (Psi - PsiBar) - gradient * PsiBar = drift * Psi - (drift + gradient) * PsiBar
         terms = []

@@ -1,0 +1,150 @@
+{
+ "ei_layers": 5,
+ "hid_e": 20,
+ "hid_i": 15,
+ "fan_in": 300,
+ "toroidal": "local",
+ "feedforward_targets": "both",
+ "local": {
+  "sigma_cells": 1.75,
+  "p_max": 1.0,
+  "input_sigma_cells": 1.813,
+  "inhibition_scale": 3.972,
+  "feedforward_inhibition": false,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 1.0
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 0.3,
+    "mean_scale": 0.6205776944756594,
+    "sd_scale": 0.12411553889513188
+   },
+   "shape": [
+    20,
+    20,
+    2
+   ],
+   "rule": {
+    "preset": "eprop",
+    "eprop_value": 0.1
+   }
+  },
+  "layers": [
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "centre_shift": 3,
+     "mean_scale": 0.9957537604299997,
+     "sd_scale": 0.09957537604299997
+    },
+    "e_shape": [
+     20,
+     20,
+     3
+    ],
+    "i_shape": [
+     15,
+     15,
+     3
+    ]
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "centre_shift": 3,
+     "mean_scale": 0.8278258384705219,
+     "sd_scale": 0.0827825838470522
+    },
+    "e_shape": [
+     20,
+     20,
+     4
+    ],
+    "i_shape": [
+     15,
+     15,
+     4
+    ]
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "centre_shift": 3,
+     "mean_scale": 0.7875002270223946,
+     "sd_scale": 0.07875002270223946
+    },
+    "e_shape": [
+     20,
+     20,
+     6
+    ],
+    "i_shape": [
+     15,
+     15,
+     6
+    ]
+   },
+   {
+    "to_next": {
+     "sigma_cells": 0.45,
+     "centre_shift": 3,
+     "mean_scale": 0.7174444446141485,
+     "sd_scale": 0.07174444446141486
+    },
+    "e_shape": [
+     20,
+     20,
+     3
+    ],
+    "i_shape": [
+     15,
+     15,
+     3
+    ],
+    "rule": {
+     "preset": "eprop",
+     "eprop_value": 0.0
+    }
+   },
+   {
+    "e_shape": [
+     20,
+     20,
+     2
+    ],
+    "i_shape": [
+     15,
+     15,
+     2
+    ],
+    "rule": {
+     "preset": "eprop",
+     "eprop_value": 0.0
+    }
+   }
+  ],
+  "input": {
+   "mean_scale": 0.12679976540762222,
+   "sd_scale": 0.06339988270381111
+  }
+ },
+ "feedback_type": "adaptive",
+ "optimise_feedback": true,
+ "explicit_feedback": true,
+ "c_reg": 0.01,
+ "f_target": 10.0,
+ "dale": {
+  "every_episodes": 1,
+  "local": true,
+  "connections": "inhibitory"
+ },
+ "monitor": true,
+ "monitor_every": 10000,
+ "probe": {
+  "moves": 5000
+ },
+ "hidden_rule": "reservoir",
+ "csv_prefix": "hyb_chan_frozen_eprop"
+}

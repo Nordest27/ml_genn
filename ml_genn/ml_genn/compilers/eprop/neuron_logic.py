@@ -144,7 +144,8 @@ def _h_inv_code(y, eps):
     return f"copysign({root} * {root} - 1.0, {y})"
 
 
-def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglow=None, transform=None):
+def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglow=None, transform=None,
+                        centring=None):
     """TD error of the value (critic) head: E = gamma V_t + r_t - V_{t-1}, with the reward decaying by
     reward_decay per step. value_reg > 0 adds a smoothness regulariser value_reg * (V_t - V_{t-1})
     (ValReg, used by the value readout's update); 0 reproduces the original implementation.
@@ -158,6 +159,28 @@ def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglo
     model_copy.add_var("PrevVal", "scalar", 0.0)
     out = model_copy.output_var_name
     reg = f"ValReg = {value_reg!r} * ({out} - PrevVal);\n" if value_reg != 0 else ""
+    if centring:
+        # reward centring (continuing tasks): the TD error uses r - RhoBar, RhoBar a running estimate of the reward per
+        # step, so the value function only has to learn values relative to the average (no r / (1 - gamma) offset).
+        # mode "reward": RhoBar = running mean of the reward; "td": RhoBar += rate * TD error (it also absorbs the
+        # critic's mean error, so the broadcast TD error becomes ~zero-mean)
+        mode, rate = centring.get("mode", "reward"), float(centring.get("rate", 1e-4))
+        if mode not in ("reward", "td"):
+            raise ValueError(f"value centring mode must be 'reward' or 'td', not {mode!r}")
+        if transform is not None or afterglow:
+            raise ValueError("value centring cannot be combined with value_transform or value_afterglow")
+        model_copy.add_var("RhoBar", "scalar", 0.0)
+        pre = f"RhoBar = {1.0 - rate!r} * RhoBar + {rate!r} * reward;\n" if mode == "reward" else ""
+        post = f"RhoBar += {rate!r} * E;\n" if mode == "td" else ""
+        model_copy.append_sim_code(
+            f"""
+            {pre}E = {out} * {gamma} + (reward - RhoBar) - PrevVal; // TD error with the centred reward
+            {post}{reg}PrevVal = {out};
+            reward *= {reward_decay};
+            tdError = 0;
+            """
+        )
+        return
     if transform is not None:
         # "sqrt": the TD error is in transformed units everywhere (the broadcast is compressed too);
         # "sqrt_head": the readout learns from the transformed error, the network receives the TD error in the
@@ -231,7 +254,8 @@ def add_rl_output_head_code(model_copy, pop, compiler):
                entropy_coeff_min=compiler.entropy_coeff_min)
     else:
         add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay, compiler.value_reg,
-                            getattr(compiler, "value_afterglow", None), getattr(compiler, "value_transform", None))
+                            getattr(compiler, "value_afterglow", None), getattr(compiler, "value_transform", None),
+                            getattr(compiler, "value_centring", None))
 
 
 def add_supervised_error_code(model_copy):

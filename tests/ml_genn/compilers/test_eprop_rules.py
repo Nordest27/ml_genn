@@ -998,3 +998,115 @@ def test_eprop_center_td_centres_the_whole_update():
     assert "(reward - TdMean) * RLTrace" in syn and "RLValueTrace" not in syn
     assert "RLTrace = Lambda * RLTrace + eFiltered * (PG_post - 0.1 * VE_post);" in syn     # the combined trace
     assert "TdMean = " in m["post_dynamics_code"]
+
+
+def test_value_centring_tracks_the_average_reward(request):
+    """Reward centring: RhoBar follows the reward (mode reward) or absorbs the TD error (mode td), and the TD error
+    uses r - RhoBar; without the option the value head has no RhoBar."""
+    for mode in ("reward", "td"):
+        compiled, inp, hid, pol, val = _compile(EPropCompiler, f"{request.node.name}_{mode}", PolicyType.GENERIC,
+                                                hidden_rule="proposed", value_centring={"mode": mode, "rate": 0.01})
+        cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+        rho = []
+        with compiled:
+            cb.on_epoch_begin(0); cb.on_batch_begin(0)
+            compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+            vpop = compiled.neuron_populations[val]
+            for t in range(30 * K):
+                if t % K == K - 1:                               # a constant positive reward every decision
+                    vpop.vars["reward"].pull_from_device()
+                    compiled.losses[val].set_var(vpop, "reward", float(np.asarray(vpop.vars["reward"].view).ravel()[0]) + 1.0)
+                compiled.step_time(cb)
+                compiled.genn_model.custom_update("GradientLearn")
+            vpop.vars["RhoBar"].pull_from_device(); rho = float(np.asarray(vpop.vars["RhoBar"].view).ravel()[0])
+        assert rho > 0.01, mode                                  # the average reward was picked up
+    plain, _, _, _, pval = _compile(EPropCompiler, request.node.name + "_plain", PolicyType.GENERIC, hidden_rule="proposed")
+    assert "RhoBar" not in plain.neuron_populations[pval].vars
+
+
+def test_vreg_gradient_matches_the_hinge_derivative_on_a_smooth_alif():
+    """The formula: on an ALIF with a smooth spike, no reset and no recurrence, ZFilter and epsA are the exact
+    dV/dW and dA/dW, so p (zbar - b eps) - n (zbar + b eps) must equal the finite difference of the hinge loss."""
+    alpha, rho, beta, vth, steps = 0.9, 0.97, 0.5, 0.61, 400
+    x = np.random.default_rng(0).standard_normal((steps, 3)) * np.r_[1.0, 0.6, 0.3]
+    x[200:, 0] = -2.0                                  # adapt first, then far below the band
+    soft = lambda u: 1 / (1 + np.exp(-u / 0.1))
+
+    def run(w):
+        v = a = loss = 0.0; zbar, eps, grad = np.zeros(3), np.zeros(3), np.zeros(3)
+        for t in range(steps):
+            th = vth + beta * a
+            p, n = max(0.0, v - th), max(0.0, -v - th)
+            loss += 0.5 * (p * p + n * n)
+            grad += (p - n) * zbar - (p + n) * beta * eps
+            psi = soft(v - th) * (1 - soft(v - th)) / 0.1
+            eps = psi * zbar + (rho - psi * beta) * eps
+            a = rho * a + soft(v - th)
+            v = alpha * v + w @ x[t]
+            zbar = alpha * zbar + x[t]
+        return loss, grad
+
+    w, h = np.array([0.4, 0.3, 0.2]), 1e-6
+    fd = np.array([(run(w + h * e)[0] - run(w - h * e)[0]) / (2 * h) for e in np.eye(3)])
+    assert np.allclose(run(w)[1], fd, rtol=1e-6)
+
+
+def test_vreg_gradient_accumulates_the_formula_from_the_simulated_state(request):
+    """The code: DeltaG(c) - DeltaG(0), with the weights held fixed, equals c * sum_t [(p - n) ZFilter - (p + n) Beta
+    epsA] from the simulated V, A, ZFilter and epsA; saturated neurons get DeltaG > 0 (descent lowers their weights),
+    hyperpolarised ones DeltaG < 0. Half the neurons are driven above the band, half far below, and neuron 1 adapts
+    near threshold before it is driven below (so the Beta epsA term is tested on both sides)."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    assert "thV" not in build_td_hidden_model(PRESETS["eprop"], **kw)["model"]["synapse_dynamics_code"]
+    c, steps = 1.0, 300
+
+    def run(cv, name):
+        compiled, inp, hid, pol, val = _compile(EPropCompiler, name, PolicyType.GENERIC,
+                                                hidden_rule={"preset": "eprop", "vreg_gradient": cv})
+        cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled,
+                          num_batches=1, num_epochs=1)
+        rec = {"V": [], "A": [], "zf": {}, "eps": {}, "dg": {}}
+        with compiled:
+            cb.on_epoch_begin(0); cb.on_batch_begin(0)
+            compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+            hpop = compiled.neuron_populations[hid]
+            sgs = {("input" if k.source() is inp else "recurrent"): sg
+                   for k, sg in compiled.connection_populations.items() if k.target() is hid and not k.is_feedback}
+
+            def set_inputs(col1):
+                sg = sgs["input"]; sg.vars["g"].pull_from_device()
+                g = sg.vars["g"].values.reshape(N_IN, N_HID)
+                g[:, ::2], g[:, 1::2], g[:, 1] = 0.6, -0.6, col1
+                sg.vars["g"].values = g.ravel(); sg.vars["g"].push_to_device()
+            set_inputs(0.12)
+            for t in range(steps):
+                if t == steps // 2:
+                    set_inputs(-0.6)
+                for v in ("V", "A", "Beta"):
+                    hpop.vars[v].pull_from_device()
+                rec["V"].append(hpop.vars["V"].view.ravel().copy()); rec["A"].append(hpop.vars["A"].view.ravel().copy())
+                for key, sg in sgs.items():   # the operands of this step's synapse update
+                    sg.pre_vars["ZFilter"].pull_from_device(); sg.vars["epsilonA"].pull_from_device()
+                    rec["zf"].setdefault(key, []).append(sg.pre_vars["ZFilter"].view.ravel().copy())
+                    rec["eps"].setdefault(key, []).append(sg.vars["epsilonA"].values.reshape(-1, N_HID).copy())
+                compiled.step_time(cb)       # no GradientLearn: DeltaG accumulates, the weights stay fixed
+                for key, sg in sgs.items():
+                    sg.vars["DeltaG"].pull_from_device()
+                    rec["dg"].setdefault(key, []).append(sg.vars["DeltaG"].values.reshape(-1, N_HID).copy())
+            rec["beta"] = hpop.vars["Beta"].view.ravel().copy()
+        return {k: (np.array(v) if isinstance(v, list) else v if not isinstance(v, dict)
+                    else {kk: np.array(vv) for kk, vv in v.items()}) for k, v in rec.items()}
+
+    on, off = run(c, request.node.name + "_on"), run(0.0, request.node.name + "_off")
+    assert np.array_equal(on["V"], off["V"])
+    th = 0.61 + on["beta"] * on["A"]
+    p, n = np.maximum(0.0, on["V"] - th), np.maximum(0.0, -on["V"] - th)
+    assert (p > 0).sum() > 0 and (n > 0).sum() > 0
+    assert np.abs(on["eps"]["input"][n[:, 1] > 0][:, :, 1]).max() > 1e-2
+    for key in ("input", "recurrent"):
+        diff = on["dg"][key] - off["dg"][key]
+        expected = np.cumsum(c * ((p - n)[:, None] * on["zf"][key][:, :, None]
+                                  - (p + n)[:, None] * on["beta"] * on["eps"][key]), 0)
+        assert np.allclose(diff, expected, rtol=1e-4, atol=1e-5 * np.abs(diff).max())
+    final = (on["dg"]["input"] - off["dg"]["input"])[-1]
+    assert np.all(final[:, 2::2] > 0) and np.all(final[:, 3::2] < 0)

@@ -243,6 +243,10 @@ class HiddenRuleConfig:
                                      # of the downstream hidden neurons' gradient scores through the forward weights
     local: Optional[LocalObjectives] = None
     fire_rate_gradient: bool = True  # e-prop-style firing-rate regulariser c_reg (F - F*) eFiltered
+    vreg_gradient: float = 0.0       # e-prop-style voltage regulariser (gradient, not noise-credited): the derivative of
+                                     # the squared hinge 1/2 [max(0, V - th)^2 + max(0, -V - th)^2], th = Vthresh +
+                                     # Beta A (dV/dW = ZFilter, dA/dW = epsA): pulls saturated neurons' input
+                                     # weights down and strongly hyperpolarised ones' up
     kappa: bool = True               # multiply the score by 1 - Alpha^2
     log_syn_sigma: float = 0.0       # initial LogSynSig; SynSig = exp(LogSynSig - 5) (weight noise)
     psibar_decay: float = 0.99

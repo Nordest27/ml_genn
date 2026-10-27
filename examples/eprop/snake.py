@@ -48,8 +48,9 @@ import csv
 #     (modular compiler; see ml_genn.compilers.eprop.neuron_logic.add_value_head_code)
 # value_transform: None or "sqrt" - compressive value transform in the value head (modular compiler; the logged
 #     values are then in transformed units, h(V))
+# reward_centring: None or {"mode": "reward" | "td", "rate": r} - reward centring in the value head (modular compiler)
 SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None,
-                        "value_transform": None}
+                        "value_transform": None, "reward_centring": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -658,7 +659,7 @@ def build_compiled_network(connectivity_type="fixed"):
     dale_l1_reg = 0
     print("L1 reg strength:", dale_l1_reg)
     if HP["hidden_rule"] is None:
-        if HP["value_afterglow"] is not None or HP["value_transform"] is not None:
+        if HP["value_afterglow"] is not None or HP["value_transform"] is not None or HP["reward_centring"] is not None:
             raise ValueError("value_afterglow / value_transform need the modular compiler (set hidden_rule)")
         compiler_cls, rule_kwargs = EPropCompiler, {}
     else:
@@ -671,6 +672,8 @@ def build_compiled_network(connectivity_type="fixed"):
             rule_kwargs["value_afterglow"] = HP["value_afterglow"]
         if HP["value_transform"] is not None:
             rule_kwargs["value_transform"] = HP["value_transform"]
+        if HP["reward_centring"] is not None:
+            rule_kwargs["value_centring"] = HP["reward_centring"]
         if HP["dale"] is not None:
             rule_kwargs["dale_local_rewiring"] = bool(HP["dale"].get("local", True))
             which = HP["dale"].get("connections", "all")         # which connections keep their sign
@@ -749,6 +752,15 @@ compiled_net, network, input_pop, hidden_layers, policy, value, built = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
 
 RELAY_POP = built.reward_relay
+
+
+def rho_bar_now():
+    """The value head's average-reward estimate under reward centring (0 without it)."""
+    vpop = compiled_net.neuron_populations[value]
+    if "RhoBar" not in vpop.vars:
+        return 0.0
+    vpop.vars["RhoBar"].pull_from_device()
+    return float(np.asarray(vpop.vars["RhoBar"].view).ravel()[0])
 
 
 def relay_reward_context():
@@ -1243,7 +1255,9 @@ with open(CSV_OUTPUT, "w", newline="") as f:
         "reward_rate",
         "voltage",
         "voltage_loss",
-        "frequency"
+        "frequency",
+        "avg_td_error",          # signed mean TD error of the game (a biased critic shows here)
+        "rho_bar"                # reward centring: the running average-reward estimate (0 without centring)
     ])
 
 TRACE_LOG_PATH = f"outputs/complete_value_traces/{CSV_PREFIX}({REPETITION}).csv"
@@ -1408,6 +1422,7 @@ def train_snake_agent_with_ipc(episodes=10000,
             env.wait_count = WAIT_INC
             reward_trace = 0
             td_error_sum_abs = 0
+            td_error_sum = 0.0
 
             while not done:
                 gamma_disc_reward *= gamma
@@ -1652,6 +1667,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                  
                 compiled_net.neuron_populations[value].vars["E"].pull_from_device() 
                 td_error_sum_abs += abs(compiled_net.neuron_populations[value].vars["E"].view[0])
+                td_error_sum += float(compiled_net.neuron_populations[value].vars["E"].view[0])
                 abs_td_sum = abs_td_decay * abs_td_sum + abs(compiled_net.neuron_populations[value].vars["E"].view[0])
                 abs_td_weight = abs_td_decay * abs_td_weight + 1.0
                 ep_frames += 1
@@ -1786,7 +1802,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                     WAIT_INC * total_reward / ep_frames,
                     v_avg,
                     v_reg_loss_avg,
-                    freq_avg
+                    freq_avg,
+                    td_error_sum / ep_frames,
+                    rho_bar_now()
                 ])
             
             # Send metrics for plotting
