@@ -23,7 +23,7 @@ from ml_genn.connectivity import Dense, FixedProbability, Conv2D, ToroidalGaussi
 from ml_genn.initializers import Normal
 from ml_genn.neurons import LeakyIntegrate, LeakyIntegrateFire, AdaptiveLeakyIntegrateFire, PoissonInput
 from ml_genn.serialisers import Numpy
-from ml_genn.optimisers import Adam, AsyncLocalAdam, CAdam, AdaBelief
+from ml_genn.optimisers import Adam, AsyncLocalAdam, CAdam, AdaBelief, SGD
 from scipy.ndimage import gaussian_filter
 
 from ml_genn.compilers.eprop_compiler import default_params
@@ -49,8 +49,13 @@ import csv
 # value_transform: None or "sqrt" - compressive value transform in the value head (modular compiler; the logged
 #     values are then in transformed units, h(V))
 # reward_centring: None or {"mode": "reward" | "td", "rate": r} - reward centring in the value head (modular compiler)
+# optimiser_betas: None (each optimiser's defaults: adam 0.9/0.999, adabelief 0.99/0.99999, sgd momentum 0.99) or
+#     [beta1, beta2] ([beta1] for sgd)
+# l2_init: None (the defaults: 1e-5 for adabelief, off for adam and sgd) or the strength of the pull towards the
+#     initial weights (0 turns it off)
 SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None,
-                        "value_transform": None, "reward_centring": None}
+                        "value_transform": None, "reward_centring": None,
+                        "optimiser_betas": None, "l2_init": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -697,10 +702,17 @@ def build_compiled_network(connectivity_type="fixed"):
             rule_kwargs.setdefault("plastic_inhibition", {}).update(
                 {c: HP["plastic_inhibition_i"] for k, c in enumerate(built.inhibitory_to_i, 1)
                  if layers is None or k in layers})
+    betas = HP["optimiser_betas"]
+    l2 = HP["l2_init"] or None                       # 0 -> off
     if HP["optimiser"] == "adam":
-        optimiser = Adam(HP["lr"], beta1=0.9, beta2=0.999)
+        b1, b2 = betas if betas is not None else (0.9, 0.999)
+        optimiser = Adam(HP["lr"], beta1=b1, beta2=b2, l2_init_strength=l2)
+    elif HP["optimiser"] == "sgd":                   # SGD with momentum (for factor-normalised rules)
+        optimiser = SGD(HP["lr"], beta1=betas[0] if betas is not None else 0.99, l2_init_strength=l2)
     else:
-        optimiser = AdaBelief(HP["lr"], beta1=0.99, beta2=0.99999, l2_init_strength=1e-5)
+        b1, b2 = betas if betas is not None else (0.99, 0.99999)
+        optimiser = AdaBelief(HP["lr"], beta1=b1, beta2=b2,
+                              l2_init_strength=1e-5 if HP["l2_init"] is None else l2)
     compiler = compiler_cls(
         **rule_kwargs,
         f_target=HP["f_target"],

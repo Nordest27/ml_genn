@@ -200,6 +200,23 @@ def plastic_inhibition_from(value):
 
 
 @dataclass(frozen=True)
+class FactorNorm:
+    """Normalise each factor of the update by its own running RMS, kept where the factor lives (all local):
+    td (the TD error: a running RMS per postsynaptic neuron of the broadcast signal), post (the postsynaptic
+    neuron's psi: its closeness to threshold), pre (the presynaptic trace ZFilter, from the presynaptic neuron's
+    firing) and noise (the synapse's normalised noise trace, which also depends on the presynaptic firing).
+    The TD terms use all four, the local-objective terms post, pre and noise, the firing-rate gradient post and
+    pre, the voltage-regulariser gradient pre. Meant for an optimiser without its own per-weight normalisation
+    (SGD with momentum). The running means are bias-corrected (they start at t = 0)."""
+    td: bool = True
+    post: bool = True
+    pre: bool = True
+    noise: bool = True
+    decay: float = 0.9999            # per step (~10 s at dt = 1 ms)
+    floor: float = 1e-3              # added in quadrature to each RMS (bounds the gain of near-silent factors)
+
+
+@dataclass(frozen=True)
 class HiddenRuleConfig:
     """Hidden-layer rule of the RL / TD(lambda) variant. Zero coefficients remove their terms."""
     noise: NoisePlacement = NoisePlacement.WEIGHT_SHARED
@@ -247,6 +264,7 @@ class HiddenRuleConfig:
                                      # the squared hinge 1/2 [max(0, V - th)^2 + max(0, -V - th)^2], th = Vthresh +
                                      # Beta A (dV/dW = ZFilter, dA/dW = epsA): pulls saturated neurons' input
                                      # weights down and strongly hyperpolarised ones' up
+    factor_norm: Optional[FactorNorm] = None   # normalise every factor of the update locally (see FactorNorm)
     kappa: bool = True               # multiply the score by 1 - Alpha^2
     log_syn_sigma: float = 0.0       # initial LogSynSig; SynSig = exp(LogSynSig - 5) (weight noise)
     psibar_decay: float = 0.99
@@ -272,6 +290,10 @@ class HiddenRuleConfig:
                              "estimator=TRACE")
         if self.center_drift and self.drift == 0:
             raise ValueError("center_drift needs drift != 0")
+        if self.factor_norm is not None and (self.eprop != 0 or self.backprop != 0 or self.diagnose_gradients
+                                             or self.estimator is Estimator.EXACT):
+            raise ValueError("factor_norm is implemented for the perturbation rule (trace estimator, no e-prop, "
+                             "backprop or gradient diagnostics)")
 
 
 PRESETS = {
@@ -380,6 +402,10 @@ def hidden_rule_from_dict(d: dict) -> HiddenRuleConfig:
     kw = _from_plain(HiddenRuleConfig, d)
     if isinstance(kw.get("local"), dict):
         kw["local"] = LocalObjectives(**_from_plain(LocalObjectives, kw["local"]))
+    if kw.get("factor_norm") is True:
+        kw["factor_norm"] = FactorNorm()
+    elif isinstance(kw.get("factor_norm"), dict):
+        kw["factor_norm"] = FactorNorm(**_from_plain(FactorNorm, kw["factor_norm"]))
     return replace(base, **kw)
 
 
@@ -389,6 +415,8 @@ def hidden_rule_to_dict(rule: HiddenRuleConfig) -> dict:
     out = {k: plain(getattr(rule, k)) for k in rule.__dataclass_fields__}
     if rule.local is not None:
         out["local"] = {k: plain(getattr(rule.local, k)) for k in rule.local.__dataclass_fields__}
+    if rule.factor_norm is not None:
+        out["factor_norm"] = {k: getattr(rule.factor_norm, k) for k in rule.factor_norm.__dataclass_fields__}
     return out
 
 

@@ -17,11 +17,11 @@ from ml_genn import Connection, Network, Population
 from ml_genn.connectivity import Dense, FixedProbability
 from ml_genn.initializers import Normal
 from ml_genn.neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrate, PoissonInput
-from ml_genn.optimisers import AdaBelief
+from ml_genn.optimisers import AdaBelief, SGD
 from ml_genn.utils.callback_list import CallbackList
 
 from ml_genn.compilers.eprop import (EPropCompiler, PRESETS, PolicyType, HiddenRuleConfig,
-                                     NoisePlacement, build_td_hidden_model, default_params)
+                                     NoisePlacement, FactorNorm, hidden_rule_from_dict, build_td_hidden_model, default_params)
 
 BACKEND = os.environ.get("MLGENN_TEST_BACKEND", "single_threaded_cpu")
 K = 10                       # simulation steps per action
@@ -52,9 +52,10 @@ def _network(seed=0):
 def _compile(compiler_cls, name, policy_type, **kw):
     net, inp, hid, pol, val = _network()
     gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    optimiser = kw.pop("optimiser", None) or AdaBelief(1e-3, beta1=0.99, beta2=0.99999)
     compiler = compiler_cls(
         example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
-        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        optimiser=optimiser, c_reg=1e-4, batch_size=1,
         feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
         train_output_bias=False, reset_time_between_batches=False,
         entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
@@ -1110,3 +1111,97 @@ def test_vreg_gradient_accumulates_the_formula_from_the_simulated_state(request)
         assert np.allclose(diff, expected, rtol=1e-4, atol=1e-5 * np.abs(diff).max())
     final = (on["dg"]["input"] - off["dg"]["input"])[-1]
     assert np.all(final[:, 2::2] > 0) and np.all(final[:, 3::2] < 0)
+
+
+def test_sgd_first_step_is_learning_rate_times_gradient(request):
+    """SGD with momentum: bias-corrected running mean, so the first step is exactly -lr * gradient."""
+    lr = 1e-3
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, optimiser=SGD(lr, beta1=0.9))
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        sgs = [sg for c, sg in compiled.connection_populations.items() if c.target() is hid and not c.is_feedback]
+        for t in range(40):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0)
+            compiled.step_time(cb)
+        before = []
+        for sg in sgs:
+            for v in ("g", "DeltaG"):
+                sg.vars[v].pull_from_device()
+            before.append((sg.vars["g"].values.copy(), sg.vars["DeltaG"].values.copy()))
+        compiled.genn_model.custom_update("GradientLearn")
+        for sg, (g0, dg) in zip(sgs, before):
+            sg.vars["g"].pull_from_device()
+            assert np.abs(dg).max() > 0
+            assert np.allclose(sg.vars["g"].values, g0 - lr * dg, rtol=1e-4, atol=1e-7)
+
+
+def test_factor_norm_from_dict_and_validation():
+    assert hidden_rule_from_dict({"preset": "proposed", "factor_norm": True}).factor_norm == FactorNorm()
+    r = hidden_rule_from_dict({"preset": "proposed", "factor_norm": {"pre": False, "floor": 0.01}})
+    assert r.factor_norm == FactorNorm(pre=False, floor=0.01)
+    with pytest.raises(ValueError):
+        hidden_rule_from_dict({"preset": "eprop_plus_proposed", "factor_norm": True})
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    m = build_td_hidden_model(replace(PRESETS["proposed"], factor_norm=FactorNorm(td=False)), **kw)
+    code = m["model"]["synapse_dynamics_code"]
+    assert "const scalar FnTd = 1.0;" in code and "XiSq" in code and "PsiSq" in code and "ZSq" in code
+    assert ("ZSq", "scalar") in m["model"]["pre_vars"] and "TdSq" not in m["post_var_vals"]
+    assert "ZSq" not in build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["pre_dynamics_code"]
+
+
+def test_factor_norm_divides_the_update_by_each_factors_running_rms(request):
+    """With the weights held fixed, the normalised rule's DeltaG grows by the plain rule's increment times
+    FnTd * FnPost * FnPre * FnXi, each computed from the running mean squares the network keeps (TD term only)."""
+    fn = FactorNorm(decay=0.999, floor=1e-3)
+    steps, skip = 3000, 1500                  # bias corrections at consecutive steps agree to <1e-3 after ~1500
+
+    def run(norm, name):
+        rule = {"preset": "proposed", "fire_rate_gradient": False}
+        if norm:
+            rule["factor_norm"] = {"decay": fn.decay, "floor": fn.floor}
+        compiled, inp, hid, pol, val = _compile(EPropCompiler, name, PolicyType.GENERIC, hidden_rule=rule)
+        cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1,
+                          num_epochs=1)
+        rec = {"dg": [], "td": [], "psi": [], "z": [], "xi": []}
+        with compiled:
+            cb.on_epoch_begin(0); cb.on_batch_begin(0)
+            compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+            sg = next(sg for c, sg in compiled.connection_populations.items()
+                      if c.target() is hid and c.source() is inp and not c.is_feedback)
+            for t in range(steps):
+                if t % K == K - 1:
+                    p = compiled.neuron_populations[pol]
+                    p.vars["pre_PG"].view[:] = np.array([0.3, -0.7, 0.2, 0.2], np.float32)
+                    p.push_var_to_device("pre_PG")
+                    compiled.losses[val].set_var(compiled.neuron_populations[val], "reward",
+                                                 1.0 if (t // K) % 2 == 0 else -1.0)
+                if norm:                          # the running statistics this step's synapse update reads
+                    for v, key in (("TdSq", "td"), ("PsiSq", "psi")):
+                        sg.post_vars[v].pull_from_device(); rec[key].append(sg.post_vars[v].view.ravel().copy())
+                    sg.pre_vars["ZSq"].pull_from_device(); rec["z"].append(sg.pre_vars["ZSq"].view.ravel().copy())
+                compiled.step_time(cb)
+                sg.vars["DeltaG"].pull_from_device()
+                rec["dg"].append(sg.vars["DeltaG"].values.reshape(N_IN, N_HID).copy())
+                if norm:                          # updated inside the synapse update, before use
+                    sg.vars["XiSq"].pull_from_device()
+                    rec["xi"].append(sg.vars["XiSq"].values.reshape(N_IN, N_HID).copy())
+        return {k: np.array(v) for k, v in rec.items()}
+
+    on, off = run(True, request.node.name + "_on"), run(False, request.node.name + "_off")
+    inc_on, inc_off = np.diff(on["dg"], axis=0), np.diff(off["dg"], axis=0)       # increment of step t (t >= 1)
+    tt = np.arange(1, steps)[:, None, None]
+    bias = 1.0 - fn.decay ** (tt + 1.0)
+    rms = lambda x: 1.0 / np.sqrt(x / bias + fn.floor ** 2)
+    norm = (rms(on["td"][1:, None, :]) * rms(on["psi"][1:, None, :]) * rms(on["z"][1:, :, None])
+            * rms(on["xi"][1:]))
+    sel = slice(skip, None)
+    assert np.abs(inc_off[sel]).max() > 0
+    # relative to the largest increment: increments are differences of a float32 running sum
+    err = np.abs(inc_on[sel] - norm[sel] * inc_off[sel]).max() / np.abs(inc_on[sel]).max()
+    assert err < 2e-4
+    # and the normalisation does something: the per-synapse gains differ by more than the tolerance
+    assert norm[sel].max() / norm[sel].min() > 2.0

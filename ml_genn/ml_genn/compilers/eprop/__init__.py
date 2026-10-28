@@ -13,6 +13,7 @@ from .variants import (
     receives_eprop_signal,
     rule_for_population,
     LocalObjectives,
+    FactorNorm,
     HiddenRuleConfig,
     PlasticInhibitionConfig,
     plastic_inhibition_from,
@@ -27,7 +28,7 @@ __all__ = [
     "EPropCompiler", "CompileState", "default_params",
     "FeedbackType", "HiddenRule", "OutputRule", "FeedbackRule", "PolicyType",
     "NoisePlacement", "Estimator", "LocalRoute", "DVMode", "EpropScope",
-    "receives_eprop_signal", "rule_for_population", "LocalObjectives",
+    "receives_eprop_signal", "rule_for_population", "LocalObjectives", "FactorNorm",
     "HiddenRuleConfig", "PlasticInhibitionConfig", "plastic_inhibition_from", "PRESETS", "get_hidden_rule", "hidden_rule_from_dict",
     "hidden_rule_to_dict", "build_td_hidden_model",
 ]

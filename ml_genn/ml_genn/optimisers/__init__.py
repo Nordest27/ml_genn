@@ -6,10 +6,11 @@ from .adam import Adam
 from .cadam import CAdam
 from .ada_belief import AdaBelief
 from .adam_acc import AsyncLocalAdam
+from .sgd import SGD
 from .optimiser import Optimiser
 
 from ..utils.module import get_module_classes
 
 default_optimisers = get_module_classes(globals(), Optimiser)
 
-__all__ = ["Adam", "CAdam", "AdaBelief", "AsyncLocalAdam", "Optimiser", "default_optimisers"]
+__all__ = ["Adam", "CAdam", "AdaBelief", "AsyncLocalAdam", "SGD", "Optimiser", "default_optimisers"]

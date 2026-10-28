@@ -106,6 +106,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     use_backprop = cfg.backprop != 0
     send_back = send_back and use_backprop
     use_efiltered = cfg.fire_rate_gradient or use_eprop or use_backprop
+    fn = cfg.factor_norm
+    fn_td, fn_post, fn_pre = (fn is not None and fn.td), (fn is not None and fn.post), (fn is not None and fn.pre)
 
     # --- normalised noise trace and the two scores -------------------------------------------------
     kappa = "(1.0 - Alpha * Alpha) * " if cfg.kappa else ""
@@ -125,6 +127,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     else:
         g_score = None
     p_score = f"(Psi - PsiBar) * {pre} * normXi" if norm_xi is not None else None
+    fn_noise = fn is not None and fn.noise and norm_xi is not None
 
     # --- model pieces ----------------------------------------------------------------------------
     params = [("CReg", "scalar"), ("Alpha", "scalar"), ("Rho", "scalar"), ("FTarget", "scalar"),
@@ -150,7 +153,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     for name, used in (("RLNoiseTrace", use_combined), ("RLNoisePtrace", use_P),
                        ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop),
                        ("RLValueTrace", use_eprop and cfg.eprop_center_value),
-                       ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag)):
+                       ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag),
+                       ("XiSq", fn_noise)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
 
@@ -162,7 +166,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("TdMean", cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
                        ("AbsTd", use_abs_td),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
-                       ("ZDec", use_decorr), ("ZDecMean", use_decorr)):
+                       ("ZDec", use_decorr), ("ZDecMean", use_decorr), ("TdSq", fn_td), ("PsiSq", fn_post)):
         if used:
             post_vars.append((name, "scalar")); post_var_vals[name] = 0.0
 
@@ -201,6 +205,10 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
 else {
     Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
 }""")
+    if fn_post:   # factor normalisation: running mean square of each factor where it lives
+        post_dyn.append(f"PsiSq = {_f(fn.decay)} * PsiSq + {_f(1 - fn.decay)} * Psi * Psi;")
+    if fn_td:
+        post_dyn.append(f"TdSq = {_f(fn.decay)} * TdSq + {_f(1 - fn.decay)} * (TdE_post + PRew_post) * (TdE_post + PRew_post);")
     if uses_psibar:
         post_dyn.append(f"PsiBar = {_f(cfg.psibar_decay)} * PsiBar + {_f(1 - cfg.psibar_decay)} * Psi;")
         if cfg.homeostat != 0 and cfg.psi_target_warmup is not None:
@@ -260,6 +268,8 @@ else {
         syn.append("SynSig = exp(LogSynSig - 5.0);")
     if norm_xi is not None:
         syn.append(f"const scalar normXi = {norm_xi};")
+    if fn_noise:
+        syn.append(f"XiSq = {_f(fn.decay)} * XiSq + {_f(1 - fn.decay)} * normXi * normXi;")
     if exact:
         syn.append("const scalar freshEps = FreshEps;\nFreshEps = 0.0;")
     dg = []
@@ -288,6 +298,7 @@ else {
         if cfg.homeostat_floor:   # one-sided: only neurons below the target are pushed (up)
             deviation = f"fmin({deviation}, 0.0)"
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
+    n_td = len(dg)                                  # the TD terms (factor normalisation: all four factors)
     if use_eprop and cfg.eprop_center_td:         # both parts with delta - its mean (one combined trace)
         dg.append(_scaled(cfg.eprop, "(reward - TdMean) * RLTrace"))
     elif use_eprop and cfg.eprop_center_value:    # policy part with delta, critic part with delta - its mean
@@ -315,6 +326,15 @@ else {
         dg.append(f"(LocR - LocMean) * ({g_score})")
     elif route is LocalRoute.GRADIENT_TRACE:
         dg.append("(LocR - LocMean) * RLNoiseGtrace")
+    if fn is not None:
+        # each factor divided by its running RMS (bias-corrected: the means start at t = 0, dt = 1 ms) plus the floor
+        syn.append(f"const scalar fnBias = 1.0 - pow({_f(fn.decay)}, t + 1.0);")
+        fl2 = _f(fn.floor * fn.floor)
+        for name, var, used in (("FnTd", "TdSq", fn_td), ("FnPost", "PsiSq", fn_post), ("FnPre", "ZSq", fn_pre),
+                                ("FnXi", "XiSq", fn_noise)):
+            syn.append(f"const scalar {name} = " + (f"1.0 / sqrt({var} / fnBias + {fl2});" if used else "1.0;"))
+        dg = ([f"FnTd * FnPost * FnPre * FnXi * ({x})" for x in dg[:n_td]]
+              + [f"FnPost * FnPre * FnXi * ({x})" for x in dg[n_td:]])
     if dg:
         syn.append("DeltaG += " + "\n    + ".join(dg) + ";")
     if send_back:
@@ -326,13 +346,14 @@ else {
     if use_efiltered:
         syn.append("eFiltered = (eFiltered * Kappa) + e;")
     if cfg.fire_rate_gradient:
-        syn.append("DeltaG += CReg * (FAvg - FTarget) * eFiltered;")
+        syn.append("DeltaG += " + ("FnPost * FnPre * " if fn is not None else "") + "CReg * (FAvg - FTarget) * eFiltered;")
     if cfg.vreg_gradient != 0:
         # d/dW of 1/2 [max(0, V - th)^2 + max(0, -V - th)^2], th = Vthresh + Beta A, with dV/dW = ZFilter and
         # dA/dW = epsA: p (ZFilter - Beta epsA) - n (ZFilter + Beta epsA) (th rises with A on both sides)
         syn.append("const scalar thV = Vthresh_post + Beta_post * A_post;")
         syn.append("const scalar vregP = fmax(0.0, V_post - thV);\nconst scalar vregN = fmax(0.0, -V_post - thV);")
-        syn.append(f"DeltaG += {_f(cfg.vreg_gradient)} * ((vregP - vregN) * ZFilter - (vregP + vregN) * Beta_post * epsA);")
+        syn.append("DeltaG += " + ("FnPre * " if fn is not None else "")
+                   + f"{_f(cfg.vreg_gradient)} * ((vregP - vregN) * ZFilter - (vregP + vregN) * Beta_post * epsA);")
     if use_combined:
         # gate = drift * (Psi - PsiBar) - gradient * PsiBar = drift * Psi - (drift + gradient) * PsiBar
         terms = []
@@ -360,14 +381,18 @@ else {
     if weight_noise and not exact:
         syn.append("NoiseTrace *= Alpha;")
 
+    pre_vars, pre_var_vals, pre_dyn = [("ZFilter", "scalar")], {"ZFilter": 0.0}, "ZFilter *= Alpha;"
+    if fn_pre:
+        pre_vars.append(("ZSq", "scalar")); pre_var_vals["ZSq"] = 0.0
+        pre_dyn += f"\nZSq = {_f(fn.decay)} * ZSq + {_f(1 - fn.decay)} * ZFilter * ZFilter;"
     model = {
         "params": params,
         "vars": vars_,
-        "pre_vars": [("ZFilter", "scalar")],
+        "pre_vars": pre_vars,
         "post_vars": post_vars,
         "post_neuron_var_refs": [(k, "scalar") for k in post_refs],
         "pre_spike_code": "ZFilter += 1.0;",
-        "pre_dynamics_code": "ZFilter *= Alpha;",
+        "pre_dynamics_code": pre_dyn,
         "post_spike_code": "\n".join(post_spike),
         "post_dynamics_code": "\n".join(post_dyn),
         "pre_spike_syn_code": pre_spike_syn,
@@ -376,5 +401,5 @@ else {
     if pre_refs:
         model["pre_neuron_var_refs"] = [(k, "scalar") for k in pre_refs]
     return dict(model=model, param_vals=param_vals, var_vals=var_vals,
-                pre_var_vals={"ZFilter": 0.0}, post_var_vals=post_var_vals,
+                pre_var_vals=pre_var_vals, post_var_vals=post_var_vals,
                 pre_neuron_var_refs=pre_refs, post_neuron_var_refs=post_refs)
