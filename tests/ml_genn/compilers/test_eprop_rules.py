@@ -8,6 +8,7 @@
 Backend: GeNN's single-threaded CPU backend by default (set MLGENN_TEST_BACKEND to override).
 """
 import os
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -1137,6 +1138,291 @@ def test_sgd_first_step_is_learning_rate_times_gradient(request):
             sg.vars["g"].pull_from_device()
             assert np.abs(dg).max() > 0
             assert np.allclose(sg.vars["g"].values, g0 - lr * dg, rtol=1e-4, atol=1e-7)
+
+
+def test_readout_optimiser_updates_the_readout_and_the_main_optimiser_the_hidden_layer(request):
+    """readout_optimiser: the readout weights use their own optimiser (and learning rate), the hidden weights the main one."""
+    lr, lr_out = 1e-3, 5e-2
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, optimiser=SGD(lr, beta1=0.9),
+                                            readout_optimiser=SGD(lr_out, beta1=0.9))
+    assert len(compiled.optimisers) == 2
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        groups = {(lr if c.target() is hid else lr_out): sg for c, sg in compiled.connection_populations.items()
+                  if not c.is_feedback and c.target() in (hid, val)}
+        for t in range(40):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0)
+            compiled.step_time(cb)
+        before = {}
+        for rate, sg in groups.items():
+            for v in ("g", "DeltaG"):
+                sg.vars[v].pull_from_device()
+            before[rate] = (sg.vars["g"].values.copy(), sg.vars["DeltaG"].values.copy())
+        compiled.genn_model.custom_update("GradientLearn")
+        for rate, sg in groups.items():
+            g0, dg = before[rate]
+            sg.vars["g"].pull_from_device()
+            assert np.abs(dg).max() > 0
+            assert np.allclose(sg.vars["g"].values, g0 - rate * dg, rtol=1e-4, atol=1e-7)
+
+
+def test_score_adaptation_off_uses_zfilter_alone_in_the_noise_scores():
+    from ml_genn.compilers.eprop import hidden_rule_to_dict
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    rule = hidden_rule_from_dict({"preset": "proposed", "score_adaptation": False, "vreg_gradient": 1.0})
+    assert not rule.score_adaptation and hidden_rule_to_dict(rule)["score_adaptation"] is False
+    off = build_td_hidden_model(rule, **kw)["model"]["synapse_dynamics_code"]
+    on = build_td_hidden_model(replace(rule, score_adaptation=True), **kw)["model"]["synapse_dynamics_code"]
+    assert "(ZFilter - Beta_post * epsA) * normXi" in on
+    assert "(ZFilter - Beta_post * epsA) * normXi" not in off and "ZFilter * normXi" in off
+    # the regularisers keep the adaptation term
+    assert "epsilonA = Psi * ZFilter" in off and "Beta_post * epsA);" in off
+    grad = build_td_hidden_model(replace(rule, score_adaptation="gradient"), **kw)["model"]["synapse_dynamics_code"]
+    assert ("RLNoiseTrace = Lambda * RLNoiseTrace + (((Psi - PsiBar) * ZFilter) - 1.0 * PsiBar * "
+            "(ZFilter - Beta_post * epsA)) * normXi;") in grad
+    drift = build_td_hidden_model(replace(rule, score_adaptation="drift"), **kw)["model"]["synapse_dynamics_code"]
+    assert ("(((Psi - PsiBar) * (ZFilter - Beta_post * epsA)) - 1.0 * PsiBar * ZFilter) * normXi;") in drift
+    with pytest.raises(ValueError):
+        replace(rule, score_adaptation="both")
+
+
+def test_noise_proxy_reads_the_voltage_not_the_noise():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    m = build_td_hidden_model(hidden_rule_from_dict({"preset": "proposed", "noise_proxy": True}), **kw)["model"]
+    assert "NoiseTrace += eps" not in m["pre_spike_syn_code"] and "addToPost(g + eps)" in m["pre_spike_syn_code"]
+    assert "NoiseTrace += ProxyFlag1 * SynSig * (ProxyDev - g) * ProxyInv;" in m["synapse_dynamics_code"]
+    assert "Noise1" not in m["synapse_dynamics_code"]
+    with pytest.raises(ValueError):
+        hidden_rule_from_dict({"preset": "node_proposed", "noise_proxy": True})
+    quiet = build_td_hidden_model(hidden_rule_from_dict({"preset": "proposed", "noise_proxy": True,
+                                                         "inject_noise": False}), **kw)["model"]
+    assert "addToPost(g);" in quiet["pre_spike_syn_code"] and "ProxyFlag1 = 1.0;" in quiet["pre_spike_syn_code"]
+    with pytest.raises(ValueError):
+        hidden_rule_from_dict({"preset": "proposed", "inject_noise": False})
+
+
+def test_eprop_broadcast_uses_the_td_error_without_feedback():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    code = build_td_hidden_model(hidden_rule_from_dict({"preset": "eprop", "eprop_broadcast": True}),
+                                 **kw)["model"]["synapse_dynamics_code"]
+    assert "RLTrace = Lambda * RLTrace + eFiltered;" in code and "reward * RLTrace" in code and "PG_post" not in code
+    with pytest.raises(ValueError):
+        hidden_rule_from_dict({"preset": "proposed", "eprop_broadcast": True})
+
+
+def test_revive_pushes_inputs_of_neurons_below_the_psi_range_on_negative_td_error():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    m = build_td_hidden_model(hidden_rule_from_dict({"preset": "proposed", "revive": 0.5}), **kw)["model"]
+    syn, post = m["synapse_dynamics_code"], m["post_dynamics_code"]
+    assert "- 0.5 * fmax(0.0, -reward) * ReviveTrace" in syn
+    assert "ReviveTrace = Lambda * ReviveTrace + DeadDist * ZFilter;" in syn
+    # the update term reads the trace before it is updated this step
+    assert syn.index("fmax(0.0, -reward) * ReviveTrace") < syn.index("ReviveTrace = Lambda")
+    assert "fmax(0.0, Beta_post * A_post - V_post) / Vthresh_post" in post
+    assert "fmax(0.0, V_post - (2.0 * Vthresh_post + Beta_post * A_post)) / Vthresh_post" in post
+    assert "ReviveTrace" not in build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["synapse_dynamics_code"]
+
+
+def test_activity_rewiring_relocates_presynaptic_partners_and_preserves_fan_in(request):
+    """Low co-activity synapses get a new presynaptic neuron for the same postsynaptic neuron: fan-in and the
+    total synapse count are unchanged, the planned pairs exist and start tiny, the removed pairs are gone."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples", "eprop"))
+    from activity_rewiring import ActivityRewirer
+    rng = np.random.default_rng(0)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        hid = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0,
+                                                    tau_adapt=300.0), N_HID)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, hid, FixedProbability(0.5, Normal(mean=0.15, sd=0.05)))
+        Connection(hid, hid, FixedProbability(0.3, Normal(mean=0.0, sd=0.05)))
+        Connection(hid, pol, Dense(Normal(mean=0.0, sd=0.5)))
+        Connection(hid, val, Dense(Normal(mean=0.0, sd=0.5)))
+        Connection(hid, pol, Dense(Normal(mean=0.0, sd=0.5)), feedback_name="policy_feedback")
+        Connection(hid, val, Dense(Normal(mean=0.0, sd=0.5)), feedback_name="value_feedback")
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        Connection(hid, val, Dense(weight=1.0), feedback_name="tde_transport")
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False,
+        entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND,
+        hidden_rule={"preset": "proposed", "coactivity_decay": 0.9},
+        activity_rewiring={"max_add": 6, "headroom": 2.0})
+    compiled = compiler.compile(net, request.node.name)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        for t in range(60):
+            compiled.step_time(cb)
+        sgs = {c.source(): sg for c, sg in compiled.connection_populations.items()
+               if c.target() is hid and not c.is_feedback}
+
+        def pairs(sg):
+            sg.pull_connectivity_from_device()
+            return list(zip(np.asarray(sg.get_sparse_pre_inds()).tolist(), np.asarray(sg.get_sparse_post_inds()).tolist()))
+        before = {k: pairs(sg) for k, sg in sgs.items()}
+        rew = ActivityRewirer(compiled, min_age=10, rel_threshold=100.0, max_frac=0.2)
+        assert len(rew.groups) == 2
+        rows = rew()
+        assert sum(r[4] for r in rows) > 0
+        for k, sg in sgs.items():
+            after = pairs(sg)
+            assert len(after) == len(before[k])
+            fan_in = lambda ps: np.bincount([p for _, p in ps], minlength=N_HID)
+            assert np.array_equal(fan_in(after), fan_in(before[k]))
+            new, gone = set(after) - set(before[k]), set(before[k]) - set(after)
+            assert len(new) == len(gone) > 0
+            if k is hid:
+                assert all(i != j for i, j in new)          # no self-connections
+            sg.vars["g"].pull_from_device()
+            g = dict(zip(after, np.asarray(sg.vars["g"].values).tolist()))
+            assert all(abs(g[p]) < 1e-4 for p in new) and not np.isnan(list(g.values())).any()
+
+
+def test_activity_rewiring_new_synapses_start_from_the_row_mean_of_the_noise_statistic(request):
+    """Under factor normalisation a new synapse's XiSq starts from the mean over its presynaptic row (0 would
+    divide its noise factor by the floor alone)."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples", "eprop"))
+    from activity_rewiring import ActivityRewirer
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        hid = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0,
+                                                    tau_adapt=300.0), N_HID)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, hid, FixedProbability(0.5, Normal(mean=0.15, sd=0.05)))
+        Connection(hid, hid, FixedProbability(0.3, Normal(mean=0.0, sd=0.05)))
+        Connection(hid, pol, Dense(Normal(mean=0.0, sd=0.5)))
+        Connection(hid, val, Dense(Normal(mean=0.0, sd=0.5)))
+        Connection(hid, pol, Dense(Normal(mean=0.0, sd=0.5)), feedback_name="policy_feedback")
+        Connection(hid, val, Dense(Normal(mean=0.0, sd=0.5)), feedback_name="value_feedback")
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        Connection(hid, val, Dense(weight=1.0), feedback_name="tde_transport")
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=SGD(1e-4, beta1=0.9), readout_optimiser=SGD(1e-4, beta1=0.9), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=0.5 ** (1 / K), td_lambda=0.8 ** (1 / K),
+        train_output_bias=False, reset_time_between_batches=False,
+        entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND,
+        hidden_rule={"preset": "proposed", "coactivity_decay": 0.9, "factor_norm": True},
+        activity_rewiring={"max_add": 6, "headroom": 2.0})
+    compiled = compiler.compile(net, request.node.name)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        for t in range(80):
+            compiled.step_time(cb)
+        sg = next(s for c, s in compiled.connection_populations.items() if c.source() is inp and c.target() is hid)
+        sg.pull_connectivity_from_device(); sg.vars["XiSq"].pull_from_device()
+        before = set(zip(np.asarray(sg.get_sparse_pre_inds()).tolist(), np.asarray(sg.get_sparse_post_inds()).tolist()))
+        pre0 = np.asarray(sg.get_sparse_pre_inds()); xs0 = np.asarray(sg.vars["XiSq"].values)
+        ActivityRewirer(compiled, min_age=10, rel_threshold=100.0, max_frac=0.2)()
+        sg.pull_connectivity_from_device(); sg.vars["XiSq"].pull_from_device()
+        pre, post = np.asarray(sg.get_sparse_pre_inds()), np.asarray(sg.get_sparse_post_inds())
+        xs = np.asarray(sg.vars["XiSq"].values)
+        new = [k for k, p in enumerate(zip(pre.tolist(), post.tolist())) if p not in before]
+        assert len(new) > 0
+        for k in new:
+            row = [x for kk, x in enumerate(xs) if pre[kk] == pre[k] and kk not in new]
+            assert xs[k] > 0 and np.isclose(xs[k], np.mean(row), rtol=1e-4)
+
+
+def _black_box_network(neuron):
+    rng = np.random.default_rng(0)
+    w = lambda shape, mean, sd: (mean + sd * rng.standard_normal(shape)).astype(np.float32)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        hid = Population(neuron, N_HID)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, hid, Dense(w((N_IN, N_HID), 0.15, 0.05)))
+        Connection(hid, hid, Dense(w((N_HID, N_HID), 0.0, 0.05)))
+        Connection(hid, pol, Dense(w((N_HID, 4), 0.0, 0.5)))
+        Connection(hid, val, Dense(w((N_HID, 1), 0.0, 0.5)))
+        Connection(hid, pol, Dense(w((N_HID, 4), 0.0, 0.5)), feedback_name="policy_feedback")
+        Connection(hid, val, Dense(w((N_HID, 1), 0.0, 0.5)), feedback_name="value_feedback")
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        Connection(hid, val, Dense(weight=1.0), feedback_name="tde_transport")
+    return net, inp, hid, pol, val
+
+
+def _black_box_run(name, neuron, rule, steps=150):
+    from ml_genn.neurons import BlackBoxALIF  # noqa: F401
+    net, inp, hid, pol, val = _black_box_network(neuron)
+    gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=gamma, td_lambda=lam,
+        train_output_bias=False, reset_time_between_batches=False,
+        entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND,
+        hidden_rule=rule)
+    compiled = compiler.compile(net, name)
+    ws, vs = [], []
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    pg = np.array([0.3, -0.7, 0.2, 0.2], np.float32)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        hpop = compiled.neuron_populations[hid]
+        upd = 0
+        for t in range(steps):
+            if t % K == K - 1:
+                p = compiled.neuron_populations[pol]
+                p.vars["pre_PG"].view[:] = pg; p.vars["pre_PG"].push_to_device()
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward",
+                                             1.0 if (t // K) % 2 == 0 else -1.0)
+            compiled.step_time(cb)
+            compiled.genn_model.custom_update("GradientLearn")
+            for o, cus in compiled.optimisers:
+                for c in cus:
+                    upd += 1; o.set_step(c, upd)
+            hpop.vars["V"].pull_from_device(); vs.append(np.array(hpop.vars["V"].view).copy())
+        for conn, sg in compiled.connection_populations.items():
+            if conn.target() is hid and not conn.is_feedback:
+                sg.vars["g"].pull_from_device(); ws.append(np.array(sg.vars["g"].values).copy())
+        thr = np.array(hpop.vars["Thr"].view).copy() if "Thr" in hpop.vars else None
+    return np.array(vs), np.concatenate([w.ravel() for w in ws]), thr
+
+
+@pytest.mark.parametrize("rule", [{"preset": "proposed"}, {"preset": "eprop"}])
+def test_black_box_neuron_at_heterogeneity_zero_is_the_standard_neuron(request, rule):
+    """Heterogeneity 0: the black-box neuron and the rule's per-neuron parameters reproduce the standard ALIF
+    network exactly (voltages and learned weights, for our rule and for e-prop)."""
+    from ml_genn.neurons import BlackBoxALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), rule)
+    v1, w1, thr = _black_box_run(request.node.name + "_bb", BlackBoxALIF(heterogeneity=0.0, **kw), rule)
+    assert np.allclose(thr, 0.61)
+    assert np.abs(v0).max() > 0.1 and not np.array_equal(w0, w0 * 0)
+    assert np.array_equal(v0, v1), np.abs(v0 - v1).max()
+    assert np.array_equal(w0, w1), np.abs(w0 - w1).max()
+
+
+def test_black_box_neuron_at_heterogeneity_one_differs_per_neuron_and_learns(request):
+    from ml_genn.neurons import BlackBoxALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), {"preset": "proposed"})
+    v1, w1, thr = _black_box_run(request.node.name + "_bb", BlackBoxALIF(heterogeneity=1.0, black_box_seed=3, **kw),
+                                 {"preset": "proposed"})
+    assert thr.std() > 0.02 and np.isfinite(v1).all() and np.isfinite(w1).all()
+    assert not np.allclose(v0, v1) and not np.allclose(w0, w1)
 
 
 def test_factor_norm_from_dict_and_validation():

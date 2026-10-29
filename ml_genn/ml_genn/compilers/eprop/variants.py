@@ -21,7 +21,7 @@ The optimiser descends on ``DeltaG``; a rule adds ``delta * (c_P * trace(P) + c_
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, Union
 
 
 class FeedbackType(Enum):
@@ -228,6 +228,12 @@ class HiddenRuleConfig:
     surprise_drift: float = 0.0      # c_S: adds c_S * (|delta| - mean|delta|) to the drift's modulator: the drift then
                                      # freezes responses around surprising moments (good or bad) and keeps routine
                                      # ones plastic (salience-gated consolidation); drift_td=0 leaves surprise only
+    revive: float = 0.0              # c_R: deterministic revival of neurons outside the psi range, on worse-than-expected
+                                     # outcomes: DeltaG -= c_R * max(0, -delta) * lambda-trace(d * ZFilter), with d the
+                                     # signed distance outside the range where psi > 0 (in Vthresh, capped at +-1):
+                                     # > 0 below it (inputs pushed up), < 0 above it (saturated: pushed down), 0 inside
+                                     # and while refractory; dV/dW = ZFilter needs no psi, so it acts where the drift
+                                     # and every psi-gated term vanish
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
@@ -243,6 +249,8 @@ class HiddenRuleConfig:
                                      # group targeting the neuron agrees); neurons settle at different sparseness
     eprop: float = 0.0               # e-prop learning signal: lambda-trace of eFiltered * (PG - eprop_value * VE)
     eprop_value: float = 0.1
+    eprop_broadcast: bool = False    # e-prop without feedback: the learning signal is the broadcast TD error for every
+                                     # neuron, i.e. reward x lambda-trace of eFiltered (a three-factor rule, no noise)
     eprop_center_value: bool = False     # the critic part of e-prop's update uses delta minus its running mean: a
                                          # biased critic (E[delta] != 0) otherwise pushes every neuron's incoming
                                          # weights coherently (the eligibility is >= 0), by the sign of its value
@@ -265,9 +273,27 @@ class HiddenRuleConfig:
                                      # Beta A (dV/dW = ZFilter, dA/dW = epsA): pulls saturated neurons' input
                                      # weights down and strongly hyperpolarised ones' up
     factor_norm: Optional[FactorNorm] = None   # normalise every factor of the update locally (see FactorNorm)
+    noise_proxy: bool = False        # WEIGHT_SHARED: the noise is still injected, but the score does not read it; each
+                                     # neuron estimates it from its own voltage (the per-step change with the reset
+                                     # undone, minus its running mean, over its running RMS) and every synapse that
+                                     # transmitted adds that estimate to its noise trace (scaled by SynSig)
+    noise_proxy_delay: int = 1       # synapse-dynamics steps between a presynaptic spike and the voltage change that
+                                     # carries the noise it delivered (1 or 2)
+    noise_proxy_decay: float = 0.999 # running mean / variance of the voltage change
+    inject_noise: bool = True        # False (noise_proxy only): no noise is injected; the proxy then sees only the
+                                     # network's own variability (Poisson inputs, spiking); SynSig only sets its scale
+    score_adaptation: Union[bool, str] = False  # presynaptic factor of the noise scores: ZFilter alone (default) or,
+                                     # True, ZFilter - Beta epsA (e-prop's ALIF factor; the rule until 2026-10-28);
+                                     # "drift" / "gradient": only that part keeps epsA. Stein's lemma already
+                                     # differentiates the gate through the adaptation; in the drift, epsA added the
+                                     # weight derivative of the adaptation trace, which lowered firing rates by
+                                     # ~10-15 Hz without a clear purpose (the regularisers keep epsA)
     kappa: bool = True               # multiply the score by 1 - Alpha^2
     log_syn_sigma: float = 0.0       # initial LogSynSig; SynSig = exp(LogSynSig - 5) (weight noise)
     psibar_decay: float = 0.99
+    coactivity_decay: Optional[float] = None   # per-synapse co-activity trace CoAct = d CoAct + (1 - d) ZFilter Psi
+                                     # (presynaptic activity while the postsynaptic neuron is eligible) and an age
+                                     # counter, for activity-dependent rewiring (None: off)
     td_stats_decay: float = 0.999    # running mean and mean |.| of the TD error (centring, homeostat)
 
     def __post_init__(self):
@@ -285,6 +311,15 @@ class HiddenRuleConfig:
                 self.eprop == 0 or (self.drift == 0 and self.gradient == 0)):
             raise ValueError("eprop_scope=SIGNAL_RECIPIENTS splits the network between e-prop and the perturbation "
                              "rule: it needs eprop != 0 and a drift or gradient part")
+        if self.noise_proxy and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT
+                                 or self.noise_proxy_delay not in (1, 2)):
+            raise ValueError("noise_proxy needs WEIGHT_SHARED noise, the trace estimator and noise_proxy_delay 1 or 2")
+        if self.eprop_broadcast and (self.eprop == 0 or self.eprop_center_value):
+            raise ValueError("eprop_broadcast needs eprop != 0 and no eprop_center_value (there is no critic part)")
+        if self.score_adaptation not in (True, False, "drift", "gradient"):
+            raise ValueError("score_adaptation must be true, false, 'drift' or 'gradient'")
+        if not self.inject_noise and not self.noise_proxy:
+            raise ValueError("inject_noise=False needs noise_proxy (the score would read noise that is never injected)")
         if self.backprop != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
             raise ValueError("backprop propagates the trace estimator's gradient score: it needs noise and "
                              "estimator=TRACE")
@@ -299,7 +334,7 @@ class HiddenRuleConfig:
 PRESETS = {
     # original, empirically found rule: gate psi (= drift - gradient), local rewards through the
     # whole trace, |dV| as implemented
-    "original": HiddenRuleConfig(drift=1.0, gradient=-1.0,
+    "original": HiddenRuleConfig(drift=1.0, gradient=-1.0, score_adaptation=True,
                                  local=LocalObjectives(route=LocalRoute.WHOLE_TRACE, dv_mode=DVMode.RESET)),
     "proposed": HiddenRuleConfig(drift=1.0, gradient=1.0),
     "proposed_homeostat": HiddenRuleConfig(drift=1.0, gradient=1.0, homeostat=5.0),

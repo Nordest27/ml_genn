@@ -53,9 +53,25 @@ import csv
 #     [beta1, beta2] ([beta1] for sgd)
 # l2_init: None (the defaults: 1e-5 for adabelief, off for adam and sgd) or the strength of the pull towards the
 #     initial weights (0 turns it off)
+# activity_rewiring: None or {"every_episodes": 10, "min_age": 100000, "rel_threshold": 0.05, "max_frac": 0.005,
+#     "coactivity_decay": 0.99999, "max_add": 8, "headroom": 1.5} - synapses whose co-activity (presynaptic trace x
+#     psi, slow mean) stays below rel_threshold x the connection's median get a new presynaptic partner drawn locally
+#     around the same postsynaptic neuron (fan-in and locality kept, fan-out free); see activity_rewiring.py
+# black_box: None or {"h": heterogeneity, "seed": s} - every hidden ALIF population is a BlackBoxALIF whose per-neuron
+#     dynamics (nonlinear leak, saturating input, threshold, partial reset, adaptation, refractory integration) the
+#     rules do not know; both rules use each neuron's own parameters (see ml_genn.neurons.BlackBoxALIF)
+# drift_check: None or {"at_timestep": t, "group": "L3_E->L3_E", "n_syn": 30, "rollouts": 64, "window": 30, "h": 0.2}
+#     - at timestep t, check that the drift is the weight derivative of the eligibility (drift_check.py), then stop
+# monitor_score_factors: also log the adaptation part of the noise scores' presynaptic factor (NeuronMonitor)
+# readout_optimiser: None (the readout uses the main optimiser) or {"type": "adam" | "adabelief" | "sgd", "lr": lr,
+#     "betas": [...]} - own optimiser for the readout weights, output biases and optimised feedback weights (modular
+#     compiler), e.g. Adam on the raw readout gradient when the hidden rule is factor-normalised and uses SGD
 SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None,
                         "value_transform": None, "reward_centring": None,
-                        "optimiser_betas": None, "l2_init": None}
+                        "optimiser_betas": None, "l2_init": None,
+                        "readout_optimiser": None, "monitor_score_factors": False,
+                        "drift_check": None, "activity_rewiring": None,
+                        "black_box": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -669,9 +685,22 @@ def build_compiled_network(connectivity_type="fixed"):
         compiler_cls, rule_kwargs = EPropCompiler, {}
     else:
         from ml_genn.compilers.eprop import EPropCompiler as ModularEPropCompiler
-        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": HP["hidden_rule"],
+        hidden_rule = HP["hidden_rule"]
+        if HP["activity_rewiring"] is not None:   # the rewiring needs the rule's co-activity trace
+            if not isinstance(hidden_rule, dict):
+                raise ValueError("activity_rewiring needs hidden_rule as a dict")
+            hidden_rule = {**hidden_rule,
+                           "coactivity_decay": float(HP["activity_rewiring"].get("coactivity_decay", 0.99999))}
+            rule_kwargs_rewiring = {"activity_rewiring": {k: HP["activity_rewiring"][k] for k in ("max_add", "headroom")
+                                                          if k in HP["activity_rewiring"]}}
+        else:
+            rule_kwargs_rewiring = {}
+        compiler_cls, rule_kwargs = ModularEPropCompiler, {"hidden_rule": hidden_rule, **rule_kwargs_rewiring,
                                                            "optimise_feedback": HP["optimise_feedback"],
                                                            "train_readout": HP["train_readout"],
+                                                           # the score-factor monitor reads each group's ZFilter
+                                                           "fuse_weight_updates": not (HP["monitor_score_factors"]
+                                                                                       or HP["drift_check"]),
                                                            "population_rules": built.population_rules}
         if HP["value_afterglow"] is not None:
             rule_kwargs["value_afterglow"] = HP["value_afterglow"]
@@ -702,17 +731,23 @@ def build_compiled_network(connectivity_type="fixed"):
             rule_kwargs.setdefault("plastic_inhibition", {}).update(
                 {c: HP["plastic_inhibition_i"] for k, c in enumerate(built.inhibitory_to_i, 1)
                  if layers is None or k in layers})
-    betas = HP["optimiser_betas"]
     l2 = HP["l2_init"] or None                       # 0 -> off
-    if HP["optimiser"] == "adam":
-        b1, b2 = betas if betas is not None else (0.9, 0.999)
-        optimiser = Adam(HP["lr"], beta1=b1, beta2=b2, l2_init_strength=l2)
-    elif HP["optimiser"] == "sgd":                   # SGD with momentum (for factor-normalised rules)
-        optimiser = SGD(HP["lr"], beta1=betas[0] if betas is not None else 0.99, l2_init_strength=l2)
-    else:
+
+    def make_optimiser(kind, lr, betas):
+        if kind == "adam":
+            b1, b2 = betas if betas is not None else (0.9, 0.999)
+            return Adam(lr, beta1=b1, beta2=b2, l2_init_strength=l2)
+        if kind == "sgd":                            # SGD with momentum (for factor-normalised rules)
+            return SGD(lr, beta1=betas[0] if betas is not None else 0.99, l2_init_strength=l2)
         b1, b2 = betas if betas is not None else (0.99, 0.99999)
-        optimiser = AdaBelief(HP["lr"], beta1=b1, beta2=b2,
-                              l2_init_strength=1e-5 if HP["l2_init"] is None else l2)
+        return AdaBelief(lr, beta1=b1, beta2=b2, l2_init_strength=1e-5 if HP["l2_init"] is None else l2)
+
+    optimiser = make_optimiser(HP["optimiser"], HP["lr"], HP["optimiser_betas"])
+    if HP["readout_optimiser"] is not None:
+        if HP["hidden_rule"] is None:
+            raise ValueError("readout_optimiser needs the modular compiler (set hidden_rule)")
+        ro = HP["readout_optimiser"]
+        rule_kwargs["readout_optimiser"] = make_optimiser(ro["type"], ro.get("lr", HP["lr"]), ro.get("betas"))
     compiler = compiler_cls(
         **rule_kwargs,
         f_target=HP["f_target"],
@@ -1304,12 +1339,14 @@ def train_snake_agent_with_ipc(episodes=10000,
             env = snake_switch.SwitchingEnv(env, **HP["switch"], wait_inc=WAIT_INC,
                                             log_path=f"outputs/{CSV_PREFIX}({REPETITION})_switches.csv")
         monitor = None
+        rewirer = None                   # activity_rewiring: created at its first call (needs the loaded model)
         if HP["monitor"]:
             alif = built.hidden
             labels = [built.labels[p] for p in alif]
             monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
                                                  f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
-                                                 report_every=HP["monitor_every"])
+                                                 report_every=HP["monitor_every"],
+                                                 score_factors=HP["monitor_score_factors"])
         normaliser = None
         normalised = {c: cfg for c, cfg in plastic_inhibition_connections(built).items() if cfg.get("normalise")}
         if normalised:
@@ -1578,6 +1615,17 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 if monitor is not None and env.wait_count == env.wait_inc:
                     monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
+                if HP["drift_check"] is not None and compiled_net.genn_model.timestep >= HP["drift_check"]["at_timestep"]:
+                    import drift_check
+                    rates = obs_to_poisson_rate(obs)
+                    drift_check.run(compiled_net, built, HP["hidden_rule"], train_callback_list,
+                                    lambda: compiled_net.set_input({input_pop: rates}),
+                                    {"trace_lambda": td_lambda,
+                                     "beta1": (HP["optimiser_betas"] or [0.99 if HP["optimiser"] != "adam" else 0.9])[0],
+                                     **HP["drift_check"]},
+                                    f"outputs/{CSV_PREFIX}({REPETITION})_drift_"
+                                    f"{'record' if HP['drift_check'].get('mode') == 'record' else 'check'}.npz")
+                    raise SystemExit(0)
                 if normaliser is not None and env.wait_count == env.wait_inc:
                     normaliser.move()
                 if probe is not None and env.wait_count == env.wait_inc and not done:
@@ -1736,6 +1784,15 @@ def train_snake_agent_with_ipc(episodes=10000,
             # compiled_net.genn_model.custom_update("DaleRewire")
             # Dale's law during continuous training: synapses whose weight crossed to the wrong sign are reset to a
             # tiny weight of the right sign (most) or pruned and rewired (locally aware with "local": true)
+            if HP["activity_rewiring"] is not None and ep % int(HP["activity_rewiring"].get("every_episodes", 10)) == 0:
+                if rewirer is None:
+                    from activity_rewiring import ActivityRewirer
+                    ar = HP["activity_rewiring"]
+                    rewirer = ActivityRewirer(compiled_net, min_age=int(ar.get("min_age", 100_000)),
+                                              rel_threshold=float(ar.get("rel_threshold", 0.05)),
+                                              max_frac=float(ar.get("max_frac", 0.005)),
+                                              log_path=f"outputs/{CSV_PREFIX}({REPETITION})_rewiring.csv")
+                rewirer()
             if HP["dale"] is not None and ep % int(HP["dale"].get("every_episodes", 1)) == 0:
                 compiled_net.genn_model.custom_update("DalePrune")
                 compiled_net.genn_model.custom_update("DaleRewire")

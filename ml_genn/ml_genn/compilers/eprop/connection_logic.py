@@ -11,7 +11,7 @@ import numpy as np
 from .variants import FeedbackType, FeedbackRule, HiddenRule, OutputRule, rule_for_population
 from .models import get_hidden_model, get_output_model, get_feedback_model
 from .hidden_rule import build_td_hidden_model
-from ...neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrateFire
+from ...neurons import AdaptiveLeakyIntegrateFire, BlackBoxALIF, LeakyIntegrateFire
 from ...utils.model import WeightUpdateModel
 
 
@@ -234,7 +234,8 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
         rule, c_reg=compiler.c_reg, alpha=alpha, rho=rho, readout_kappa=compiler.readout_kappa(),
         f_target=(compiler.f_target * compiler.dt) / 1000.0,
         alpha_fav=np.exp(-compiler.dt / compiler.tau_reg),
-        v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda, send_back=send_back)
+        v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda, send_back=send_back,
+        local_params=isinstance(target_neuron, BlackBoxALIF))
     kw["var_vals"]["g"] = connect_snippet.weight
     return WeightUpdateModel(**kw)
 

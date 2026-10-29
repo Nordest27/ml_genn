@@ -3,12 +3,13 @@ import numpy as np
 
 from copy import deepcopy
 from typing import Optional, Sequence
-from pygenn import SynapseMatrixType, create_var_ref, create_wu_var_ref
+from pygenn import SynapseMatrixConnectivity, SynapseMatrixType, create_var_ref, create_wu_var_ref
 
 from .. import Compiler
 from ..compiled_training_network import CompiledTrainingNetwork
 from ..deep_r import RewiringRecord, add_deep_r
 from ..dale_rewiring import add_dale_rewiring, local_rewiring_geometry
+from ..activity_rewiring import add_activity_rewiring
 from ..compiler import create_reset_custom_update
 from ... import Connection, Population, Network
 from ...callbacks import (BatchProgressBar, CustomUpdateOnBatchBegin,
@@ -17,7 +18,7 @@ from ...callbacks import (BatchProgressBar, CustomUpdateOnBatchBegin,
 from ...communicators import Communicator
 from ...losses import Loss, SparseCategoricalCrossentropy, default_losses
 from ...metrics import MetricsType
-from ...neurons import (AdaptiveLeakyIntegrateFire, Input, LeakyIntegrate,
+from ...neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, Input, LeakyIntegrate,
                         LeakyIntegrateFire, LeakyIntegrateFireInput)
 from ...optimisers import Optimiser, default_optimisers
 from ...synapses import Delta
@@ -83,6 +84,7 @@ class CompileState:
         self.policy_regularisation_connections = []
 
         self.weight_optimiser_connections = []
+        self.readout_optimiser_connections = set()   # readout / feedback weights (readout_optimiser, if given)
         self.bias_optimiser_populations = []
         self.softmax_populations = []
         self._neuron_reset_vars = {}
@@ -227,6 +229,16 @@ class EPropCompiler(Compiler):
                                     a dict of its fields, or True for the defaults)
         train_readout:               False keeps the readout (policy / value) weights at their
                                     initial values, to test what the hidden rule learns on its own
+        readout_optimiser:           Optimiser for the readout weights, the output biases and
+                                    the optimised feedback weights (None: ``optimiser``), e.g.
+                                    Adam on the raw readout gradient when the hidden rule is
+                                    factor-normalised and uses SGD
+        fuse_weight_updates:         Let GeNN fuse identical pre/postsynaptic weight-update code
+                                    (faster; False keeps every group's pre/post variables readable,
+                                    e.g. for diagnostics)
+        activity_rewiring:           {"max_add": n, "headroom": h}: add the activity-dependent rewiring pass
+                                    ("ActRewire", ml_genn.compilers.activity_rewiring) to every sparse
+                                    connection with a co-activity trace (None: off)
         optimise_feedback:           Optimise adaptive feedback connections
                                     (False reproduces the original
                                     implementation, where they are not).
@@ -269,9 +281,12 @@ class EPropCompiler(Compiler):
                  value_feedback_ret_e: float = 0.0,
                  inhibitory_reversal: Optional[float] = None,
                  dale_local_rewiring: bool = False,
+                 activity_rewiring: dict = None,
                  dale_connections=None,
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
+                 readout_optimiser=None,
+                 fuse_weight_updates: bool = True,
                  population_rules: dict = None,
                  plastic_inhibition: dict = None,
                  value_reg: float = 0.0,
@@ -333,9 +348,15 @@ class EPropCompiler(Compiler):
         self.value_feedback_ret_e = value_feedback_ret_e
         self.inhibitory_reversal = inhibitory_reversal
         self.dale_local_rewiring = dale_local_rewiring
+        # {"max_add": 8, "headroom": 1.5}: an "ActRewire" pass on every sparse optimised connection whose rule keeps
+        # a co-activity trace (hidden rule coactivity_decay), planned on the host (examples/eprop/activity_rewiring.py)
+        self.activity_rewiring = activity_rewiring
         self.dale_connections = None if dale_connections is None else set(dale_connections)
         self.optimise_feedback = optimise_feedback
         self.train_readout = train_readout
+        self.fuse_weight_updates = fuse_weight_updates
+        self._readout_optimiser = (None if readout_optimiser is None else
+                                   get_object(readout_optimiser, Optimiser, "Optimiser", default_optimisers))
         self.value_reg = value_reg
         self.value_afterglow = value_afterglow
         self.value_transform = value_transform
@@ -429,6 +450,8 @@ class EPropCompiler(Compiler):
         elif not conn.is_feedback or (self.optimise_feedback and
                                     "DeltaG" in [v[0] for v in wum.model["vars"]]):
             compile_state.weight_optimiser_connections.append(conn)
+            if readout_conn or conn.is_feedback:
+                compile_state.readout_optimiser_connections.add(conn)
 
         return wum
 
@@ -498,6 +521,8 @@ class EPropCompiler(Compiler):
         compile_state.tau_mem = pop.neuron.tau_mem
         if isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             compile_state.tau_adapt = pop.neuron.tau_adapt
+        if isinstance(pop.neuron, BlackBoxALIF):   # last: it rewrites the final integration line
+            neuron_logic.apply_black_box(model_copy, pop.neuron.coefficients(pop, self.dt))
 
     def readout_kappa(self):
         """Membrane decay of the readout heads (the policy head's; the value head's if there is none), or None.
@@ -527,18 +552,19 @@ class EPropCompiler(Compiler):
                                 connection_populations: dict,
                                 compile_state: CompileState) -> CompiledTrainingNetwork:
         genn_model.fuse_postsynaptic_models = True
-        genn_model.fuse_pre_post_weight_update_models = True
+        genn_model.fuse_pre_post_weight_update_models = self.fuse_weight_updates
 
         self._wire_feedback_targets(connection_populations, compile_state)
 
         optimiser_custom_updates = []
+        readout_custom_updates = []          # stays empty without a readout_optimiser
         deep_r_record_rewirings_ccus = []
         dale_rewiring_required = self._add_weight_optimisers(
             genn_model, connection_populations, compile_state, optimiser_custom_updates,
-            deep_r_record_rewirings_ccus)
+            readout_custom_updates, deep_r_record_rewirings_ccus)
 
         self._add_bias_optimisers(genn_model, neuron_populations, compile_state,
-                                  optimiser_custom_updates)
+                                  optimiser_custom_updates, readout_custom_updates)
 
         for p, o, s in compile_state.softmax_populations:
             genn_pop = neuron_populations[p]
@@ -547,12 +573,14 @@ class EPropCompiler(Compiler):
         compile_state.create_reset_custom_updates(self, genn_model, neuron_populations)
 
         base_train_callbacks, base_validate_callbacks = self._build_callbacks(
-            compile_state, optimiser_custom_updates, deep_r_record_rewirings_ccus,
-            dale_rewiring_required)
+            compile_state, optimiser_custom_updates + readout_custom_updates,
+            deep_r_record_rewirings_ccus, dale_rewiring_required)
 
         optimisers = []
         if len(optimiser_custom_updates) > 0:
             optimisers.append((self._optimiser, optimiser_custom_updates))
+        if len(readout_custom_updates) > 0:
+            optimisers.append((self._readout_optimiser, readout_custom_updates))
 
         return CompiledTrainingNetwork(
             genn_model, neuron_populations, connection_populations,
@@ -593,7 +621,8 @@ class EPropCompiler(Compiler):
                 setattr(connection_populations[c], attr, target_var)
 
     def _add_weight_optimisers(self, genn_model, connection_populations, compile_state,
-                               optimiser_custom_updates, deep_r_record_rewirings_ccus):
+                               optimiser_custom_updates, readout_custom_updates,
+                               deep_r_record_rewirings_ccus):
         """Add Deep-R / Dale rewiring infrastructure and an optimiser custom
         update for every weight that needs one. Returns whether Dale
         rewiring was used anywhere.
@@ -604,6 +633,14 @@ class EPropCompiler(Compiler):
             dale_sign = c.exc_inh_sign
             delta_g_var_ref = create_wu_var_ref(genn_pop, "DeltaG")
             weight_var_ref = create_wu_var_ref(genn_pop, "g")
+
+            if (self.activity_rewiring is not None and "CoAct" in genn_pop.vars
+                    and genn_pop.matrix_type & SynapseMatrixConnectivity.SPARSE):
+                add_activity_rewiring(genn_pop, genn_model, self, dale_sign, weight_var_ref,
+                                      max_add=int(self.activity_rewiring.get("max_add", 8)),
+                                      headroom=float(self.activity_rewiring.get("headroom", 1.5)),
+                                      norm_stat_ref=(create_wu_var_ref(genn_pop, "XiSq")
+                                                     if "XiSq" in genn_pop.vars else None))
 
             if c in self.deep_r_conns:
                 deep_r_2_ccu = add_deep_r(genn_pop, genn_model,
@@ -625,22 +662,28 @@ class EPropCompiler(Compiler):
                     compiler=self, l1_strength=self.dale_rewiring_l1_strength,
                     sign=dale_sign, weight_var_ref=weight_var_ref, geometry=geometry)
 
-            optimiser_custom_updates.append(
+            readout = (self._readout_optimiser is not None
+                       and c in compile_state.readout_optimiser_connections)
+            (readout_custom_updates if readout else optimiser_custom_updates).append(
                 self._create_optimiser_custom_update(
                     f"Weight{i}", weight_var_ref, delta_g_var_ref,
-                    genn_model, True))
+                    genn_model, True,
+                    self._readout_optimiser if readout else self._optimiser))
 
         return dale_rewiring_required
 
     def _add_bias_optimisers(self, genn_model, neuron_populations, compile_state,
-                             optimiser_custom_updates):
+                             optimiser_custom_updates, readout_custom_updates):
+        # only the output populations have trainable biases
+        readout = self._readout_optimiser is not None
         for i, p in enumerate(compile_state.bias_optimiser_populations):
             genn_pop = neuron_populations[p]
-            optimiser_custom_updates.append(
+            (readout_custom_updates if readout else optimiser_custom_updates).append(
                 self._create_optimiser_custom_update(
                     f"Bias{i}", create_var_ref(genn_pop, "Bias"),
                     create_var_ref(genn_pop, "DeltaBias"),
-                    genn_model, False))
+                    genn_model, False,
+                    self._readout_optimiser if readout else self._optimiser))
 
     def _build_callbacks(self, compile_state, optimiser_custom_updates,
                          deep_r_record_rewirings_ccus, dale_rewiring_required):
@@ -683,7 +726,7 @@ class EPropCompiler(Compiler):
         return train_callbacks, validate_callbacks
 
     def _create_optimiser_custom_update(self, name_suffix, var_ref,
-                                        gradient_ref, genn_model, wu):
+                                        gradient_ref, genn_model, wu, optimiser):
         if self.full_batch_size > 1:
             reduction_optimiser_model = CustomUpdateModel(
                 GRADIENT_BATCH_REDUCE_MODEL, {}, {"ReducedGradient": 0.0},
@@ -694,9 +737,9 @@ class EPropCompiler(Compiler):
                 "GradientBatchReduce", "CUBatchReduce" + name_suffix)
             reduced_gradient = (create_wu_var_ref(genn_reduction, "ReducedGradient") if wu
                                 else create_var_ref(genn_reduction, "ReducedGradient"))
-            optimiser_model = self._optimiser.get_model(reduced_gradient, var_ref, False, None)
+            optimiser_model = optimiser.get_model(reduced_gradient, var_ref, False, None)
         else:
-            optimiser_model = self._optimiser.get_model(gradient_ref, var_ref, True, None)
+            optimiser_model = optimiser.get_model(gradient_ref, var_ref, True, None)
 
         return self.add_custom_update(genn_model, optimiser_model,
                                       "GradientLearn", "CUGradientLearn" + name_suffix)

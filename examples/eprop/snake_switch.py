@@ -17,6 +17,7 @@ import os
 from collections import deque
 
 import numpy as np
+from pygenn import SynapseMatrixConnectivity
 
 MANGLES = ("channels", "actions", "flip")
 
@@ -224,10 +225,13 @@ def pseudo_derivative(v, a, beta, v_thresh, refrac):
 
 class NeuronMonitor:
     def __init__(self, compiled_net, populations, labels, log_path, report_every=10000, psi_eps=0.01,
-                 silent_hz=0.5, dt_ms=1.0, weights=True):
+                 silent_hz=0.5, dt_ms=1.0, weights=True, score_factors=False):
         """populations: hidden ALIF ml_genn Populations; labels: their names in the log.
         weights: also log, per connection group into a hidden population, how far its weights have moved from
-        their initial values (||W - W0|| / ||W0||), to see which layers learn when."""
+        their initial values (||W - W0|| / ||W0||), to see which layers learn when.
+        score_factors: also log, per such group, the size of the adaptation part of e-prop's presynaptic factor
+        ZFilter - Beta epsA at the report step: RMS(Beta epsA) / RMS(ZFilter) and the fraction of synapses
+        (weighted by |ZFilter|) where the factor is negative."""
         self.net, self.pops, self.labels = compiled_net, list(populations), list(labels)
         self.report_every, self.psi_eps, self.silent_hz, self.dt_ms = int(report_every), psi_eps, silent_hz, dt_ms
         self.log_path = log_path
@@ -235,12 +239,19 @@ class NeuronMonitor:
         self.spikes = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
         self.vloss = [0.0 for _ in self.pops]
         self.v_sum = [np.zeros(int(np.prod(p.shape))) for p in self.pops]
+        self.dead_zone = [0.0 for _ in self.pops]
         self.prev_spike_count = [None] * len(self.pops)
         self.samples, self.moves = 0, 0
         self.prev_dead = [None] * len(self.pops)
         os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
         name_of = {p: l for p, l in zip(self.pops, self.labels)}
         self.weight_groups = []
+        self.score_groups = []
+        if score_factors:
+            for c, sg in compiled_net.connection_populations.items():
+                if not c.is_feedback and c.target() in name_of and "epsilonA" in sg.vars:
+                    src = name_of.get(c.source(), c.source().name)
+                    self.score_groups.append((f"{src}->{name_of[c.target()]}", sg, c.target()))
         if weights:
             for c, sg in compiled_net.connection_populations.items():
                 if c.is_feedback or c.target() not in name_of:
@@ -253,7 +264,8 @@ class NeuronMonitor:
         cols = ["timestep", "moves", "switch"]
         for l in self.labels:
             cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
-                     f"{l}_recovered", f"{l}_vloss", f"{l}_v_mean", f"{l}_v_p10", f"{l}_v_p90", f"{l}_hyper"]
+                     f"{l}_recovered", f"{l}_vloss", f"{l}_v_mean", f"{l}_v_p10", f"{l}_v_p90", f"{l}_hyper",
+                     f"{l}_deadzone"]
         cols += [f"dW|{name}" for name, *_ in self.weight_groups]
         # Dale's law is not enforced during continuous training: fraction of each sign-constrained group's synapses
         # whose weight has crossed to the other sign (E source: g < 0; I source: g > 0)
@@ -261,8 +273,17 @@ class NeuronMonitor:
         # net sign of each sign-constrained group, sign * sum(g) / sum|g|: 1 = every synapse keeps its population's
         # sign, 0 = the group's excitation and inhibition cancel, < 0 = the group acts with the opposite sign
         cols += [f"net|{name}" for name, *_, sign in self.weight_groups if sign is not None]
+        cols += [f"epsA|{name}" for name, *_ in self.score_groups]
+        cols += [f"piNeg|{name}" for name, *_ in self.score_groups]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
+
+    def _zfilter_group(self, sg):
+        """GeNN fuses identical presynaptic updates: only one synapse group per source owns the ZFilter array."""
+        for other in [sg] + list(self.net.connection_populations.values()):
+            if other.src is sg.src and "ZFilter" in other.pre_vars and other.pre_vars["ZFilter"]._array is not None:
+                return other
+        raise RuntimeError(f"no synapse group owns ZFilter for {sg.name}")
 
     def _vars(self, pop, names):
         npop = self.net.neuron_populations[pop]
@@ -281,6 +302,10 @@ class NeuronMonitor:
             thr = p.neuron.v_thresh + p.neuron.beta * a
             self.vloss[i] += float(np.mean(np.maximum(v - thr, 0.0) + np.maximum(-v - thr, 0.0)))
             self.v_sum[i] += v
+            # dead zone: below the range where psi > 0 (V < Beta A) but above the voltage regulariser's band
+            # (V > -(Vthresh + Beta A)), not refractory: no psi-gated term and no vreg gradient acts there
+            ba = p.neuron.beta * a
+            self.dead_zone[i] += float(np.mean((v < ba) & (v > -(p.neuron.v_thresh + ba)) & (refrac <= 0)))
             # a neuron fired since the last sample if it is (or was recently) refractory
             self.spikes[i] += refrac > 0
         self.samples += 1
@@ -304,7 +329,9 @@ class NeuronMonitor:
             v_mean = self.v_sum[i] / max(self.samples, 1)
             row += [dead.mean(), silent.mean(), (dead & ~silent).mean(), psi.mean(), hz.mean(), rec,
                     self.vloss[i] / max(self.samples, 1), float(v_mean.mean()), float(np.percentile(v_mean, 10)),
-                    float(np.percentile(v_mean, 90)), float(np.mean(v_mean < -5.0 * p.neuron.v_thresh))]
+                    float(np.percentile(v_mean, 90)), float(np.mean(v_mean < -5.0 * p.neuron.v_thresh)),
+                    self.dead_zone[i] / max(self.samples, 1)]
+            self.dead_zone[i] = 0.0
             self.vloss[i] = 0.0
             self.v_sum[i][:] = 0
             self.prev_dead[i] = dead
@@ -319,6 +346,23 @@ class NeuronMonitor:
                 flips.append(float(np.mean(sign * g < 0)))
                 nets.append(float(sign * g.sum() / (np.abs(g).sum() + 1e-12)))
         row += flips + nets
+        ratios, negs = [], []
+        for name, sg, tgt in self.score_groups:
+            sg.vars["epsilonA"].pull_from_device()
+            zsg = self._zfilter_group(sg)
+            zsg.pre_vars["ZFilter"].pull_from_device()
+            eps = np.asarray(sg.vars["epsilonA"].values, dtype=np.float64)
+            if sg.matrix_type & SynapseMatrixConnectivity.SPARSE:
+                pre, post = np.asarray(sg.get_sparse_pre_inds()), np.asarray(sg.get_sparse_post_inds())
+            else:
+                pre = np.repeat(np.arange(sg.src.num_neurons), sg.trg.num_neurons)
+                post = np.tile(np.arange(sg.trg.num_neurons), sg.src.num_neurons)
+            zf = np.asarray(zsg.pre_vars["ZFilter"].view, dtype=np.float64).ravel()[pre]
+            beta = np.broadcast_to(np.asarray(tgt.neuron.beta, dtype=np.float64).ravel(), (sg.trg.num_neurons,))[post]
+            adapt = beta * eps
+            ratios.append(float(np.sqrt(np.mean(adapt ** 2) / (np.mean(zf ** 2) + 1e-30))))
+            negs.append(float(np.sum(np.abs(zf) * (zf - adapt < 0)) / (np.sum(np.abs(zf)) + 1e-30)))
+        row += ratios + negs
         self.samples = 0
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])

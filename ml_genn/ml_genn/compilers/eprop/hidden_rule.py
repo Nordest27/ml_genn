@@ -62,12 +62,18 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, rho: float,
                           f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float,
-                          send_back: bool = False, readout_kappa: float = None):
+                          send_back: bool = False, readout_kappa: float = None, local_params: bool = False):
     """Return the keyword arguments of a ``WeightUpdateModel`` (model dict and initial values).
 
     send_back: this synapse's presynaptic neuron is a hidden neuron that receives the backward signal
     (``ISynBack``); the synapse then adds ``g * score_post`` to it with ``addToPre``. Only valid when the
-    compiler sets the connection's ``pre_target_var`` to ``ISynBack``."""
+    compiler sets the connection's ``pre_target_var`` to ``ISynBack``.
+
+    local_params: the postsynaptic neuron is a black-box neuron (ml_genn.neurons.BlackBoxALIF) with per-neuron
+    parameters; every term then uses that neuron's own threshold (Thr), effective leak (AlphaEff) and adaptation
+    (RhoJ, Beta) instead of the population constants, and the presynaptic trace is kept per synapse, decaying with
+    the postsynaptic neuron's leak (ZFilterS, fed by ZSpk, the presynaptic spike of the previous update). With the
+    coefficients of heterogeneity 0 the arithmetic is identical to the standard rule."""
     weight_noise = cfg.noise in (NoisePlacement.WEIGHT_SHARED, NoisePlacement.WEIGHT_INDEPENDENT)
     node_noise = cfg.noise is NoisePlacement.NODE
     exact = cfg.estimator is Estimator.EXACT
@@ -96,6 +102,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     rate_w = (c_reg if local is None or local.rate is None else local.rate)
     use_rate_local = local is not None and rate_w != 0
     use_decorr = local is not None and local.decorr != 0
+    proxy = cfg.noise_proxy
+    use_revive = cfg.revive != 0
     if use_decorr and local.decorr_norm not in ("covariance", "correlation"):
         raise ValueError(f"decorr_norm must be 'covariance' or 'correlation', not {local.decorr_norm!r}")
     if use_decorr and not use_local_post:
@@ -119,14 +127,18 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         norm_xi = f"{kappa}PertEpsTrace_post / (Sigma_post * Sigma_post + 1e-6)"
     else:
         norm_xi = None
-    pre = "(ZFilter - Beta_post * epsA)"
+    # presynaptic factor of each part of the score: with or without e-prop's adaptation term
+    adapt = "(ZFilter - Beta_post * epsA)"
+    pre_P = adapt if cfg.score_adaptation in (True, "drift") else "ZFilter"
+    pre_G = adapt if cfg.score_adaptation in (True, "gradient") else "ZFilter"
+    pre = pre_G
     if exact:
         g_score = "-freshEps / (SynSig * SynSig + 1e-6)"            # REINFORCE sign, no gate, no filter
     elif norm_xi is not None:
         g_score = f"-PsiBar * {pre} * normXi"
     else:
         g_score = None
-    p_score = f"(Psi - PsiBar) * {pre} * normXi" if norm_xi is not None else None
+    p_score = f"(Psi - PsiBar) * {pre_P} * normXi" if norm_xi is not None else None
     fn_noise = fn is not None and fn.noise and norm_xi is not None
 
     # --- model pieces ----------------------------------------------------------------------------
@@ -148,13 +160,17 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         var_vals.update({"LogSynSig": cfg.log_syn_sigma, "SynSig": 0.0})
         if not exact:
             vars_.append(("NoiseTrace", "scalar")); var_vals["NoiseTrace"] = 0.0
+        if proxy:
+            vars_ += [("ProxyFlag1", "scalar"), ("ProxyFlag2", "scalar")]
+            var_vals.update({"ProxyFlag1": 0.0, "ProxyFlag2": 0.0})
     if exact:
         vars_.append(("FreshEps", "scalar")); var_vals["FreshEps"] = 0.0
     for name, used in (("RLNoiseTrace", use_combined), ("RLNoisePtrace", use_P),
                        ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop),
                        ("RLValueTrace", use_eprop and cfg.eprop_center_value),
                        ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag),
-                       ("XiSq", fn_noise)):
+                       ("XiSq", fn_noise), ("ReviveTrace", use_revive),
+                       ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
 
@@ -166,7 +182,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("TdMean", cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
                        ("AbsTd", use_abs_td),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
-                       ("ZDec", use_decorr), ("ZDecMean", use_decorr), ("TdSq", fn_td), ("PsiSq", fn_post)):
+                       ("ZDec", use_decorr), ("ZDecMean", use_decorr), ("TdSq", fn_td), ("PsiSq", fn_post), ("DeadDist", use_revive),
+                       ("ProxyPrevV", proxy), ("ProxyZ", proxy), ("ProxyMean", proxy), ("ProxyVar", proxy),
+                       ("ProxyDev", proxy), ("ProxyInv", proxy)):
         if used:
             post_vars.append((name, "scalar")); post_var_vals[name] = 0.0
 
@@ -184,6 +202,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
 
     # post spike / dynamics code
     post_spike = []
+    if proxy:
+        post_spike.append("ProxyZ = 1.0;")
     if use_favg:
         post_spike.append("FAvg += (1.0 - AlphaFAv);")
     if use_dvc:
@@ -205,6 +225,23 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
 else {
     Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
 }""")
+    if proxy:   # noise estimate: the voltage change not explained by the leak (reset undone), standardised
+        d = _f(cfg.noise_proxy_decay); d1 = _f(1 - cfg.noise_proxy_decay)
+        post_dyn.append(f"""{{
+    const scalar inn = (RefracTime_post > 0.0) ? ProxyMean : V_post - Alpha * ProxyPrevV + Vthresh_post * ProxyZ;
+    const scalar dev = inn - ProxyMean;
+    ProxyMean = {d} * ProxyMean + {d1} * inn;
+    ProxyVar = {d} * ProxyVar + {d1} * dev * dev;
+    ProxyDev = dev;
+    ProxyInv = 1.0 / sqrt(ProxyVar + 1e-12);
+    ProxyPrevV = V_post;
+    ProxyZ = 0.0;
+}}""")
+    if use_revive:   # signed distance outside the psi range (in Vthresh, capped at +-1): > 0 below it, < 0 above
+        # it (saturated); 0 inside it and while refractory
+        post_dyn.append("DeadDist = (RefracTime_post > 0.0) ? 0.0 : "
+                        "fmin(1.0, fmax(0.0, Beta_post * A_post - V_post) / Vthresh_post) - "
+                        "fmin(1.0, fmax(0.0, V_post - (2.0 * Vthresh_post + Beta_post * A_post)) / Vthresh_post);")
     if fn_post:   # factor normalisation: running mean square of each factor where it lives
         post_dyn.append(f"PsiSq = {_f(fn.decay)} * PsiSq + {_f(1 - fn.decay)} * Psi * Psi;")
     if fn_td:
@@ -255,7 +292,8 @@ else {
     accumulate = "FreshEps += eps;" if exact else "NoiseTrace += eps;"
     if cfg.noise is NoisePlacement.WEIGHT_SHARED:
         pre_spike_syn = ("SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = SynSig * Noise1;\n"
-                         f"addToPost(g + eps);\n{accumulate}")
+                         + ("addToPost(g + eps);\n" if cfg.inject_noise else "addToPost(g);\n")
+                         + ("ProxyFlag1 = 1.0;" if proxy else accumulate))
     elif cfg.noise is NoisePlacement.WEIGHT_INDEPENDENT:
         pre_spike_syn = (_HASH_NOISE + "SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = SynSig * synNoise;\n"
                          f"addToPost(g + eps);\n{accumulate}")
@@ -266,6 +304,11 @@ else {
     syn = ["const scalar reward = TdE_post + PRew_post;", "const scalar epsA = epsilonA;"]
     if weight_noise:
         syn.append("SynSig = exp(LogSynSig - 5.0);")
+    if proxy:   # the synapses that transmitted add the neuron's noise estimate once it is in the voltage
+        last = "ProxyFlag2" if cfg.noise_proxy_delay == 2 else "ProxyFlag1"
+        # minus the synapse's own transmitted weight, which arrives in the voltage with the noise
+        syn.append(f"NoiseTrace += {last} * SynSig * (ProxyDev - g) * ProxyInv;")
+        syn.append("ProxyFlag2 = ProxyFlag1;\nProxyFlag1 = 0.0;" if cfg.noise_proxy_delay == 2 else "ProxyFlag1 = 0.0;")
     if norm_xi is not None:
         syn.append(f"const scalar normXi = {norm_xi};")
     if fn_noise:
@@ -298,6 +341,8 @@ else {
         if cfg.homeostat_floor:   # one-sided: only neurons below the target are pushed (up)
             deviation = f"fmin({deviation}, 0.0)"
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
+    if use_revive:   # worse-than-expected outcomes push neurons outside the psi range back into it (dV/dW = ZFilter)
+        dg.append(f"- {_f(cfg.revive)} * fmax(0.0, -reward) * ReviveTrace")
     n_td = len(dg)                                  # the TD terms (factor normalisation: all four factors)
     if use_eprop and cfg.eprop_center_td:         # both parts with delta - its mean (one combined trace)
         dg.append(_scaled(cfg.eprop, "(reward - TdMean) * RLTrace"))
@@ -362,13 +407,25 @@ else {
         if cfg.drift + cfg.gradient != 0:
             terms.append(f"- {_f(cfg.drift + cfg.gradient)} * PsiBar")
         gate = " ".join(terms)
-        syn.append(f"RLNoiseTrace = Lambda * RLNoiseTrace + ({gate}) * {pre} * normXi;")
+        if pre_P == pre_G:
+            syn.append(f"RLNoiseTrace = Lambda * RLNoiseTrace + ({gate}) * {pre} * normXi;")
+        else:   # the drift and gradient parts with different presynaptic factors
+            score = " ".join(x for x in ((_scaled(cfg.drift, f"(Psi - PsiBar) * {pre_P}") if cfg.drift != 0 else ""),
+                                         (f"- {_f(cfg.gradient)} * PsiBar * {pre_G}" if cfg.gradient != 0 else "")) if x)
+            syn.append(f"RLNoiseTrace = Lambda * RLNoiseTrace + ({score or '0.0'}) * normXi;")
+    if use_revive:
+        syn.append("ReviveTrace = Lambda * ReviveTrace + DeadDist * ZFilter;")
+    if cfg.coactivity_decay is not None:   # for activity-dependent rewiring: co-activity and age of the synapse
+        d = cfg.coactivity_decay
+        syn.append(f"CoAct = {_f(d)} * CoAct + {_f(1 - d)} * ZFilter * Psi;\nAge += 1.0;")
     if use_P:
         syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
     if use_G:
         syn.append(f"RLNoiseGtrace = Lambda * RLNoiseGtrace + {g_score};")
     if use_eprop:
-        if cfg.eprop_center_value and not cfg.eprop_center_td:   # separate traces: the policy and the critic part
+        if cfg.eprop_broadcast:   # no feedback: every neuron's learning signal is the broadcast TD error itself
+            syn.append("RLTrace = Lambda * RLTrace + eFiltered;")
+        elif cfg.eprop_center_value and not cfg.eprop_center_td:   # separate traces: the policy and the critic part
             syn.append("RLTrace = Lambda * RLTrace + eFiltered * PG_post;")
             syn.append("RLValueTrace = Lambda * RLValueTrace + eFiltered * VE_post;")
         else:
@@ -400,6 +457,24 @@ else {
     }
     if pre_refs:
         model["pre_neuron_var_refs"] = [(k, "scalar") for k in pre_refs]
+    if local_params:
+        if fn_pre:
+            raise NotImplementedError("factor_norm with a presynaptic factor is not implemented for black-box "
+                                      "neurons (the presynaptic trace is per synapse there)")
+        import re
+        sub = lambda code: re.sub(r"\bZFilter\b", "ZFilterS",
+                                  re.sub(r"\bRho\b", "Rho_post", re.sub(r"\bAlpha\b", "Alpha_post", code)))
+        model["synapse_dynamics_code"] = ("ZFilterS = Alpha_post * ZFilterS + ZSpk;\n"
+                                          + sub(model["synapse_dynamics_code"]))
+        model["post_dynamics_code"] = sub(model["post_dynamics_code"])
+        model["post_spike_code"] = sub(model["post_spike_code"])
+        model["pre_spike_code"] += "\nZSpk = 1.0;"
+        model["pre_dynamics_code"] = "ZSpk = 0.0;\n" + model["pre_dynamics_code"]
+        model["pre_vars"] = pre_vars + [("ZSpk", "scalar")]; pre_var_vals["ZSpk"] = 0.0
+        model["vars"] = vars_ + [("ZFilterS", "scalar")]; var_vals["ZFilterS"] = 0.0
+        model["params"] = [p for p in params if p[0] != "Vthresh_post"]; param_vals.pop("Vthresh_post")
+        post_refs.update({"Vthresh_post": "Thr", "Alpha_post": "AlphaEff", "Rho_post": "RhoJ"})
+        model["post_neuron_var_refs"] = [(k, "scalar") for k in post_refs]
     return dict(model=model, param_vals=param_vals, var_vals=var_vals,
                 pre_var_vals=pre_var_vals, post_var_vals=post_var_vals,
                 pre_neuron_var_refs=pre_refs, post_neuron_var_refs=post_refs)

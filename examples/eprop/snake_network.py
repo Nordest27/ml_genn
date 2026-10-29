@@ -21,7 +21,7 @@ import numpy as np
 from ml_genn import Connection, Network, Population
 from ml_genn.connectivity import Dense, FixedProbability, LocalPermutation, ToroidalGaussian2D
 from ml_genn.initializers import Normal
-from ml_genn.neurons import AdaptiveLeakyIntegrateFire, LeakyIntegrate, PoissonInput
+from ml_genn.neurons import AdaptiveLeakyIntegrateFire, BlackBoxALIF, LeakyIntegrate, PoissonInput
 
 Shape = Tuple[int, int, int]
 
@@ -151,6 +151,8 @@ class NetworkSpec:
     explicit_feedback: bool = True   # random feedback connections from every hidden population to the heads
     feedback_p: float = 1.0          # ... from the EI layers (from the fields: readout_p)
     node_sigma: float = 1e-2         # membrane-noise s.d. of every hidden neuron (used by node-noise rules only)
+    black_box: Optional[dict] = None  # {"h": heterogeneity, "seed": s}: every hidden ALIF population (fields too) is a
+                                      # BlackBoxALIF with per-neuron dynamics the learning rules are not told about
     reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
 
 
@@ -269,9 +271,13 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
                               exact=exact)
 
 
-def _alif(neuron: NeuronSpec, node_sigma):
-    return AdaptiveLeakyIntegrateFire(v_thresh=neuron.v_thresh, tau_mem=neuron.tau_mem, tau_refrac=neuron.tau_refrac,
-                                      tau_adapt=neuron.tau_adapt, beta=neuron.beta, perturbation_eps_std=node_sigma)
+def _alif(neuron: NeuronSpec, node_sigma, black_box=None):
+    kw = dict(v_thresh=neuron.v_thresh, tau_mem=neuron.tau_mem, tau_refrac=neuron.tau_refrac,
+              tau_adapt=neuron.tau_adapt, beta=neuron.beta, perturbation_eps_std=node_sigma)
+    if black_box is not None:
+        return BlackBoxALIF(heterogeneity=float(black_box.get("h", 0.0)), black_box_seed=int(black_box.get("seed", 0)),
+                            **kw)
+    return AdaptiveLeakyIntegrateFire(**kw)
 
 
 def _gain(conn: ConnSpec, g: float) -> ConnSpec:
@@ -292,8 +298,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             s = slows[k] if k < len(slows) else None
             return _gain(conn, spec.layers[k].slow.in_gain) if (s is not None and target is s and sign > 0) else conn
         for k, ls in enumerate(spec.layers):
-            e = Population(_alif(ls.neuron, spec.node_sigma), ls.e_shape)
-            i = Population(_alif(ls.neuron, spec.node_sigma), ls.i_shape)
+            e = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box), ls.e_shape)
+            i = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box), ls.i_shape)
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
                 spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
@@ -312,7 +318,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             s = None
             if ls.slow is not None:                  # slow sub-population: recurrent with E, I and itself
                 s_shape = ls.slow.shape or ls.e_shape
-                s = Population(_alif(ls.slow.neuron, spec.node_sigma), s_shape)
+                s = Population(_alif(ls.slow.neuron, spec.node_sigma, spec.black_box), s_shape)
                 for pre, post, src_shape, fan, sign in ((e, s, ls.e_shape, ls.fan_in_e, +1), (s, e, s_shape, ls.fan_in_e, +1),
                                                         (s, s, s_shape, ls.fan_in_e, +1), (s, i, s_shape, ls.fan_in_e, +1),
                                                         (i, s, ls.i_shape, ls.fan_in_i, -1)):
@@ -336,8 +342,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         fields = None
         if spec.fields is not None:
             fs = spec.fields
-            fields = (Population(_alif(fs.neuron, spec.node_sigma), fs.shape),
-                      Population(_alif(fs.neuron, spec.node_sigma), fs.shape))
+            fields = (Population(_alif(fs.neuron, spec.node_sigma, spec.black_box), fs.shape),
+                      Population(_alif(fs.neuron, spec.node_sigma, spec.black_box), fs.shape))
             labels[fields[0]], labels[fields[1]] = "policy_field", "value_field"
             if fs.rule is not None:
                 rules[fields[0]] = rules[fields[1]] = fs.rule
@@ -564,7 +570,8 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                        layers=[base_layer(k) for k in range(hp["ei_layers"])],
                        fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], ff="field", p=0.005),
                                         conn_i=ff_i),
-                       explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"])
+                       explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"],
+                       black_box=hp.get("black_box"))
     net = dict(hp.get("network") or {})
     if "layers" in net:
         if hp["ei_layers"] != 1 and len(net["layers"]) != hp["ei_layers"]:

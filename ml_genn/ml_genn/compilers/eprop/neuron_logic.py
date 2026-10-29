@@ -449,3 +449,37 @@ def enable_node_noise(model_copy):
             raise RuntimeError(f"node noise: '{source}' not found in the ALIF sim code; the neuron "
                                "model changed, update _NODE_NOISE_SWITCHES")
         model_copy.replace_sim_code(source, target)
+
+
+def apply_black_box(model_copy, coefficients):
+    """Turn a (modified) ALIF hidden neuron into a black-box neuron (ml_genn.neurons.BlackBoxALIF): per-neuron
+    nonlinear leak, saturating input, threshold, partial reset, adaptation and refractory integration. Applied after
+    every other modification, on the final integration line "V = Alpha * V + <input>;". With the coefficients of
+    heterogeneity 0 the generated arithmetic equals the standard neuron's exactly."""
+    import re
+    for name, value in coefficients.items():
+        if name == "Beta":
+            model_copy.var_vals["Beta"] = value
+        else:
+            model_copy.add_var(name, "scalar", value)
+    code = model_copy.model["sim_code"]
+    m = re.search(r"V = Alpha \* V \+ (.*?);", code)
+    if m is None:
+        raise RuntimeError("black-box neuron: integration line not found")
+    inp = m.group(1)
+    new = (f"if (RefracTime <= 0.0 || IntRefr > 0.5) {{\n"
+           f"    V = LeakA * V + LeakB * tanh(LeakC * V) + InG * ((InS > 1e5) ? ({inp}) : InS * tanh(({inp}) / InS));\n"
+           f"}}")
+    code = code[:m.start()] + new + code[m.end():]
+    if "A *= Rho;" not in code:
+        raise RuntimeError("black-box neuron: adaptation line not found")
+    code = code.replace("A *= Rho;", "A *= RhoJ;")
+    model_copy.model["sim_code"] = code
+    thr = model_copy.model["threshold_condition_code"]
+    if "Vthresh + (Beta * A)" not in thr:
+        raise RuntimeError("black-box neuron: threshold not found")
+    model_copy.model["threshold_condition_code"] = thr.replace("Vthresh + (Beta * A)", "Thr + (Beta * A)")
+    reset = model_copy.model["reset_code"]
+    if "V -= (Vthresh - Vreset);" not in reset:
+        raise RuntimeError("black-box neuron: needs the relative reset")
+    model_copy.model["reset_code"] = reset.replace("V -= (Vthresh - Vreset);", "V -= ResetF * (Thr - Vreset);")
