@@ -172,6 +172,54 @@ PANELS = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Population sizes for monitors written before the monitor logged them (<pop>_n columns): the GPU architecture's
+# E (20x20x3) and I (15x15x3) layers. Only used, with a warning, when a monitor has no size columns.
+FALLBACK_SIZES = {"E": 1200, "I": 675}
+
+# Companion files written next to each run's score CSV; they are not runs themselves.
+COMPANION_RE = re.compile(r"_(neurons|policy|probe|drift_\w+)$")
+
+
+def monitor_frequency(df: pd.DataFrame):
+    """Hidden firing rate (Hz, mean over every neuron of the E and I layers L1..Lk) from the run's neuron monitor
+    (<run>_neurons.csv, written with monitor: true), placed on the episode axis via the episodes' step counts.
+    The score CSV's own "frequency" column is a single population's rate in runs made before the logging fix,
+    so it is only used when there is no monitor. Returns (episode, rate) or None."""
+    path = df.attrs.get("neurons_path")
+    if not path or not os.path.exists(path):
+        return None
+    mon = pd.read_csv(path)
+    cols = [c for c in mon.columns if re.fullmatch(r"L\d+_[EI]_hz", c)]
+    if mon.empty or not cols:
+        return None
+    sizes = []
+    for c in cols:
+        n_col = c[:-len("hz")] + "n"
+        sizes.append(float(mon[n_col].iloc[0]) if n_col in mon.columns else FALLBACK_SIZES[c.split("_")[1]])
+    if not all(c[:-len("hz")] + "n" in mon.columns for c in cols):
+        print(f"  !  {path}: no population sizes in the monitor, weighting E/I by {FALLBACK_SIZES}")
+    weights = np.array(sizes) / np.sum(sizes)
+    t_end = np.cumsum(pd.to_numeric(df["ep_steps"], errors="coerce").to_numpy(dtype=np.float64))
+    episodes = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
+    i = np.minimum(np.searchsorted(t_end, mon["timestep"].to_numpy(dtype=np.float64)), len(episodes) - 1)
+    ep_mon, rate = episodes[i], mon[cols].to_numpy(dtype=np.float64) @ weights
+    # every episode the monitor covers gets a value, so each episode window averages all runs (the monitor
+    # writes one row per interval, far sparser than the episodes)
+    ep = episodes[(episodes >= ep_mon[0]) & (episodes <= ep_mon[-1])]
+    return ep, np.interp(ep, ep_mon, rate)
+
+
+def frequency_series(df: pd.DataFrame, limit=None):
+    """(episode, Hz) for the Frequency panel: the monitor's rate if available, else the score CSV's column."""
+    mon = monitor_frequency(df)
+    if mon is not None:
+        return mon if limit is None else (mon[0][mon[0] < limit], mon[1][mon[0] < limit])
+    print(f"  !  no neuron monitor for {df.attrs.get('source', '?')}: Frequency uses the score CSV column")
+    ep = pd.to_numeric(df["episode"], errors="coerce")[:limit].to_numpy(dtype=np.float64)
+    val = pd.to_numeric(df["frequency"], errors="coerce")[:limit].to_numpy(dtype=np.float64)
+    return ep, val * 1000
+
+
 def find_col(df: pd.DataFrame, candidates: list[str]):
     for c in candidates:
         if c in df.columns:
@@ -271,10 +319,11 @@ def _compute_series_xyz(dfs, col, n_runs):
     and secondary series in the fused Voltage Loss / Voltage panel."""
     if n_runs == 1:
         df  = dfs[0]
-        ep  = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
-        val = pd.to_numeric(df[col],       errors="coerce").to_numpy(dtype=np.float64)
         if col == "frequency":
-            val = val * 1000
+            ep, val = frequency_series(df)
+        else:
+            ep  = pd.to_numeric(df["episode"], errors="coerce").to_numpy(dtype=np.float64)
+            val = pd.to_numeric(df[col],       errors="coerce").to_numpy(dtype=np.float64)
         agg = window_rolling_mean_std(ep, val, WINDOW_EP)
         if agg is None:
             return None
@@ -286,10 +335,11 @@ def _compute_series_xyz(dfs, col, n_runs):
             df_col = find_col(df, [col])
             if df_col is None:
                 continue
-            ep  = pd.to_numeric(df["episode"], errors="coerce")[:19999].to_numpy(dtype=np.float64)
-            val = pd.to_numeric(df[df_col],    errors="coerce")[:19999].to_numpy(dtype=np.float64)
             if df_col == "frequency":
-                val = val * 1000
+                ep, val = frequency_series(df, limit=19999)
+            else:
+                ep  = pd.to_numeric(df["episode"], errors="coerce")[:19999].to_numpy(dtype=np.float64)
+                val = pd.to_numeric(df[df_col],    errors="coerce")[:19999].to_numpy(dtype=np.float64)
             per_run_series.append(per_run_window_means(ep, val, WINDOW_EP))
         agg = aggregate_runs_by_window(per_run_series, WINDOW_EP)
         if agg is None:
@@ -299,12 +349,19 @@ def _compute_series_xyz(dfs, col, n_runs):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+def _load_run(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.attrs["source"] = path
+    df.attrs["neurons_path"] = os.path.splitext(path)[0] + "_neurons.csv"
+    return df
+
+
 def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, list[str]]]):
     chart_slug = re.sub(r"[^A-Za-z0-9]+", "_", chart_key).strip("_").lower()
     out_png = os.path.join(OUT_DIR, f"comparison_{chart_slug}_{n_runs}_runs.png")
 
     # pre-load each solution's dataframes once
-    loaded = [(key, [pd.read_csv(p) for p in paths]) for key, paths in solutions]
+    loaded = [(key, [_load_run(p) for p in paths]) for key, paths in solutions]
 
     n_panels = len(PANELS)
     n_cols = 2
@@ -392,7 +449,8 @@ def render_comparison(chart_key: str, n_runs: int, solutions: list[tuple[str, li
     print(f"  ✓  {out_png}")
 
 def main():
-    files = sorted(glob.glob(INPUT_GLOB))
+    files = [f for f in sorted(glob.glob(INPUT_GLOB))
+             if not COMPANION_RE.search(os.path.splitext(os.path.basename(f))[0])]
     if not files:
         print(f"No CSV files found matching {INPUT_GLOB!r}.")
         return

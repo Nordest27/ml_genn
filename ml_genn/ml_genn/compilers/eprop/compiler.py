@@ -18,7 +18,7 @@ from ...callbacks import (BatchProgressBar, CustomUpdateOnBatchBegin,
 from ...communicators import Communicator
 from ...losses import Loss, SparseCategoricalCrossentropy, default_losses
 from ...metrics import MetricsType
-from ...neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, Input, LeakyIntegrate,
+from ...neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, ResonatorALIF, PlateauALIF, Input, LeakyIntegrate,
                         LeakyIntegrateFire, LeakyIntegrateFireInput)
 from ...optimisers import Optimiser, default_optimisers
 from ...synapses import Delta
@@ -233,6 +233,17 @@ class EPropCompiler(Compiler):
                                     the optimised feedback weights (None: ``optimiser``), e.g.
                                     Adam on the raw readout gradient when the hidden rule is
                                     factor-normalised and uses SGD
+        population_optimisers:       {Population: Optimiser} own optimiser for the hidden synapses onto a
+                                    population (e.g. a fast optimiser for the field layers of a nonlinear
+                                    readout, a slow one for the reservoir layers); readout and feedback
+                                    weights keep readout_optimiser, every other synapse uses ``optimiser``
+        episodic:                    Episodic learning: a "TraceReset" custom update that zeros every
+                                    synapse's lambda-traces (hidden rule and readout), for the training
+                                    loop to call at each episode start, and an episode mode in the value
+                                    head (EpMode: 0 within an episode, 1 terminal - the terminal value is
+                                    0 -, 2 the first step of an episode - no TD error across episodes).
+                                    Neuron states, short filters, running baselines and optimiser states
+                                    are kept.
         fuse_weight_updates:         Let GeNN fuse identical pre/postsynaptic weight-update code
                                     (faster; False keeps every group's pre/post variables readable,
                                     e.g. for diagnostics)
@@ -286,6 +297,8 @@ class EPropCompiler(Compiler):
                  optimise_feedback: bool = False,
                  train_readout: bool = True,
                  readout_optimiser=None,
+                 population_optimisers: dict = None,
+                 episodic: bool = False,
                  fuse_weight_updates: bool = True,
                  population_rules: dict = None,
                  plastic_inhibition: dict = None,
@@ -357,6 +370,10 @@ class EPropCompiler(Compiler):
         self.fuse_weight_updates = fuse_weight_updates
         self._readout_optimiser = (None if readout_optimiser is None else
                                    get_object(readout_optimiser, Optimiser, "Optimiser", default_optimisers))
+        self.episodic = episodic
+        # one Optimiser object per distinct setting: populations sharing an object share one optimiser group
+        self._population_optimisers = {p: get_object(o, Optimiser, "Optimiser", default_optimisers)
+                                       for p, o in (population_optimisers or {}).items()}
         self.value_reg = value_reg
         self.value_afterglow = value_afterglow
         self.value_transform = value_transform
@@ -523,6 +540,11 @@ class EPropCompiler(Compiler):
             compile_state.tau_adapt = pop.neuron.tau_adapt
         if isinstance(pop.neuron, BlackBoxALIF):   # last: it rewrites the final integration line
             neuron_logic.apply_black_box(model_copy, pop.neuron.coefficients(pop, self.dt))
+        elif isinstance(pop.neuron, ResonatorALIF):
+            neuron_logic.apply_resonator(model_copy, *pop.neuron.rotation(self.dt))
+        elif isinstance(pop.neuron, PlateauALIF):
+            pl = pop.neuron.plateau
+            neuron_logic.apply_plateau(model_copy, pl["g"], pl["theta_p"], pl["s"], pl["tau_p"], pl["gain"])
 
     def readout_kappa(self):
         """Membrane decay of the readout heads (the policy head's; the value head's if there is none), or None.
@@ -558,10 +580,12 @@ class EPropCompiler(Compiler):
 
         optimiser_custom_updates = []
         readout_custom_updates = []          # stays empty without a readout_optimiser
+        population_custom_updates = {}       # id(optimiser) -> (optimiser, custom updates) for population_optimisers
         deep_r_record_rewirings_ccus = []
         dale_rewiring_required = self._add_weight_optimisers(
             genn_model, connection_populations, compile_state, optimiser_custom_updates,
-            readout_custom_updates, deep_r_record_rewirings_ccus)
+            readout_custom_updates, deep_r_record_rewirings_ccus, population_custom_updates)
+        population_updates = [u for _, ups in population_custom_updates.values() for u in ups]
 
         self._add_bias_optimisers(genn_model, neuron_populations, compile_state,
                                   optimiser_custom_updates, readout_custom_updates)
@@ -571,9 +595,11 @@ class EPropCompiler(Compiler):
             self.add_softmax_custom_updates(genn_model, genn_pop, o, s)
 
         compile_state.create_reset_custom_updates(self, genn_model, neuron_populations)
+        if self.episodic:
+            self._add_trace_reset(genn_model, connection_populations)
 
         base_train_callbacks, base_validate_callbacks = self._build_callbacks(
-            compile_state, optimiser_custom_updates + readout_custom_updates,
+            compile_state, optimiser_custom_updates + readout_custom_updates + population_updates,
             deep_r_record_rewirings_ccus, dale_rewiring_required)
 
         optimisers = []
@@ -581,6 +607,7 @@ class EPropCompiler(Compiler):
             optimisers.append((self._optimiser, optimiser_custom_updates))
         if len(readout_custom_updates) > 0:
             optimisers.append((self._readout_optimiser, readout_custom_updates))
+        optimisers += [(o, ups) for o, ups in population_custom_updates.values() if ups]
 
         return CompiledTrainingNetwork(
             genn_model, neuron_populations, connection_populations,
@@ -622,7 +649,7 @@ class EPropCompiler(Compiler):
 
     def _add_weight_optimisers(self, genn_model, connection_populations, compile_state,
                                optimiser_custom_updates, readout_custom_updates,
-                               deep_r_record_rewirings_ccus):
+                               deep_r_record_rewirings_ccus, population_custom_updates=None):
         """Add Deep-R / Dale rewiring infrastructure and an optimiser custom
         update for every weight that needs one. Returns whether Dale
         rewiring was used anywhere.
@@ -664,13 +691,32 @@ class EPropCompiler(Compiler):
 
             readout = (self._readout_optimiser is not None
                        and c in compile_state.readout_optimiser_connections)
-            (readout_custom_updates if readout else optimiser_custom_updates).append(
-                self._create_optimiser_custom_update(
-                    f"Weight{i}", weight_var_ref, delta_g_var_ref,
-                    genn_model, True,
-                    self._readout_optimiser if readout else self._optimiser))
+            own = (not readout and c not in compile_state.readout_optimiser_connections
+                   and c.target() in self._population_optimisers)
+            if readout:
+                optimiser, updates = self._readout_optimiser, readout_custom_updates
+            elif own:
+                optimiser = self._population_optimisers[c.target()]
+                updates = population_custom_updates.setdefault(id(optimiser), (optimiser, []))[1]
+            else:
+                optimiser, updates = self._optimiser, optimiser_custom_updates
+            updates.append(self._create_optimiser_custom_update(
+                f"Weight{i}", weight_var_ref, delta_g_var_ref, genn_model, True, optimiser))
 
         return dale_rewiring_required
+
+    # the lambda-traces that carry credit over time (hidden rule and readout); short filters such as ZFilter,
+    # epsilonA, NoiseTrace and eFiltered follow the neuron's own state and are not reset
+    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace",
+                        "ReviveTrace", "DiagGtrace", "DiagG1trace")
+
+    def _add_trace_reset(self, genn_model, connection_populations):
+        for i, genn_pop in enumerate(connection_populations.values()):
+            names = [n for n in self.TRACE_RESET_VARS if n in genn_pop.vars]
+            if names:
+                model = create_reset_custom_update([(n, "scalar", 0.0) for n in names],
+                                                   lambda name, g=genn_pop: create_wu_var_ref(g, name))
+                self.add_custom_update(genn_model, model, "TraceReset", f"CUTraceReset{i}")
 
     def _add_bias_optimisers(self, genn_model, neuron_populations, compile_state,
                              optimiser_custom_updates, readout_custom_updates):

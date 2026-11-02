@@ -62,7 +62,8 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, rho: float,
                           f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float,
-                          send_back: bool = False, readout_kappa: float = None, local_params: bool = False):
+                          send_back: bool = False, readout_kappa: float = None, local_params: bool = False,
+                          refrac_gated: bool = False):
     """Return the keyword arguments of a ``WeightUpdateModel`` (model dict and initial values).
 
     send_back: this synapse's presynaptic neuron is a hidden neuron that receives the backward signal
@@ -73,7 +74,11 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     parameters; every term then uses that neuron's own threshold (Thr), effective leak (AlphaEff) and adaptation
     (RhoJ, Beta) instead of the population constants, and the presynaptic trace is kept per synapse, decaying with
     the postsynaptic neuron's leak (ZFilterS, fed by ZSpk, the presynaptic spike of the previous update). With the
-    coefficients of heterogeneity 0 the arithmetic is identical to the standard rule."""
+    coefficients of heterogeneity 0 the arithmetic is identical to the standard rule.
+
+    refrac_gated: the postsynaptic neuron discards its input while refractory (integrate_during_refrac=False); the
+    presynaptic trace is then per synapse and takes no input delivered while the postsynaptic neuron is refractory
+    (it keeps decaying), which is that neuron's actual dV/dW. Without it the arithmetic is the standard rule's."""
     weight_noise = cfg.noise in (NoisePlacement.WEIGHT_SHARED, NoisePlacement.WEIGHT_INDEPENDENT)
     node_noise = cfg.noise is NoisePlacement.NODE
     exact = cfg.estimator is Estimator.EXACT
@@ -457,14 +462,21 @@ else {
     }
     if pre_refs:
         model["pre_neuron_var_refs"] = [(k, "scalar") for k in pre_refs]
-    if local_params:
+    if local_params or refrac_gated:   # per-synapse presynaptic trace
         if fn_pre:
-            raise NotImplementedError("factor_norm with a presynaptic factor is not implemented for black-box "
-                                      "neurons (the presynaptic trace is per synapse there)")
+            raise NotImplementedError("factor_norm with a presynaptic factor is not implemented with a per-synapse "
+                                      "presynaptic trace (black-box or non-integrating refractory neurons)")
         import re
-        sub = lambda code: re.sub(r"\bZFilter\b", "ZFilterS",
-                                  re.sub(r"\bRho\b", "Rho_post", re.sub(r"\bAlpha\b", "Alpha_post", code)))
-        model["synapse_dynamics_code"] = ("ZFilterS = Alpha_post * ZFilterS + ZSpk;\n"
+        if local_params:
+            sub_params = lambda code: re.sub(r"\bRho\b", "Rho_post", re.sub(r"\bAlpha\b", "Alpha_post", code))
+        else:
+            sub_params = lambda code: code
+        sub = lambda code: re.sub(r"\bZFilter\b", "ZFilterS", sub_params(code))
+        decay = "Alpha_post" if local_params else "Alpha"
+        # an input delivered while the postsynaptic neuron is refractory is discarded by it (RefracTime_post is the
+        # value the neuron's next update tests)
+        inp = "((RefracTime_post > 0.0) ? 0.0 : ZSpk)" if refrac_gated else "ZSpk"
+        model["synapse_dynamics_code"] = (f"ZFilterS = {decay} * ZFilterS + {inp};\n"
                                           + sub(model["synapse_dynamics_code"]))
         model["post_dynamics_code"] = sub(model["post_dynamics_code"])
         model["post_spike_code"] = sub(model["post_spike_code"])
@@ -472,8 +484,9 @@ else {
         model["pre_dynamics_code"] = "ZSpk = 0.0;\n" + model["pre_dynamics_code"]
         model["pre_vars"] = pre_vars + [("ZSpk", "scalar")]; pre_var_vals["ZSpk"] = 0.0
         model["vars"] = vars_ + [("ZFilterS", "scalar")]; var_vals["ZFilterS"] = 0.0
-        model["params"] = [p for p in params if p[0] != "Vthresh_post"]; param_vals.pop("Vthresh_post")
-        post_refs.update({"Vthresh_post": "Thr", "Alpha_post": "AlphaEff", "Rho_post": "RhoJ"})
+        if local_params:
+            model["params"] = [p for p in params if p[0] != "Vthresh_post"]; param_vals.pop("Vthresh_post")
+            post_refs.update({"Vthresh_post": "Thr", "Alpha_post": "AlphaEff", "Rho_post": "RhoJ"})
         model["post_neuron_var_refs"] = [(k, "scalar") for k in post_refs]
     return dict(model=model, param_vals=param_vals, var_vals=var_vals,
                 pre_var_vals=pre_var_vals, post_var_vals=post_var_vals,

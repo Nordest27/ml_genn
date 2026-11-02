@@ -12,6 +12,9 @@ Config ("network" key of SNAKE_CONFIG), any subset, e.g.
 The layers list sets the depth: one entry per layer, {} for a layer with default settings (with ei_layers other than
 1 the two must agree). Shapes given as an int n mean (n, n, channels). A layer or the fields may carry their own learning rule ("rule"), passed
 to the compiler as population_rules (the layer split: e.g. perturbation-based in wide layers, e-prop in narrow ones).
+A layer or the fields may also carry their own optimiser ("optimiser": {"type": "adam", "lr": 1e-5, "betas": [...]},
+unset keys from the main optimiser), passed as population_optimisers: e.g. fast field layers (a nonlinear readout) on
+slow reservoir layers.
 """
 from dataclasses import dataclass, field, fields as dc_fields, replace
 from typing import Optional, Tuple, Union
@@ -21,7 +24,7 @@ import numpy as np
 from ml_genn import Connection, Network, Population
 from ml_genn.connectivity import Dense, FixedProbability, LocalPermutation, ToroidalGaussian2D
 from ml_genn.initializers import Normal
-from ml_genn.neurons import AdaptiveLeakyIntegrateFire, BlackBoxALIF, LeakyIntegrate, PoissonInput
+from ml_genn.neurons import AdaptiveLeakyIntegrateFire, BlackBoxALIF, LeakyIntegrate, PlateauALIF, PoissonInput, ResonatorALIF
 
 Shape = Tuple[int, int, int]
 
@@ -101,6 +104,8 @@ class LayerSpec:
                                                                # feedforward inhibition outweighs the excitation 3:1;
                                                                # mean_scale 0.033 here balances it
     rule: Optional[Union[str, dict]] = None                    # learning rule of this layer (None: the default)
+    optimiser: Optional[dict] = None                           # {"type", "lr", "betas"}: own optimiser for the
+                                                               # synapses onto this layer (None: the main optimiser)
     to_next_targets: str = "both"                              # "both": this layer projects to the next layer's E and
                                                                # I populations (disynaptic feedforward inhibition:
                                                                # E_n -> I_n+1 -> E_n+1); "e": to its E population only,
@@ -125,6 +130,7 @@ class FieldSpec:
     conn_i: Optional[ConnSpec] = None                                   # ... from the I population only (None: conn)
     readout_p: float = 0.99999       # field -> head (fixed probability, weights N(0, 1 / sqrt(fan_in)))
     rule: Optional[Union[str, dict]] = None
+    optimiser: Optional[dict] = None   # {"type", "lr", "betas"}: own optimiser for the synapses onto the fields
 
 
 @dataclass
@@ -134,6 +140,18 @@ class RelaySpec:
     from the value head every step by the training script); fixed-probability excitatory connections into the first
     layer's E and I populations, plastic under the hidden rule like every other synapse."""
     n: int = 10                      # neurons per channel (ON, OFF)
+    p: float = 0.5                   # connection probability to every first-layer neuron
+    mean_scale: float = 0.1          # weight mean mean_scale / sqrt(fan-in), fan-in = p * 2n
+    sd_scale: float = 0.05
+
+
+@dataclass
+class CueSpec:
+    """Context cue (cued foraging): a Poisson population of two groups of n neurons, one per context, the active group
+    firing at the input rate (set every move by the training script). Fixed-probability excitatory connections into
+    the first layer's E and I populations, plastic under the hidden rule like the input; without hidden layers (ei_layers
+    0) the cue projects to the heads, like the input."""
+    n: int = 10                      # neurons per context
     p: float = 0.5                   # connection probability to every first-layer neuron
     mean_scale: float = 0.1          # weight mean mean_scale / sqrt(fan-in), fan-in = p * 2n
     sd_scale: float = 0.05
@@ -151,9 +169,13 @@ class NetworkSpec:
     explicit_feedback: bool = True   # random feedback connections from every hidden population to the heads
     feedback_p: float = 1.0          # ... from the EI layers (from the fields: readout_p)
     node_sigma: float = 1e-2         # membrane-noise s.d. of every hidden neuron (used by node-noise rules only)
+    integrate_during_refrac: bool = True  # False: hidden ALIF neurons discard their input while refractory
+    resonator: Optional[dict] = None  # {"period": P, "gain": k}: every hidden ALIF population is a ResonatorALIF
+    plateau: Optional[dict] = None  # {"g", "theta_p", "s", "tau_p", "gain"}: every hidden ALIF population is a PlateauALIF
     black_box: Optional[dict] = None  # {"h": heterogeneity, "seed": s}: every hidden ALIF population (fields too) is a
                                       # BlackBoxALIF with per-neuron dynamics the learning rules are not told about
     reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
+    cue: Optional[CueSpec] = None    # None: no context-cue input (set by cued_foraging)
 
 
 @dataclass
@@ -171,6 +193,8 @@ class Built:
     slow: list = field(default_factory=list)              # per layer: its slow sub-population, or None
     inhibitory_to_slow: list = field(default_factory=list)   # I -> slow connections (I onto excitatory, like I -> E)
     reward_relay: Optional[Population] = None              # the relay population (ON then OFF neurons) or None
+    cue: Optional[Population] = None                       # the context-cue population (one group per context) or None
+    population_optimisers: dict = field(default_factory=dict)   # Population -> (owner, settings), e.g. ("L2", {...})
 
     @property
     def hidden(self):
@@ -271,9 +295,15 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
                               exact=exact)
 
 
-def _alif(neuron: NeuronSpec, node_sigma, black_box=None):
+def _alif(neuron: NeuronSpec, node_sigma, black_box=None, integrate_during_refrac=True, resonator=None,
+         plateau=None):
     kw = dict(v_thresh=neuron.v_thresh, tau_mem=neuron.tau_mem, tau_refrac=neuron.tau_refrac,
-              tau_adapt=neuron.tau_adapt, beta=neuron.beta, perturbation_eps_std=node_sigma)
+              tau_adapt=neuron.tau_adapt, beta=neuron.beta, perturbation_eps_std=node_sigma,
+              integrate_during_refrac=integrate_during_refrac)
+    if plateau is not None:
+        return PlateauALIF(**{k: float(v) for k, v in plateau.items()}, **kw)
+    if resonator is not None:
+        return ResonatorALIF(period=float(resonator["period"]), gain=float(resonator.get("gain", 1.0)), **kw)
     if black_box is not None:
         return BlackBoxALIF(heterogeneity=float(black_box.get("h", 0.0)), black_box_seed=int(black_box.get("seed", 0)),
                             **kw)
@@ -286,7 +316,7 @@ def _gain(conn: ConnSpec, g: float) -> ConnSpec:
 
 def build_network(spec: NetworkSpec, default_params) -> Built:
     network = Network(default_params)
-    labels, rules, i_to_e, i_to_i, i_to_s = {}, {}, [], [], []
+    labels, rules, optimisers, i_to_e, i_to_i, i_to_s = {}, {}, {}, [], [], []
     slows = []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
@@ -298,8 +328,10 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             s = slows[k] if k < len(slows) else None
             return _gain(conn, spec.layers[k].slow.in_gain) if (s is not None and target is s and sign > 0) else conn
         for k, ls in enumerate(spec.layers):
-            e = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box), ls.e_shape)
-            i = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box), ls.i_shape)
+            e = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
+                         spec.plateau), ls.e_shape)
+            i = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
+                         spec.plateau), ls.i_shape)
             for pre, post, src_shape, fan, sign in ((e, e, ls.e_shape, ls.fan_in_e, +1), (e, i, ls.e_shape, ls.fan_in_e, +1),
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
                 spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
@@ -315,10 +347,13 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             labels[e], labels[i] = f"L{k + 1}_E", f"L{k + 1}_I"
             if ls.rule is not None:
                 rules[e] = rules[i] = ls.rule
+            if ls.optimiser is not None:
+                optimisers[e] = optimisers[i] = (f"L{k + 1}", ls.optimiser)
             s = None
             if ls.slow is not None:                  # slow sub-population: recurrent with E, I and itself
                 s_shape = ls.slow.shape or ls.e_shape
-                s = Population(_alif(ls.slow.neuron, spec.node_sigma, spec.black_box), s_shape)
+                s = Population(_alif(ls.slow.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
+                         spec.plateau), s_shape)
                 for pre, post, src_shape, fan, sign in ((e, s, ls.e_shape, ls.fan_in_e, +1), (s, e, s_shape, ls.fan_in_e, +1),
                                                         (s, s, s_shape, ls.fan_in_e, +1), (s, i, s_shape, ls.fan_in_e, +1),
                                                         (i, s, ls.i_shape, ls.fan_in_i, -1)):
@@ -333,6 +368,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 labels[s] = f"L{k + 1}_S"
                 if ls.rule is not None:
                     rules[s] = ls.rule
+                if ls.optimiser is not None:
+                    optimisers[s] = (f"L{k + 1}", ls.optimiser)
             slows.append(s)
             layers.append((e, i))
         lpops = lambda k: list(layers[k]) + ([slows[k]] if slows[k] is not None else [])
@@ -342,15 +379,35 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         fields = None
         if spec.fields is not None:
             fs = spec.fields
-            fields = (Population(_alif(fs.neuron, spec.node_sigma, spec.black_box), fs.shape),
-                      Population(_alif(fs.neuron, spec.node_sigma, spec.black_box), fs.shape))
+            fields = (Population(_alif(fs.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
+                         spec.plateau), fs.shape),
+                      Population(_alif(fs.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
+                         spec.plateau), fs.shape))
             labels[fields[0]], labels[fields[1]] = "policy_field", "value_field"
             if fs.rule is not None:
                 rules[fields[0]] = rules[fields[1]] = fs.rule
+            if fs.optimiser is not None:
+                optimisers[fields[0]] = optimisers[fields[1]] = ("fields", fs.optimiser)
 
         policy = Population(LeakyIntegrate(tau_mem=spec.head_tau_mem, bias=0.0, readout="var"), spec.num_actions)
         value = Population(LeakyIntegrate(tau_mem=spec.head_tau_mem, bias=0.0, readout="var"), 1)
 
+        cue = Population(PoissonInput(), (2 * spec.cue.n,)) if spec.cue is not None else None
+        if not layers:
+            # no hidden layers (ei_layers 0): the heads read the input directly, fully connected, and learn with the
+            # readout rule alone - the strictly online counterpart of a linear policy / value on the raw frame
+            if spec.fields is not None or spec.reward_relay is not None:
+                raise ValueError("ei_layers 0: the heads read the input directly; set network.fields to null and use "
+                                 "no reward relay")
+            for head in (policy, value):
+                Connection(inp, head, connectivity(ConnSpec(type="fixed", p=1.0), spec.input_shape, None),
+                           exc_inh_sign=None)
+                if cue is not None:
+                    Connection(cue, head, connectivity(ConnSpec(type="fixed", p=1.0), cue.shape, None),
+                               exc_inh_sign=None)
+            Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
+            return Built(network, inp, layers, None, policy, value, labels, rules, i_to_e, i_to_i,
+                         slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue)
         # input -> first layer (excitatory)
         first = spec.layers[0]
         for target in lpops(0):
@@ -365,6 +422,13 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             for target in layers[0]:
                 Connection(relay, target, connectivity(ConnSpec(type="fixed", p=rs.p, mean_scale=rs.mean_scale,
                                                                 sd_scale=rs.sd_scale), (2 * rs.n,), +1),
+                           exc_inh_sign=+1)
+        # context cue -> first layer (its own connections; excitatory, plastic like the input)
+        if cue is not None:
+            cs = spec.cue
+            for target in layers[0]:
+                Connection(cue, target, connectivity(ConnSpec(type="fixed", p=cs.p, mean_scale=cs.mean_scale,
+                                                              sd_scale=cs.sd_scale), cue.shape, +1),
                            exc_inh_sign=+1)
         # layer k -> layer k+1 (centre_shift: one displacement field per step, on the target layer's sheet, shared by
         # all its populations so that neighbouring E, I and slow neurons are displaced together)
@@ -443,7 +507,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
     return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay,
-                 slow=slows, inhibitory_to_slow=i_to_s)
+                 slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -571,7 +635,9 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                        fields=FieldSpec(shape=(hp["hid_i"],) * 2 + (channels,), conn=conn(hp["ei_layers"], ff="field", p=0.005),
                                         conn_i=ff_i),
                        explicit_feedback=hp["explicit_feedback"], node_sigma=hp["node_sigma"],
-                       black_box=hp.get("black_box"))
+                       black_box=hp.get("black_box"),
+                       integrate_during_refrac=bool(hp.get("integrate_during_refrac", True)),
+                       resonator=hp.get("resonator"), plateau=hp.get("plateau"))
     net = dict(hp.get("network") or {})
     if "layers" in net:
         if hp["ei_layers"] != 1 and len(net["layers"]) != hp["ei_layers"]:
@@ -596,6 +662,8 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
                 ld["slow"] = {**ld["slow"], "shape": _shape(ld["slow"]["shape"], channels)}
             layers.append(_merge(replace(base_layer(depth), **short), ld))
         spec = replace(spec, layers=layers)
+    if hp.get("cued_foraging"):
+        spec = replace(spec, cue=_merge(CueSpec(), dict(hp["cued_foraging"].get("cue") or {})))
     if "reward_relay" in net:
         rr = net.pop("reward_relay")
         spec = replace(spec, reward_relay=None if rr is None else _merge(RelaySpec(), rr))

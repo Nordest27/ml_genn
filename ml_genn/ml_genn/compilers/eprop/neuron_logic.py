@@ -145,7 +145,7 @@ def _h_inv_code(y, eps):
 
 
 def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglow=None, transform=None,
-                        centring=None):
+                        centring=None, episodic=False):
     """TD error of the value (critic) head: E = gamma V_t + r_t - V_{t-1}, with the reward decaying by
     reward_decay per step. value_reg > 0 adds a smoothness regulariser value_reg * (V_t - V_{t-1})
     (ValReg, used by the value readout's update); 0 reproduces the original implementation.
@@ -158,6 +158,9 @@ def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglo
     model_copy.add_var("ValReg", "scalar", 0.0)
     model_copy.add_var("PrevVal", "scalar", 0.0)
     out = model_copy.output_var_name
+    if episodic and (centring or transform is not None or afterglow):
+        raise ValueError("episodic value learning cannot be combined with value_centring, value_transform or "
+                         "value_afterglow (continuing-task variants)")
     reg = f"ValReg = {value_reg!r} * ({out} - PrevVal);\n" if value_reg != 0 else ""
     if centring:
         # reward centring (continuing tasks): the TD error uses r - RhoBar, RhoBar a running estimate of the reward per
@@ -221,6 +224,21 @@ def add_value_head_code(model_copy, gamma, reward_decay, value_reg=0.0, afterglo
             """
         )
         return
+    if episodic:
+        # EpMode, set by the training loop: 0 within an episode; 1 terminal (from the step the episode ends, through
+        # its drain): the terminal state's value is 0, no bootstrap; 2 the first step of a new episode: no TD error
+        # across the boundary, the current value is only recorded
+        model_copy.add_var("EpMode", "scalar", 0.0)
+        model_copy.append_sim_code(
+            f"""
+            const scalar boot = (EpMode > 0.5 && EpMode < 1.5) ? 0.0 : {out};
+            E = (EpMode > 1.5) ? 0.0 : boot * {gamma} + reward - PrevVal; // TD error
+            {reg}PrevVal = boot;
+            reward *= {reward_decay};
+            tdError = 0;
+            """
+        )
+        return
     model_copy.append_sim_code(
         f"""
         E = {out} * {gamma} + reward - PrevVal; // TD error
@@ -255,7 +273,7 @@ def add_rl_output_head_code(model_copy, pop, compiler):
     else:
         add_value_head_code(model_copy, compiler.gamma, compiler.reward_decay, compiler.value_reg,
                             getattr(compiler, "value_afterglow", None), getattr(compiler, "value_transform", None),
-                            getattr(compiler, "value_centring", None))
+                            getattr(compiler, "value_centring", None), getattr(compiler, "episodic", False))
 
 
 def add_supervised_error_code(model_copy):
@@ -483,3 +501,43 @@ def apply_black_box(model_copy, coefficients):
     if "V -= (Vthresh - Vreset);" not in reset:
         raise RuntimeError("black-box neuron: needs the relative reset")
     model_copy.model["reset_code"] = reset.replace("V -= (Vthresh - Vreset);", "V -= ResetF * (Thr - Vreset);")
+
+
+def apply_resonator(model_copy, cos_t, sin_t, gain):
+    """Turn a (modified) ALIF hidden neuron into a resonate-and-fire neuron (ml_genn.neurons.ResonatorALIF): V and a
+    second variable W rotate by the angle with cosine cos_t / sine sin_t while decaying by Alpha; the input enters V
+    scaled by gain. Applied on the final integration line "V = Alpha * V + <input>;" after every other modification.
+    With cos_t = 1, sin_t = 0 and gain = 1 the arithmetic equals the standard neuron's (W stays 0)."""
+    import re
+    model_copy.add_var("W", "scalar", 0.0)
+    model_copy.add_param("RCos", "scalar", cos_t)
+    model_copy.add_param("RSin", "scalar", sin_t)
+    model_copy.add_param("RGain", "scalar", gain)
+    code = model_copy.model["sim_code"]
+    m = re.search(r"V = Alpha \* V \+ (.*?);", code)
+    if m is None:
+        raise RuntimeError("resonator neuron: integration line not found")
+    inp = m.group(1)
+    new = (f"{{\n    const scalar vOld = V;\n"
+           f"    V = Alpha * ((RCos * vOld) - (RSin * W)) + RGain * ({inp});\n"
+           f"    W = Alpha * ((RSin * vOld) + (RCos * W));\n}}")
+    model_copy.model["sim_code"] = code[:m.start()] + new + code[m.end():]
+
+
+def apply_plateau(model_copy, g, theta_p, s, tau_p, gain):
+    """Add the bistable persistent current of ml_genn.neurons.PlateauALIF to a (modified) ALIF hidden neuron, on the
+    final integration line "V = Alpha * V + <input>;" after every other modification. P is updated from the voltage
+    before this step's integration. With g = 0 and gain = 1 the voltage arithmetic equals the standard neuron's."""
+    import re
+    model_copy.add_var("P", "scalar", 0.0)
+    for name, value in (("PlatG", g), ("PlatTheta", theta_p), ("PlatS", s), ("PlatTau", tau_p), ("PlatGain", gain)):
+        model_copy.add_param(name, "scalar", value)
+    code = model_copy.model["sim_code"]
+    m = re.search(r"V = Alpha \* V \+ (.*?);", code)
+    if m is None:
+        raise RuntimeError("plateau neuron: integration line not found")
+    inp = m.group(1)
+    new = (f"{{\n    const scalar pOld = P;\n"
+           f"    P = P + ((1.0 / (1.0 + exp(-(V - PlatTheta) / PlatS))) - P) / PlatTau;\n"
+           f"    V = Alpha * V + PlatG * pOld + PlatGain * ({inp});\n}}")
+    model_copy.model["sim_code"] = code[:m.start()] + new + code[m.end():]

@@ -107,10 +107,14 @@ class AdaptiveLeakyIntegrateFire(Neuron):
                 }}
                 """
             else:
+                # while refractory the membrane decays as usual but discards its input; adaptation decays once per
+                # step in both branches (the standard integration line stays intact in the else branch, so the
+                # compilers' code edits apply to it)
                 genn_model["sim_code"] = f"""
-                A *= Rho;
                 if (RefracTime > 0.0) {{
                     RefracTime -= dt;
+                    V = Alpha * V;
+                    A *= Rho;
                 }}
                 else {{
                     {sim_code_perturbation}

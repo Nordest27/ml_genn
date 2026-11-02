@@ -57,6 +57,22 @@ import csv
 #     "coactivity_decay": 0.99999, "max_add": 8, "headroom": 1.5} - synapses whose co-activity (presynaptic trace x
 #     psi, slow mean) stays below rel_threshold x the connection's median get a new presynaptic partner drawn locally
 #     around the same postsynaptic neuron (fan-in and locality kept, fan-out free); see activity_rewiring.py
+# resonator: None or {"period": P, "gain": k} - every hidden ALIF population is a ResonatorALIF (resonate-and-fire
+#     membrane, damped oscillation with period P ms, input gain k); the rules keep their standard traces
+# plateau: None or {"g": 0.08, "theta_p": 0.3, "s": 0.05, "tau_p": 30, "gain": 0.6} - every hidden ALIF population is a
+#     PlateauALIF (bistable persistent current: a single-neuron memory); the rules keep their standard traces
+# episodic_traces: True - episodic learning (task knowledge, like the softmax and the reward signal): at each episode
+#     start every synapse's lambda-traces (hidden rule and readout) and the value head's decaying reward are zeroed;
+#     the value head treats the end of an episode as terminal (value 0, no bootstrap, through the drain) and computes
+#     no TD error across the boundary. Neuron states, short filters, baselines and optimiser states are kept
+# cued_foraging: None or {"bad_reward": -1.0, "max_bad_length": 10, "cue": {"n": 10, "p": 0.5, ...}} - two apples
+#     (types A and B, own input channels: the input has 4 channels) and a context cue (its own input population,
+#     snake_network.CueSpec) saying which type is good; eating the bad one gives bad_reward (snake_switch.CuedForagingEnv)
+# replay: None or {"probe": "path/to/run(0)_probe.npz", "window": "last"} - feed the network the frames a probe
+#     recording stored (the recorded agent's inputs, whatever this network's actions) and stop when they end; with the
+#     "probe" option this records e.g. the untrained reservoir on a trained agent's states (snake_switch.ReplayEnv)
+# integrate_during_refrac: False - every hidden ALIF neuron discards its input while refractory (e-prop's trace still
+#     counts it; the noise-based drift differentiates through the actual dynamics)
 # black_box: None or {"h": heterogeneity, "seed": s} - every hidden ALIF population is a BlackBoxALIF whose per-neuron
 #     dynamics (nonlinear leak, saturating input, threshold, partial reset, adaptation, refractory integration) the
 #     rules do not know; both rules use each neuron's own parameters (see ml_genn.neurons.BlackBoxALIF)
@@ -71,7 +87,9 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "optimiser_betas": None, "l2_init": None,
                         "readout_optimiser": None, "monitor_score_factors": False,
                         "drift_check": None, "activity_rewiring": None,
-                        "black_box": None}
+                        "black_box": None, "integrate_during_refrac": True,
+                        "resonator": None, "plateau": None, "replay": None, "cued_foraging": None,
+                        "episodic_traces": False}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -517,7 +535,7 @@ WAIT_INC = 30
 # 0.5 per timestep, i.e. a spike probability of 1-exp(-0.5) ~= 0.39.
 INPUT_RATE_SCALE = 0.7
 
-INPUT_C = 3
+INPUT_C = 4 if HP["cued_foraging"] else 3       # cued foraging: apples A and B in channels 2 and 3
 
 INPUT_SHAPE = (VISIBLE_RANGE*SCALE, VISIBLE_RANGE*SCALE, INPUT_C)
 DOWNSAMPLE_SHAPE = (30, 30, INPUT_C)
@@ -748,6 +766,22 @@ def build_compiled_network(connectivity_type="fixed"):
             raise ValueError("readout_optimiser needs the modular compiler (set hidden_rule)")
         ro = HP["readout_optimiser"]
         rule_kwargs["readout_optimiser"] = make_optimiser(ro["type"], ro.get("lr", HP["lr"]), ro.get("betas"))
+    if HP["episodic_traces"]:
+        if HP["hidden_rule"] is None:
+            raise ValueError("episodic_traces needs the modular compiler (set hidden_rule)")
+        rule_kwargs["episodic"] = True
+    if built.population_optimisers:
+        # per-layer optimisers from the "network" layers / fields entries ("optimiser": {"type", "lr", "betas"});
+        # unset keys take the main optimiser's settings. One optimiser per layer, shared by its populations
+        if HP["hidden_rule"] is None:
+            raise ValueError("per-layer optimisers need the modular compiler (set hidden_rule)")
+        made = {}
+        for pop, (owner, cfg) in built.population_optimisers.items():
+            if owner not in made:
+                kind = cfg.get("type", HP["optimiser"])
+                made[owner] = make_optimiser(kind, cfg.get("lr", HP["lr"]),
+                                             cfg.get("betas", HP["optimiser_betas"] if kind == HP["optimiser"] else None))
+            rule_kwargs.setdefault("population_optimisers", {})[pop] = made[owner]
     compiler = compiler_cls(
         **rule_kwargs,
         f_target=HP["f_target"],
@@ -793,7 +827,8 @@ def build_compiled_network(connectivity_type="fixed"):
     compiled_net = compiler.compile(network)
 
     # return compiled_net, network, input_pop, hidden_layers, policy, value
-    return compiled_net, network, input_pop, {i: l for i, l in enumerate(built.layers[0])}, policy, value, built
+    return (compiled_net, network, input_pop, {i: l for i, l in enumerate(built.layers[0] if built.layers else ())},
+            policy, value, built)
 
 compiled_net, network, input_pop, hidden_layers, policy, value, built = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
@@ -808,6 +843,26 @@ def rho_bar_now():
         return 0.0
     vpop.vars["RhoBar"].pull_from_device()
     return float(np.asarray(vpop.vars["RhoBar"].view).ravel()[0])
+
+
+CUE_POP = built.cue
+
+
+def feed_cue(env):
+    """Cued foraging: the active context's group of the cue population fires at the input rate, the other is silent."""
+    if CUE_POP is None:
+        return
+    n = CUE_POP.shape[0] // 2
+    rates = np.zeros(2 * n, dtype=np.float32)
+    rates[n * env.cue:n * (env.cue + 1)] = INPUT_RATE_SCALE
+    compiled_net.set_input({CUE_POP: rates})
+
+
+def set_episode_mode(mode):
+    """episodic_traces: the value head's EpMode (0 within an episode, 1 terminal, 2 the first step of an episode)."""
+    vpop = compiled_net.neuron_populations[value]
+    vpop.vars["EpMode"].view[:] = mode
+    vpop.vars["EpMode"].push_to_device()
 
 
 def relay_reward_context():
@@ -1335,6 +1390,11 @@ def train_snake_agent_with_ipc(episodes=10000,
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
         if HP["memory"]:
             env = snake_switch.MemoryEnv(env, **HP["memory"])
+        if HP["cued_foraging"]:
+            env = snake_switch.CuedForagingEnv(env, **{k: v for k, v in HP["cued_foraging"].items() if k != "cue"},
+                                               seed=None if HP["seed"] is None else HP["seed"] + 7)
+        if HP["replay"]:
+            env = snake_switch.ReplayEnv(env, **HP["replay"])
         if HP["switch"]:
             env = snake_switch.SwitchingEnv(env, **HP["switch"], wait_inc=WAIT_INC,
                                             log_path=f"outputs/{CSV_PREFIX}({REPETITION})_switches.csv")
@@ -1355,6 +1415,16 @@ def train_snake_agent_with_ipc(episodes=10000,
             if len(every) != 1:
                 raise ValueError("plastic inhibition: use one normalise_every for all normalised connections")
             normaliser = InhibitionNormaliser(compiled_net, list(normalised), every.pop())
+        # the "frequency" column: one connection per hidden population that keeps the postsynaptic running rate FAvg
+        freq_sources = {}
+        for c, genn_pop in compiled_net.connection_populations.items():
+            tgt = c.target()
+            if any(tgt is p for p in built.hidden) and tgt not in freq_sources and "FAvg" in genn_pop.post_vars:
+                try:                          # groups GeNN fused into another have no array of their own
+                    genn_pop.post_vars["FAvg"].pull_from_device()
+                except AttributeError:
+                    continue
+                freq_sources[tgt] = genn_pop
         probe = None
         if HP["probe"]:
             probe = snake_switch.ProbeRecorder(compiled_net, built.hidden, [built.labels[p] for p in built.hidden],
@@ -1396,7 +1466,8 @@ def train_snake_agent_with_ipc(episodes=10000,
         gamma_disc_reward = 0
         ep = 0
         # while compiled_net.genn_model.timestep < 30e6: 
-        while ep < HP["min_episodes"] or compiled_net.genn_model.timestep < HP["max_timesteps"]:
+        while ((ep < HP["min_episodes"] or compiled_net.genn_model.timestep < HP["max_timesteps"])
+               and not getattr(env, "exhausted", False)):
             ep += 1
             # if env.won:
             #     compiled_net.save_connectivity((BOARD_SIZE,), serialiser)
@@ -1444,6 +1515,13 @@ def train_snake_agent_with_ipc(episodes=10000,
             for m in all_metrics.values():
                 m.reset()
             obs = env.reset()
+            if HP["episodic_traces"]:
+                # the learning part starts afresh: no credit or reward carried over from the last episode, and no
+                # TD error across the boundary on the episode's first step
+                compiled_net.genn_model.custom_update("TraceReset")
+                compiled_net.losses[value].set_var(compiled_net.neuron_populations[value], "reward", 0.0)
+                set_episode_mode(2)
+                episode_start = True
             done = False
             total_reward = 0
             current_run = []
@@ -1466,6 +1544,7 @@ def train_snake_agent_with_ipc(episodes=10000,
             )
             """
             compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
+            feed_cue(env)
             # compiled_net.step_time(train_callback_list)
             # previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
@@ -1574,6 +1653,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                                          else probs)
 
                 obs, reward, done = env.step(action_label)
+                if done and HP["episodic_traces"]:
+                    set_episode_mode(1)            # this step's TD error and the drain: the terminal value is 0
                 total_reward += reward
                 gamma_disc_reward += reward
                 reward_trace = reward_trace * reward_decay + reward * 1.0
@@ -1602,6 +1683,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                     else:
                         current_run.append(frame_img.copy())
                     compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
+                    feed_cue(env)
                 # spikes = make_rate_coded_spikes(
                 #     obs.reshape(-1),
                 #     compiled_net.genn_model.timestep,
@@ -1612,6 +1694,9 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
+                if HP["episodic_traces"] and episode_start and not done:
+                    set_episode_mode(0)            # past the episode's first step: normal TD
+                    episode_start = False
 
                 if monitor is not None and env.wait_count == env.wait_inc:
                     monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
@@ -1632,23 +1717,16 @@ def train_snake_agent_with_ipc(episodes=10000,
                     probe.sample(env, obs, ep)
 
                 if env.wait_count == env.wait_inc:
-                    for conn_pop in list(compiled_net.connection_populations.values())[::-1]:
-                        try:
-                            conn_pop.post_vars["FAvg"].pull_from_device()
-                            f = conn_pop.post_vars["FAvg"].view
-                        except:
-                            f = 0
-                            pass
-                    # print("----------------------------")
-                    # conn_pop.vars["SynSig"].pull_from_device()
-                    # print(np.mean(conn_pop.vars["SynSig"].values))
-                    
-                    # conn_pop.vars["RLNoiseTrace"].pull_from_device()
-                    # print(sum(abs(conn_pop.vars["RLNoiseTrace"].values)))
-                    # for smth in dir(conn_pop):
-                    #     print(smth)
-                    freq_avg = freq_avg*0.999 + 0.001*np.mean(abs(f))
+                    # network-wide hidden rate: every hidden population's running rate, weighted by its size
+                    rates, counts = [], []
+                    for genn_pop in freq_sources.values():
+                        genn_pop.post_vars["FAvg"].pull_from_device()
+                        f = genn_pop.post_vars["FAvg"].view
+                        rates.append(np.mean(np.abs(f)))
+                        counts.append(np.size(f))
+                    freq_avg = freq_avg*0.999 + 0.001*(np.average(rates, weights=counts) if rates else 0.0)
 
+                if env.wait_count == env.wait_inc and hidden_layers:   # no hidden layers: no voltage to log
                     compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["V"].pull_from_device()
                     compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["A"].pull_from_device()
                     compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["Beta"].pull_from_device()
@@ -1718,8 +1796,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                     print("-----------------TdE----------------")
                 # td_error_trace = 0
 
-                compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].pull_from_device() 
-                if abs(td_error - compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].view[0]) > 0.001:
+                if hidden_layers:
+                    compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].pull_from_device()
+                if hidden_layers and abs(td_error - compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].view[0]) > 0.001:
                     print("Host", td_error)
                     print("Dev", compiled_net.neuron_populations[list(hidden_layers.values())[0]].vars["TdE"].view[0])
                     print("--------------Hid E TdE----------------")
@@ -1733,6 +1812,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 ep_frames += 1
 
             compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
+
+            feed_cue(env)
             for i in range(WAIT_INC):
                 gamma_disc_reward *= gamma
                 if i % WAIT_INC == 0:

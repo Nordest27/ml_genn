@@ -147,6 +147,147 @@ class SwitchingEnv:
                                         " ".join(map(str, self.act)), "".join("1" if x else "0" for x in self.flip)])
 
 
+class ReplayEnv:
+    """Replays a probe recording (ProbeRecorder with its input frames and board state) instead of playing: every move
+    the network is given the recorded agent's frame, whatever its own actions, so another network (e.g. the untrained
+    reservoir) can be probed on exactly the states a trained agent visited. The board state behind each frame (body,
+    apple, heading) is set on the wrapped SnakeEnv for the probe's task variables and the viewers.
+
+    Episodes follow the recording's episode index. A recorded sample is the frame after a move; the first sample of
+    each episode is presented at reset (its own move was not recorded), the following ones after each move.
+    `exhausted` turns True when the last recorded episode ends (snake.py then stops)."""
+    DIRS = ["left", "up", "right", "down"]
+
+    def __init__(self, env, probe, window="last"):
+        z = np.load(probe, allow_pickle=False)
+        if f"{window}_inp" not in z.files or z[f"{window}_inp"].size == 0:
+            raise ValueError(f"replay: {probe} has no input frames for window {window!r}")
+        if int(z["board"]) != env.size:
+            raise ValueError(f"replay: recorded board {int(z['board'])} != this board {env.size}")
+        self.env = env
+        self.frames, self.body, self.apple = z[f"{window}_inp"], z[f"{window}_body"], z[f"{window}_apple"]
+        self.heading = z[f"{window}_y"][:, 6].astype(int)
+        ep = z[f"{window}_extra"][:, 4]
+        starts = np.r_[0, np.where(ep[1:] != ep[:-1])[0] + 1]
+        self.episodes = list(zip(starts, np.r_[starts[1:], len(ep)]))
+        self.shape = env.get_local_img_observation().shape
+        if int(np.prod(self.shape)) != self.frames.shape[1]:
+            raise ValueError(f"replay: recorded frames have {self.frames.shape[1]} values, this input {self.shape}")
+        self.k, self.i, self.end = 0, 0, 0
+        self.wait_inc, self.wait_count = env.wait_inc, env.wait_inc
+        self.done, self.exhausted = False, False
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def _frame(self, i):
+        return (self.frames[i].astype(np.float32) / 255.0).reshape(self.shape)
+
+    def _set_state(self, i):
+        self.env.snake = [tuple(int(v) for v in b) for b in self.body[i] if b[0] >= 0]
+        self.env.apples = [tuple(int(v) for v in self.apple[i])] if self.apple[i][0] >= 0 else []
+        self.env.direction = self.DIRS[self.heading[i]]
+
+    def reset(self):
+        self.i, self.end = self.episodes[self.k]
+        self.k += 1
+        self._set_state(self.i)
+        self.wait_count, self.done = self.wait_inc, False
+        return self._frame(self.i)
+
+    def step(self, action):
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self._frame(self.i), 0.0, False
+        self.i += 1
+        if self.i >= self.end:                  # the recorded episode ended here
+            self.done = True
+            self.exhausted = self.k >= len(self.episodes)
+            return self._frame(self.end - 1), 0.0, True
+        self._set_state(self.i)
+        self.wait_count = self.wait_inc
+        return self._frame(self.i), 0.0, False
+
+
+class CuedForagingEnv:
+    """Cued foraging: two apples on the board, type A and type B, each drawn in its own input channel (channels 2 and
+    3 of a 4-channel observation; 0 and 1 as in Snake). A cue says which type is good; it is re-drawn at random at
+    every spawn and exposed as `cue` (0: A is good, 1: B is good) for the training script to feed to the network's
+    cue population. Eating the good apple works as in Snake (+1, the snake grows); eating the bad one gives
+    `bad_reward` and no growth. Either way both apples respawn with a new cue. The value of heading for an apple is
+    cue x type, a contextual XOR that a linear readout of the frame and the cue cannot represent.
+
+    Apples never spawn on a cell next to the head, so no move can be forced onto one. From a snake length (cells,
+    head included) of `max_bad_length` on, only the good apple spawns. Starvation (no good apple for size^2 moves)
+    is the wrapped Snake's rule; a bad apple does not reset it. fixed_cue=0 or 1 keeps the cue constant (always the same
+    type good): the control in which no conjunction with the cue is needed."""
+
+    def __init__(self, env, bad_reward=-1.0, max_bad_length=10, seed=None, fixed_cue=None):
+        self.env, self.bad_reward, self.max_bad_length = env, float(bad_reward), int(max_bad_length)
+        self.fixed_cue = None if fixed_cue is None else int(fixed_cue)
+        self.rng = np.random.default_rng(seed)
+        self.cue, self.bad, self._good = 0, None, None
+
+    def __getattr__(self, name):
+        return getattr(self.env, name)
+
+    def __setattr__(self, name, value):
+        if name in ("wait_count",):
+            setattr(self.env, name, value)
+        else:
+            object.__setattr__(self, name, value)
+
+    def _spawn(self):
+        snake, size = self.env.snake, self.env.size
+        hy, hx = snake[0]
+        near = {(hy + dy, hx + dx) for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0))}
+        free = [(i, j) for i in range(size) for j in range(size) if (i, j) not in snake]
+        safe = [c for c in free if c not in near] or free
+        if not safe:                                       # the board is full
+            self.env.apples, self.bad, self._good = [], None, None
+            return
+        self._good = safe.pop(int(self.rng.integers(len(safe))))
+        self.env.apples = [self._good]
+        self.bad = (safe[int(self.rng.integers(len(safe)))]
+                    if len(snake) < self.max_bad_length and safe else None)
+        self.cue = int(self.rng.integers(2)) if self.fixed_cue is None else self.fixed_cue
+
+    def reset(self):
+        self.env.reset()
+        self._spawn()
+        return self.get_local_img_observation()
+
+    def step(self, action):
+        moving = self.env.wait_count == 0
+        _, reward, done = self.env.step(action)
+        if moving and not done:
+            if self.bad is not None and self.env.snake[0] == self.bad:
+                reward += self.bad_reward
+                self._spawn()
+            elif list(self.env.apples) != ([self._good] if self._good is not None else []):
+                self._spawn()                              # the good apple was eaten (Snake respawned its own)
+        return self.get_local_img_observation(), reward, done
+
+    def get_local_img_observation(self):
+        good = list(self.env.apples)
+        try:
+            g = self.env.get_local_img_observation()
+            self.env.apples = [self.bad] if self.bad is not None else []
+            b = self.env.get_local_img_observation()
+        finally:
+            self.env.apples = good
+        a_map, b_map = (g[..., 2], b[..., 2]) if self.cue == 0 else (b[..., 2], g[..., 2])
+        return np.stack([g[..., 0], g[..., 1], a_map, b_map], axis=-1).astype(np.float32)
+
+    def img(self, scale=10):
+        """The board with both apples (the good one in Snake's apple colour, red; the bad one blue)."""
+        board = self.env.img(scale=scale)
+        if self.bad is not None:
+            y, x = self.bad
+            board[y * scale:(y + 1) * scale, x * scale:(x + 1) * scale] = (255, 0, 0)       # BGR: blue
+        return board
+
+
 class MemoryEnv:
     """Snake with a disappearing apple: a new apple is visible to the agent for `visible_moves` moves, then it is
     removed from the agent's observation (it stays on the board and can still be eaten). The view is centred on the
@@ -265,7 +406,7 @@ class NeuronMonitor:
         for l in self.labels:
             cols += [f"{l}_dead", f"{l}_dead_silent", f"{l}_dead_firing", f"{l}_mean_psi", f"{l}_hz",
                      f"{l}_recovered", f"{l}_vloss", f"{l}_v_mean", f"{l}_v_p10", f"{l}_v_p90", f"{l}_hyper",
-                     f"{l}_deadzone"]
+                     f"{l}_deadzone", f"{l}_n"]
         cols += [f"dW|{name}" for name, *_ in self.weight_groups]
         # Dale's law is not enforced during continuous training: fraction of each sign-constrained group's synapses
         # whose weight has crossed to the other sign (E source: g < 0; I source: g > 0)
@@ -330,7 +471,7 @@ class NeuronMonitor:
             row += [dead.mean(), silent.mean(), (dead & ~silent).mean(), psi.mean(), hz.mean(), rec,
                     self.vloss[i] / max(self.samples, 1), float(v_mean.mean()), float(np.percentile(v_mean, 10)),
                     float(np.percentile(v_mean, 90)), float(np.mean(v_mean < -5.0 * p.neuron.v_thresh)),
-                    self.dead_zone[i] / max(self.samples, 1)]
+                    self.dead_zone[i] / max(self.samples, 1), int(np.prod(p.shape))]
             self.dead_zone[i] = 0.0
             self.vloss[i] = 0.0
             self.v_sum[i][:] = 0

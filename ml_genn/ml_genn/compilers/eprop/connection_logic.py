@@ -235,7 +235,9 @@ def build_hidden_wum(conn, connect_snippet, compiler, compile_state, target_neur
         f_target=(compiler.f_target * compiler.dt) / 1000.0,
         alpha_fav=np.exp(-compiler.dt / compiler.tau_reg),
         v_thresh=target_neuron.v_thresh, td_lambda=compiler.td_lambda, send_back=send_back,
-        local_params=isinstance(target_neuron, BlackBoxALIF))
+        local_params=isinstance(target_neuron, BlackBoxALIF),
+        refrac_gated=(isinstance(target_neuron, AdaptiveLeakyIntegrateFire) and target_neuron.tau_refrac is not None
+                      and not target_neuron.integrate_during_refrac))
     kw["var_vals"]["g"] = connect_snippet.weight
     return WeightUpdateModel(**kw)
 

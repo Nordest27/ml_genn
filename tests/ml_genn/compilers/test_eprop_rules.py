@@ -52,6 +52,8 @@ def _network(seed=0):
 
 def _compile(compiler_cls, name, policy_type, **kw):
     net, inp, hid, pol, val = _network()
+    if "population_optimisers" in kw and callable(kw["population_optimisers"]):
+        kw["population_optimisers"] = kw["population_optimisers"](hid)   # needs the hidden population itself
     gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
     optimiser = kw.pop("optimiser", None) or AdaBelief(1e-3, beta1=0.99, beta2=0.99999)
     compiler = compiler_cls(
@@ -1170,6 +1172,132 @@ def test_readout_optimiser_updates_the_readout_and_the_main_optimiser_the_hidden
             assert np.allclose(sg.vars["g"].values, g0 - rate * dg, rtol=1e-4, atol=1e-7)
 
 
+
+@pytest.mark.parametrize("with_readout", [True, False])
+def test_population_optimisers_give_the_synapses_onto_a_population_their_own_optimiser(request, with_readout):
+    """population_optimisers: synapses onto a listed hidden population use its optimiser; the readout keeps the
+    readout optimiser (or the main one without it)."""
+    lr_main, lr_pop, lr_out = 1e-3, 2e-2, 5e-2
+    kw = dict(hidden_rule={"preset": "proposed"}, optimiser=SGD(lr_main, beta1=0.9),
+              population_optimisers=lambda h: {h: SGD(lr_pop, beta1=0.9)})
+    if with_readout:
+        kw["readout_optimiser"] = SGD(lr_out, beta1=0.9)
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC, **kw)
+    assert len(compiled.optimisers) == 2          # the population's group and the readout's (main or its own)
+    expected_out = lr_out if with_readout else lr_main
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        groups = [((lr_pop if c.target() is hid else expected_out), sg)
+                  for c, sg in compiled.connection_populations.items()
+                  if not c.is_feedback and c.target() in (hid, val)]
+        for t in range(40):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0)
+            compiled.step_time(cb)
+        before = []
+        for rate, sg in groups:
+            for v in ("g", "DeltaG"):
+                sg.vars[v].pull_from_device()
+            before.append((sg.vars["g"].values.copy(), sg.vars["DeltaG"].values.copy()))
+        compiled.genn_model.custom_update("GradientLearn")
+        for (rate, sg), (g0, dg) in zip(groups, before):
+            sg.vars["g"].pull_from_device()
+            assert np.abs(dg).max() > 0
+            assert np.allclose(sg.vars["g"].values, g0 - rate * dg, rtol=1e-4, atol=1e-7)
+
+
+def test_drift_only_keeps_the_local_rewards_on_their_own_gradient_score():
+    """drift_only with local rewards (GRADIENT_INSTANT): the task trace carries the drift gate (Psi - PsiBar) alone,
+    and the local term keeps its instantaneous gradient-part score; proposed differs only in the task gate."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    local = {"route": "GRADIENT_INSTANT", "dv": 0.0, "decorr": 1.0}
+    code = {name: build_td_hidden_model(hidden_rule_from_dict({"preset": name, "local": local}), **kw)
+            ["model"]["synapse_dynamics_code"] for name in ("drift_only", "proposed")}
+    assert "((Psi) - 1.0 * PsiBar) * ZFilter * normXi;" in code["drift_only"]
+    assert "((Psi) - 2.0 * PsiBar) * ZFilter * normXi;" in code["proposed"]
+    for c in code.values():
+        assert "(LocR - LocMean) * (-PsiBar * ZFilter * normXi)" in c
+
+
+def test_episodic_trace_reset_zeros_the_lambda_traces_only(request):
+    """episodic: "TraceReset" zeros every synapse's lambda-traces (hidden rule and readout) and leaves
+    the weights, the presynaptic filters and the neuron state alone."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, episodic=True,
+                                            fuse_weight_updates=False)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        for t in range(60):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0)
+            compiled.step_time(cb)
+        traced = {}
+        for c, sg in compiled.connection_populations.items():
+            names = [n for n in EPropCompiler.TRACE_RESET_VARS if n in sg.vars]
+            if names:
+                checked = [n for n in names + ["g", "ZFilter"] if n in sg.vars]
+                for n in checked:
+                    sg.vars[n].pull_from_device()
+                traced[c] = (sg, names, {n: sg.vars[n].values.copy() for n in checked})
+        assert any(c.target() is hid for c in traced) and any(c.target() is val for c in traced)
+        assert any(np.abs(v[n]).max() > 0 for _, names, v in traced.values() for n in names)
+        hpop = compiled.neuron_populations[hid]
+        hpop.vars["V"].pull_from_device()
+        v_before = hpop.vars["V"].view.copy()
+        compiled.genn_model.custom_update("TraceReset")
+        for c, (sg, names, before) in traced.items():
+            for n in before:
+                sg.vars[n].pull_from_device()
+                after = sg.vars[n].values
+                if n in names:
+                    assert np.all(after == 0.0), (c, n)
+                else:
+                    assert np.array_equal(after, before[n]), (c, n)
+        hpop.vars["V"].pull_from_device()
+        assert np.array_equal(hpop.vars["V"].view, v_before)
+
+
+def test_episodic_value_head_terminal_and_start_modes(request):
+    """episodic: EpMode 1 (terminal) gives E = reward - PrevVal and records a terminal value of 0; EpMode 2 (episode
+    start) gives no TD error and records the current value; EpMode 0 is the usual TD error."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, episodic=True)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    vpop = compiled.neuron_populations[val]
+
+    def mode(m):
+        vpop.vars["EpMode"].view[:] = m
+        vpop.vars["EpMode"].push_to_device()
+
+    def read(*names):
+        for n in names:
+            vpop.vars[n].pull_from_device()
+        return [float(np.asarray(vpop.vars[n].view).ravel()[0]) for n in names]
+
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        for _ in range(30):
+            compiled.step_time(cb)
+        prev, = read("PrevVal")
+        compiled.losses[val].set_var(vpop, "reward", 0.5)
+        mode(1)
+        compiled.step_time(cb)
+        e, prev_after = read("E", "PrevVal")
+        assert abs(e - (0.5 - prev)) < 1e-5 and prev_after == 0.0
+        mode(2)
+        compiled.step_time(cb)
+        e, prev_after = read("E", "PrevVal")
+        assert e == 0.0 and prev_after != 0.0
+        mode(0)
+        compiled.step_time(cb)
+        e, = read("E")
+        assert e != 0.0
+
 def test_score_adaptation_off_uses_zfilter_alone_in_the_noise_scores():
     from ml_genn.compilers.eprop import hidden_rule_to_dict
     kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
@@ -1423,6 +1551,99 @@ def test_black_box_neuron_at_heterogeneity_one_differs_per_neuron_and_learns(req
                                  {"preset": "proposed"})
     assert thr.std() > 0.02 and np.isfinite(v1).all() and np.isfinite(w1).all()
     assert not np.allclose(v0, v1) and not np.allclose(w0, w1)
+
+
+def test_non_integrating_refractory_neuron_decays_without_input_and_the_trace_skips_that_input(request):
+    """integrate_during_refrac=False: while refractory the membrane decays by Alpha and discards its input, adaptation
+    decays once per step; the rule's per-synapse presynaptic trace takes no input delivered while the postsynaptic
+    neuron is refractory and otherwise follows ZFilter's recursion."""
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0, integrate_during_refrac=False)
+    net, inp, hid, pol, val = _black_box_network(AdaptiveLeakyIntegrateFire(**kw))
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=AdaBelief(1e-3, beta1=0.99, beta2=0.99999), c_reg=1e-4, batch_size=1,
+        feedback_type="random", reward_decay=0.1 ** (1 / K), gamma=0.5 ** (1 / K), td_lambda=0.8 ** (1 / K),
+        train_output_bias=False, reset_time_between_batches=False,
+        entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND,
+        hidden_rule={"preset": "proposed"})
+    compiled = compiler.compile(net, request.node.name)
+    alpha, rho = np.exp(-1 / 10.0), np.exp(-1 / 300.0)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.full(N_IN, 0.9, np.float32)})
+        hpop = compiled.neuron_populations[hid]
+        sg = next(s_ for c, s_ in compiled.connection_populations.items() if c.source() is inp and c.target() is hid)
+        zsg = next(o for o in compiled.connection_populations.values()
+                   if o.src is sg.src and "ZFilter" in o.pre_vars and getattr(o.pre_vars["ZFilter"], "_array", None) is not None)
+        assert "ZFilterS" in sg.vars
+        def state():
+            for v in ("V", "A", "RefracTime"):
+                hpop.vars[v].pull_from_device()
+            zsg.pre_vars["ZFilter"].pull_from_device(); sg.vars["ZFilterS"].pull_from_device()
+            return ({v: np.array(hpop.vars[v].view).ravel().copy() for v in ("V", "A", "RefracTime")},
+                    np.array(zsg.pre_vars["ZFilter"].view).ravel().copy(),
+                    np.array(sg.vars["ZFilterS"].view).reshape(N_IN, N_HID).copy())
+        prev, zf_prev, _ = state()
+        ref_trace = np.zeros((N_IN, N_HID))
+        n_refr = 0
+        for t in range(300):
+            compiled.step_time(cb)
+            cur, zf, trace = state()
+            refr = prev["RefracTime"] > 0                      # tested by this step's neuron update
+            spiked = cur["RefracTime"] == 3.0                    # spiked in this update (reset to TauRefrac)
+            q = refr & ~spiked
+            n_refr += q.sum()
+            assert np.allclose(cur["V"][q], alpha * prev["V"][q], rtol=1e-6, atol=1e-7)
+            quiet = ~spiked
+            assert np.allclose(cur["A"][quiet], rho * prev["A"][quiet], rtol=1e-6, atol=1e-9)
+            # reference trace: decays by Alpha; the presynaptic spike of update t-1 enters unless the postsynaptic
+            # neuron is refractory for update t
+            z_last = np.round(zf_prev - alpha * zf_prev_prev, 3) if t > 0 else np.zeros(N_IN)
+            # (step t's synapse dynamics see the RefracTime left by update t-1, i.e. prev)
+            ref_trace = alpha * ref_trace + z_last[:, None] * (prev["RefracTime"][None, :] <= 0)
+            zf_prev_prev, zf_prev, prev = zf_prev, zf, cur
+            if t > 2:
+                assert np.allclose(trace, ref_trace, rtol=1e-5, atol=1e-5), np.abs(trace - ref_trace).max()
+        assert n_refr > 50
+
+
+@pytest.mark.parametrize("rule", [{"preset": "proposed"}, {"preset": "eprop"}])
+def test_resonator_neuron_without_rotation_is_the_standard_neuron(request, rule):
+    from ml_genn.neurons import ResonatorALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), rule)
+    v1, w1, _ = _black_box_run(request.node.name + "_res", ResonatorALIF(period=None, **kw), rule)
+    assert np.array_equal(v0, v1), np.abs(v0 - v1).max()
+    assert np.array_equal(w0, w1), np.abs(w0 - w1).max()
+
+
+def test_resonator_neuron_oscillates(request):
+    from ml_genn.neurons import ResonatorALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), {"preset": "proposed"})
+    v1, w1, _ = _black_box_run(request.node.name + "_res", ResonatorALIF(period=25.0, gain=2.0, **kw),
+                               {"preset": "proposed"})
+    assert np.isfinite(v1).all() and np.isfinite(w1).all() and not np.allclose(v0, v1)
+
+
+@pytest.mark.parametrize("rule", [{"preset": "proposed"}, {"preset": "eprop"}])
+def test_plateau_neuron_without_feedback_is_the_standard_neuron(request, rule):
+    from ml_genn.neurons import PlateauALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), rule)
+    v1, w1, _ = _black_box_run(request.node.name + "_pl", PlateauALIF(g=0.0, gain=1.0, **kw), rule)
+    assert np.array_equal(v0, v1), np.abs(v0 - v1).max()
+    assert np.array_equal(w0, w1), np.abs(w0 - w1).max()
+
+
+def test_plateau_neuron_switches_and_sustains(request):
+    from ml_genn.neurons import PlateauALIF
+    kw = dict(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0)
+    v0, w0, _ = _black_box_run(request.node.name + "_std", AdaptiveLeakyIntegrateFire(**kw), {"preset": "proposed"})
+    v1, w1, _ = _black_box_run(request.node.name + "_pl", PlateauALIF(g=0.08, gain=0.6, **kw), {"preset": "proposed"})
+    assert np.isfinite(v1).all() and not np.allclose(v0, v1)
 
 
 def test_factor_norm_from_dict_and_validation():

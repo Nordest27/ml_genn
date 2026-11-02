@@ -228,7 +228,8 @@ def build_compiled_network(connectivity_type=None):
 
     compiled_net = compiler.compile(network)
 
-    hidden_layers = {i: pop for i, pop in enumerate(built.layers[0])}      # the first layer's E and I
+    # the first layer's E and I (none with ei_layers 0: the heads read the input directly)
+    hidden_layers = {i: pop for i, pop in enumerate(built.layers[0] if built.layers else ())}
     return compiled_net, network, input_pop, hidden_layers, policy, value
 
 
@@ -383,21 +384,22 @@ def train(compiled_net, input_pop, hidden_layers, policy, value,
                 freq_avg = np.mean(abs(f))
                 syn_sig_avg = np.mean(syn_sig_vals)
 
-                # Voltage diagnostics on first hidden population
-                first_hidden = list(hidden_layers.values())[0]
-                compiled_net.neuron_populations[first_hidden].vars["V"].pull_from_device()
-                compiled_net.neuron_populations[first_hidden].vars["A"].pull_from_device()
-                compiled_net.neuron_populations[first_hidden].vars["Beta"].pull_from_device()
+                # Voltage diagnostics on first hidden population (none without hidden layers)
+                if hidden_layers:
+                    first_hidden = list(hidden_layers.values())[0]
+                    compiled_net.neuron_populations[first_hidden].vars["V"].pull_from_device()
+                    compiled_net.neuron_populations[first_hidden].vars["A"].pull_from_device()
+                    compiled_net.neuron_populations[first_hidden].vars["Beta"].pull_from_device()
 
-                v_view    = compiled_net.neuron_populations[first_hidden].vars["V"].view
-                A_view    = compiled_net.neuron_populations[first_hidden].vars["A"].view
-                beta_view = compiled_net.neuron_populations[first_hidden].vars["Beta"].view
+                    v_view    = compiled_net.neuron_populations[first_hidden].vars["V"].view
+                    A_view    = compiled_net.neuron_populations[first_hidden].vars["A"].view
+                    beta_view = compiled_net.neuron_populations[first_hidden].vars["Beta"].view
 
-                v_avg = v_avg * 0.999 + 0.001 * np.mean(v_view)
-                v_reg_loss_avg = v_reg_loss_avg * 0.999 + 0.001 * np.mean(abs(
-                    np.maximum( v_view - (0.61 + beta_view * A_view), 0.0) +
-                    np.maximum(-v_view - (0.61 + beta_view * A_view), 0.0)
-                ))
+                    v_avg = v_avg * 0.999 + 0.001 * np.mean(v_view)
+                    v_reg_loss_avg = v_reg_loss_avg * 0.999 + 0.001 * np.mean(abs(
+                        np.maximum( v_view - (0.61 + beta_view * A_view), 0.0) +
+                        np.maximum(-v_view - (0.61 + beta_view * A_view), 0.0)
+                    ))
 
                 # Capture frame + re-encode spikes for the (possibly just
                 # updated, e.g. after the opponent moved) board state.

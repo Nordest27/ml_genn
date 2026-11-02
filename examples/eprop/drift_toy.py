@@ -73,13 +73,39 @@ def gate_shape(x, gate):
     raise ValueError(gate)
 
 
-def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=False):
+def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=False, noise2=None, sigma2=None,
+             th_true=None, th_gate=None, gate_table=None, track=False, eif=None, resonator=None, plateau=None):
     """Replay target neuron j in window w (an int, or one window per rollout as an (R,) array) for R rollouts.
     noise: (R, T+1) Noise1 samples (noise[:, t] is drawn in step t and delivered in step t+1); g: (R, n_aff)
     weights (default: the recorded ones). gate: "drift" (psi - psibar with the code's psi), "psi" (psi alone), or
     a tailed gate ("exp<s>" / "fs<s>", see gate_shape) used, with its own running mean, only in the score and the
-    eligibility (the neuron's dynamics are unchanged). Returns per step t = 1..T: score s, eligibility e for every
-    afferent (R, T, n_aff) and the voltage after the step (R, T)."""
+    eligibility (the neuron's dynamics are unchanged). Model-free gates measured with Stein's identity:
+    "stein2": gate = the neuron's last spike x its own total noise trace H / Var(H) (the same noise the score uses:
+    the score then subtracts E[gate-free part] x Cov(H, NoiseTrace), the second-order Stein correction);
+    "stein2x": gate = last spike x the trace of a second, independent per-neuron noise (noise2, s.d. sigma2, added
+    to the membrane) / its variance (no correction). Both estimate the drift of the true eligibility (the neuron's
+    measured spike sensitivity x presynaptic trace).
+    th_true: the neuron's real threshold (before adaptation; (R,) or scalar; default the nominal Vthresh), hidden
+    from the gate; th_gate: the threshold the gate is centred on (default th_true). The gate keeps the triangle's
+    width Vthresh (a design choice). gate_table: (edges, values), a measured gate as a function of the noise-free
+    voltage relative to th_gate (the bins option); replaces the triangle.
+    eif: {"delta": D, "vt": VT, "vpeak": VP} - exponential integrate-and-fire upswing,
+    V <- Alpha V + (1 - Alpha) D exp((V - VT) / D) + I, spike at V >= VP + Beta A (relative reset by Vthresh); the
+    gate still assumes the nominal hard threshold.
+    resonator: {"period": P, "gain": k} - resonate-and-fire membrane: (V, W) <- Alpha R(2 pi / P) (V, W) + (k I, 0),
+    threshold and
+    relative reset on V as usual. With track, the e-prop eligibilities for the spike of each step are also returned
+    (aligned with it): psi x a single decaying input trace (the unknown-model eligibility) and psi x the V component
+    of the eligibility vector propagated with the same damped rotation (the derived, known-model eligibility).
+    plateau: {"gp": g, "thp": theta, "s": s, "tau": tau, "gain": k} - bistable persistent current P:
+    P <- P + (sigmoid((V - theta) / s) - P) / tau, V <- Alpha V + g P + k I. With track the e-prop eligibilities are
+    returned as for the resonator: single decaying trace vs the derived (V, P) eligibility vector (Jacobian with the
+    sigmoid's slope), plus the plateau variable itself.
+    track: also return, per step, the noise-free voltage relative to the real (adaptive) spike threshold,
+    x = V - H - threshold (H = the neuron's own noise trace) before the
+    spike decision, the Stein sensitivity sample w = z H / Var(H), and the spikes, for learning the centre online.
+    Returns per step t = 1..T: score s, eligibility e for every afferent (R, T, n_aff) and the voltage after the
+    step (R, T) (and, with track, (x, w, z), each (R, T))."""
     src, pre, g0, sig, _ = rec.afferents(j)
     deliver, trace = rec.inputs(j)
     R = noise.shape[0]
@@ -87,46 +113,142 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
     g = np.broadcast_to(g0, (R, len(g0))) if g is None else g
     w = np.broadcast_to(np.asarray(w), (R,))
     st = {k: rec.state[k][w, 0, j].astype(np.float64) for k in ("V", "A", "RefracTime", "Psi", "PsiBar")}
-    tailed = gate not in ("drift", "psi")
+    stein = gate in ("stein2", "stein2x")
+    tailed = gate not in ("drift", "psi") and not stein
+    if stein:
+        R0 = noise.shape[0]
+        zlast = np.zeros(R0); H = np.zeros(R0); VarH = np.full(R0, 1e-12)
+        C = None                                   # Cov(H, NoiseTrace) per synapse ("stein2")
+        if gate == "stein2x" and (noise2 is None or sigma2 is None):
+            raise ValueError("stein2x needs noise2 and sigma2")
     if tailed:   # the tailed gate and its running mean, started from the recorded voltage
         x0 = (st["V"] - (rec.vth + rec.state["Beta"][w, 0, j] * st["A"])) / rec.vth
         st["PsiT"] = np.where(st["RefracTime"] > 0, 0.0, (0.3 / rec.vth) * gate_shape(x0, gate))
         st["PsiTBar"] = st["PsiT"].copy()
     beta = rec.state["Beta"][w, 0, j].astype(np.float64)
     a, kappa = rec.alpha, 1.0 - rec.alpha ** 2
+    R1 = noise.shape[0]
+    th0 = np.broadcast_to(np.asarray(rec.vth if th_true is None else th_true, dtype=np.float64), (R1,))
+    thg = th0 if th_gate is None else np.broadcast_to(np.asarray(th_gate, dtype=np.float64), (R1,))
+    if track or gate_table is not None or th_true is not None or th_gate is not None:
+        Ht = np.zeros(R1); VarHt = np.full(R1, 1e-12)
+    x_out, w_out, z_out = [], [], []
+    if plateau is not None:
+        st["P"] = np.zeros(R1)
+        epsV = np.zeros((R1, len(g0))); epsP = np.zeros((R1, len(g0))); eps1 = np.zeros((R1, len(g0)))
+        e1_out, e2_out, p_out = [], [], []
+    if resonator is not None:
+        th_r = 2 * np.pi / float(resonator["period"])
+        cr, sr = np.cos(th_r), np.sin(th_r)
+        st["W"] = np.zeros(R1)
+        epsV = np.zeros((R1, len(g0))); epsW = np.zeros((R1, len(g0))); eps1 = np.zeros((R1, len(g0)))
+        e1_out, e2_out = [], []
     nt = np.zeros((R, len(g0)))
     s_out, e_out, v_out = [], [], []
     for t in range(1, T + 1):
         # 1. synapse dynamics (psi and psibar from the previous neuron update, presynaptic trace after step t-1)
-        gt = (st["PsiT"] - st["PsiTBar"] if tailed else
-              st["Psi"] - st["PsiBar"] if gate == "drift" else st["Psi"])
-        e = gt[:, None] * trace[w, t - 1]
-        s_out.append(kappa * e * nt / (sig * sig + 1e-6)); e_out.append(e)
+        if stein:
+            gt = zlast * H / VarH
+            e = gt[:, None] * trace[w, t - 1]
+            score = kappa * e * nt / (sig * sig + 1e-6)
+            if gate == "stein2" and C is not None:   # second-order Stein: remove the E[f] Cov(H, NT) part
+                score = score - kappa * (zlast / VarH)[:, None] * trace[w, t - 1] * C / (sig * sig + 1e-6)
+            s_out.append(score); e_out.append(e)
+        else:
+            gt = (st["PsiT"] - st["PsiTBar"] if tailed else
+                  st["Psi"] - st["PsiBar"] if gate == "drift" else st["Psi"])
+            e = gt[:, None] * trace[w, t - 1]
+            s_out.append(kappa * e * nt / (sig * sig + 1e-6)); e_out.append(e)
         nt *= a
         # 2. delivery of the spikes emitted in step t-1, with the noise drawn in step t-1
         d = deliver[w, t - 1]
         eps = sig[None, :] * noise[:, t - 1][:, None] * d
         isyn = (g * d).sum(1) + eps.sum(1)
         nt += eps
+        if track or gate_table is not None or th_true is not None or th_gate is not None:
+            S_t = (sig[None, :] * d).sum(1)
+            Ht = a * Ht + noise[:, t - 1] * S_t; VarHt = a * a * VarHt + S_t * S_t
+        if stein:
+            S = (sig[None, :] * d).sum(1)                  # the shared sample's total weight this step
+            if gate == "stein2":
+                C = (a * a * C if C is not None else 0.0) + (sig[None, :] * d) * S[:, None]
+                H = a * H + noise[:, t - 1] * S
+                VarH = a * a * VarH + S * S
+            else:
+                eta = sigma2 * noise2[:, t - 1]
+                isyn = isyn + eta
+                H = a * H + eta
+                VarH = a * a * VarH + sigma2 * sigma2
         # 3. neuron update
-        st["V"] = a * st["V"] + isyn
+        if plateau is not None:
+            pg, pth, ps, ptau = (float(plateau[k]) for k in ("gp", "thp", "s", "tau"))
+            kin = float(plateau.get("gain", 1.0))
+            v_old, p_old = st["V"], st["P"]
+            sgm = 1.0 / (1.0 + np.exp(-(v_old - pth) / ps))
+            st["P"] = p_old + (sgm - p_old) / ptau
+            st["V"] = a * v_old + pg * p_old + kin * isyn
+            dsg = (sgm * (1 - sgm) / ps)[:, None]               # the sigmoid's slope at the current voltage
+            ev_old = epsV
+            epsV = a * ev_old + pg * epsP + kin * d
+            epsP = (1 - 1 / ptau) * epsP + dsg * ev_old / ptau
+            eps1 = a * eps1 + kin * d
+        elif resonator is not None:
+            v_old, w_old = st["V"], st["W"]
+            st["V"] = a * (cr * v_old - sr * w_old) + float(resonator.get("gain", 1.0)) * isyn
+            st["W"] = a * (sr * v_old + cr * w_old)
+            # eligibility traces of the input (per synapse): single decaying vs the derived damped rotation
+            ev_old = epsV
+            gr = float(resonator.get("gain", 1.0))
+            epsV = a * (cr * ev_old - sr * epsW) + gr * d
+            epsW = a * (sr * ev_old + cr * epsW)
+            eps1 = a * eps1 + gr * d
+        elif eif is not None:   # soft threshold and peak move with adaptation, like the hard threshold
+            ba = beta * st["A"]
+            up = (1 - a) * eif["delta"] * np.exp(np.minimum((st["V"] - eif["vt"] - ba) / eif["delta"], 20.0))
+            # the runaway is cut at the spike peak (discrete EIF): it spikes this step instead of diverging
+            st["V"] = np.minimum(a * st["V"] + up + isyn, eif["vpeak"] + ba + 0.05)
+        else:
+            st["V"] = a * st["V"] + isyn
         st["A"] *= rec.rho
         ref = st["RefracTime"]
         ref = np.where(ref > 0, ref - 1.0, ref)
-        th = rec.vth + beta * st["A"]
-        psi = (1.0 / rec.vth) * 0.3 * np.maximum(0.0, 1.0 - np.abs((st["V"] - th) / rec.vth))
+        th = (eif["vpeak"] if eif is not None else th0) + beta * st["A"]   # the neuron's real (adaptive) threshold
+        thg_t = thg + beta * st["A"]                       # where the gate is centred
+        if gate_table is not None:
+            edges, vals = gate_table
+            xr = st["V"] - Ht - thg_t                     # noise-free voltage relative to the gate's centre
+            psi = vals[np.clip(np.searchsorted(edges, xr) - 1, 0, len(vals) - 1)]
+        else:
+            psi = (1.0 / rec.vth) * 0.3 * np.maximum(0.0, 1.0 - np.abs((st["V"] - thg_t) / rec.vth))
         st["Psi"] = np.where(ref > 0, 0.0, psi)
         st["PsiBar"] = 0.99 * st["PsiBar"] + 0.01 * st["Psi"]
         if tailed:
             st["PsiT"] = np.where(ref > 0, 0.0, (0.3 / rec.vth) * gate_shape((st["V"] - th) / rec.vth, gate))
             st["PsiTBar"] = 0.99 * st["PsiTBar"] + 0.01 * st["PsiT"]
         spk = (st["V"] >= th) & (ref <= 0)
-        st["V"] = np.where(spk, st["V"] - rec.vth, st["V"])
+        if (resonator is not None or plateau is not None) and track:
+            psi_now = np.where(ref > 0, 0.0, (1.0 / rec.vth) * 0.3 * np.maximum(0.0, 1.0 - np.abs((st["V"] - th) / rec.vth)))
+            e1_out.append(psi_now[:, None] * eps1); e2_out.append(psi_now[:, None] * epsV)
+        if track:
+            x_out.append(st["V"] - Ht - th); z_out.append(spk.astype(np.float64))   # relative to the real threshold
+            w_out.append(np.where(ref > 0, 0.0, spk * Ht / VarHt))
+        st["V"] = np.where(spk, st["V"] - th0, st["V"])
         st["A"] = np.where(spk, st["A"] + 1.0, st["A"])
         st["RefracTime"] = np.where(spk, rec.refrac, ref)
+        if stein:
+            zlast = spk.astype(np.float64)
+        if plateau is not None and track:
+            p_out.append(st["P"].copy())
         v_out.append(st["V"].copy())
     if return_state:
         return st, nt
+    if track:
+        extra = (np.stack(x_out, 1), np.stack(w_out, 1), np.stack(z_out, 1))
+        if resonator is not None or plateau is not None:
+            extra = extra + (np.stack(e1_out, 1), np.stack(e2_out, 1))
+        if plateau is not None:
+            extra = extra + (np.stack(p_out, 1),)
+        return np.stack(s_out, 1), np.stack(e_out, 1), np.stack(v_out, 1), extra
     return np.stack(s_out, 1), np.stack(e_out, 1), np.stack(v_out, 1)
 
 
