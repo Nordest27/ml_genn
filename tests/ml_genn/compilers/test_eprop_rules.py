@@ -11,6 +11,8 @@ import os
 import sys
 from dataclasses import replace
 
+import re
+
 import numpy as np
 import pytest
 
@@ -1297,6 +1299,25 @@ def test_episodic_value_head_terminal_and_start_modes(request):
         compiled.step_time(cb)
         e, = read("E")
         assert e != 0.0
+
+
+@pytest.mark.parametrize("rule", [{"preset": "proposed"}, {"preset": "proposed_homeostat"}, {"preset": "eprop"}])
+def test_trace_norm_turns_every_lambda_trace_into_a_running_average(rule):
+    """trace_norm: each lambda-trace update keeps its increment, scaled by (1 - Lambda); nothing else changes."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    plain = build_td_hidden_model(hidden_rule_from_dict(rule), **kw)["model"]["synapse_dynamics_code"].splitlines()
+    normed = build_td_hidden_model(hidden_rule_from_dict({**rule, "trace_norm": True}),
+                                   **kw)["model"]["synapse_dynamics_code"].splitlines()
+    assert len(plain) == len(normed)
+    changed = 0
+    for a, b in zip(plain, normed):
+        m = re.match(r"^(\w+) = Lambda \* \1 ([+-]) (.*);$", a)
+        if m and m.group(1) != "FAvgTrace":
+            assert b == f"{m.group(1)} = Lambda * {m.group(1)} {m.group(2)} (1.0 - Lambda) * ({m.group(3)});"
+            changed += 1
+        else:
+            assert a == b
+    assert changed >= 1
 
 def test_score_adaptation_off_uses_zfilter_alone_in_the_noise_scores():
     from ml_genn.compilers.eprop import hidden_rule_to_dict

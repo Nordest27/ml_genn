@@ -65,6 +65,9 @@ import csv
 #     start every synapse's lambda-traces (hidden rule and readout) and the value head's decaying reward are zeroed;
 #     the value head treats the end of an episode as terminal (value 0, no bootstrap, through the drain) and computes
 #     no TD error across the boundary. Neuron states, short filters, baselines and optimiser states are kept
+# episodic_debug: n > 0 - log every simulation step of the first n episodes (value head EpMode, TD error E, PrevVal,
+#     reward variable, and the summed |lambda-trace| of one hidden and one readout synapse group) to
+#     outputs/<prefix>(<rep>)_episodic_debug.csv, to check the episode-boundary mechanics
 # cued_foraging: None or {"bad_reward": -1.0, "max_bad_length": 10, "cue": {"n": 10, "p": 0.5, ...}} - two apples
 #     (types A and B, own input channels: the input has 4 channels) and a context cue (its own input population,
 #     snake_network.CueSpec) saying which type is good; eating the bad one gives bad_reward (snake_switch.CuedForagingEnv)
@@ -89,7 +92,7 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "drift_check": None, "activity_rewiring": None,
                         "black_box": None, "integrate_during_refrac": True,
                         "resonator": None, "plateau": None, "replay": None, "cued_foraging": None,
-                        "episodic_traces": False}
+                        "episodic_traces": False, "episodic_debug": 0}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -865,6 +868,44 @@ def set_episode_mode(mode):
     vpop.vars["EpMode"].push_to_device()
 
 
+class EpisodicDebug:
+    """episodic_debug: per-step log of the value head and two lambda-traces for the first n episodes."""
+
+    def __init__(self, n, path):
+        import csv
+        self.n, self.f = n, open(path, "w", newline="")
+        self.w = csv.writer(self.f)
+        self.w.writerow(["timestep", "episode", "phase", "ep_mode", "E", "prev_val", "reward", "value",
+                         "hidden_trace", "readout_trace"])
+        groups = compiled_net.connection_populations
+        self.hidden = next((sg for c, sg in groups.items() if "RLNoiseTrace" in sg.vars or "RLNoisePtrace" in sg.vars),
+                           None)
+        self.htrace = None if self.hidden is None else ("RLNoiseTrace" if "RLNoiseTrace" in self.hidden.vars
+                                                       else "RLNoisePtrace")
+        self.readout = next((sg for c, sg in groups.items() if c.target() is value and not c.is_feedback
+                             and "RLTrace" in sg.vars), None)
+
+    def log(self, episode, phase):
+        if episode >= self.n:
+            return
+        vpop = compiled_net.neuron_populations[value]
+        names = ["E", "PrevVal", "reward"] + (["EpMode"] if "EpMode" in vpop.vars else [])
+        for v in names:
+            vpop.vars[v].pull_from_device()
+        get = lambda v: float(np.asarray(vpop.vars[v].view).ravel()[0])
+
+        def tsum(sg, var):
+            if sg is None:
+                return float("nan")
+            sg.vars[var].pull_from_device()
+            return float(np.abs(sg.vars[var].values).sum())
+        self.w.writerow([compiled_net.genn_model.timestep, episode, phase,
+                         get("EpMode") if "EpMode" in vpop.vars else float("nan"), get("E"), get("PrevVal"),
+                         get("reward"), float(compiled_net.get_readout(value)[0].mean()),
+                         tsum(self.hidden, self.htrace), tsum(self.readout, "RLTrace")])
+        self.f.flush()
+
+
 def relay_reward_context():
     """Reward relay (network.reward_relay): the value head's decaying reward variable, read every step, sets the relay
     population's rates (ON: tanh(max(r, 0) / s), OFF: tanh(max(-r, 0) / s) times the input rate scale, s the size of
@@ -1425,6 +1466,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                 except AttributeError:
                     continue
                 freq_sources[tgt] = genn_pop
+        episodic_debug = (EpisodicDebug(int(HP["episodic_debug"]),
+                                        f"outputs/{CSV_PREFIX}({REPETITION})_episodic_debug.csv")
+                          if HP["episodic_debug"] else None)
         probe = None
         if HP["probe"]:
             probe = snake_switch.ProbeRecorder(compiled_net, built.hidden, [built.labels[p] for p in built.hidden],
@@ -1694,6 +1738,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
+                if episodic_debug is not None:
+                    episodic_debug.log(ep, "episode")
                 if HP["episodic_traces"] and episode_start and not done:
                     set_episode_mode(0)            # past the episode's first step: normal TD
                     episode_start = False
@@ -1847,6 +1893,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 reward_trace = reward_trace * reward_decay
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
+                if episodic_debug is not None:
+                    episodic_debug.log(ep, "drain")
                 
                 compiled_net.genn_model.custom_update("GradientLearn")
                 for o, custom_updates in compiled_net.optimisers:

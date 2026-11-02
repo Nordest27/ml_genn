@@ -60,6 +60,22 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 """
 
 
+_LAMBDA_TRACES = ("RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLTrace", "RLValueTrace", "RLBackTrace",
+                  "ReviveTrace", "DiagGtrace", "DiagG1trace")
+
+
+def _normalise_traces(lines):
+    """trace_norm: every lambda-trace update "X = Lambda * X +/- inc;" becomes "X = Lambda * X +/- (1.0 - Lambda) *
+    (inc);" (a running average with the same geometric weights; the step size no longer grows with lambda)."""
+    import re
+    pat = re.compile(r"^(" + "|".join(_LAMBDA_TRACES) + r") = Lambda \* \1 ([+-]) (.*);$")
+    out = []
+    for line in lines:
+        m = pat.match(line)
+        out.append(f"{m.group(1)} = Lambda * {m.group(1)} {m.group(2)} (1.0 - Lambda) * ({m.group(3)});" if m else line)
+    return out
+
+
 def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, rho: float,
                           f_target: float, alpha_fav: float, v_thresh: float, td_lambda: float,
                           send_back: bool = False, readout_kappa: float = None, local_params: bool = False,
@@ -458,7 +474,7 @@ else {
         "post_spike_code": "\n".join(post_spike),
         "post_dynamics_code": "\n".join(post_dyn),
         "pre_spike_syn_code": pre_spike_syn,
-        "synapse_dynamics_code": "\n".join(syn),
+        "synapse_dynamics_code": "\n".join(_normalise_traces(syn) if cfg.trace_norm else syn),
     }
     if pre_refs:
         model["pre_neuron_var_refs"] = [(k, "scalar") for k in pre_refs]

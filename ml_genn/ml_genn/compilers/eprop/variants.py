@@ -295,6 +295,10 @@ class HiddenRuleConfig:
                                      # (presynaptic activity while the postsynaptic neuron is eligible) and an age
                                      # counter, for activity-dependent rewiring (None: off)
     td_stats_decay: float = 0.999    # running mean and mean |.| of the TD error (centring, homeostat)
+    trace_norm: bool = False         # lambda-traces as running averages, X = lambda X + (1 - lambda) score, instead of
+                                     # X = lambda X + score: the same geometric weighting of past steps (the same credit),
+                                     # but a step size independent of lambda, so the learning rate and the balance with
+                                     # the instantaneous local rewards do not change when lambda does
 
     def __post_init__(self):
         uses_noise = (self.drift != 0 or self.gradient != 0 or self.homeostat != 0
