@@ -7,6 +7,7 @@ from .connectivity import Connectivity
 from .conv_2d import Conv2D
 from .conv_2d_transpose import Conv2DTranspose
 from .dense import Dense
+from .explicit import Explicit
 from .fixed_probability import FixedProbability
 from .local_permutation import LocalPermutation
 from .one_to_one import OneToOne
@@ -16,6 +17,6 @@ from ..utils.module import get_module_classes
 
 default_connectivity = get_module_classes(globals(), Connectivity)
 
-__all__ = ["AvgPool2D", "AvgPoolConv2D", "AvgPoolDense2D", "Connectivity",
+__all__ = ["AvgPool2D", "AvgPoolConv2D", "AvgPoolDense2D", "Connectivity", "Explicit",
            "Conv2D", "Conv2DTranspose", "Dense", "FixedProbability", "LocalPermutation",
            "OneToOne", "ToroidalGaussian2D", "default_connectivity"]

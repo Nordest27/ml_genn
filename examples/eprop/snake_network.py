@@ -22,9 +22,10 @@ from typing import Optional, Tuple, Union
 import numpy as np
 
 from ml_genn import Connection, Network, Population
-from ml_genn.connectivity import Dense, FixedProbability, LocalPermutation, ToroidalGaussian2D
+from ml_genn.connectivity import Dense, Explicit, FixedProbability, LocalPermutation, ToroidalGaussian2D
 from ml_genn.initializers import Normal
-from ml_genn.neurons import AdaptiveLeakyIntegrateFire, BlackBoxALIF, LeakyIntegrate, PlateauALIF, PoissonInput, ResonatorALIF
+from ml_genn.neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, BooleanUnit, LeakyIntegrate, PlateauALIF,
+                             PoissonInput, ResonatorALIF)
 
 Shape = Tuple[int, int, int]
 
@@ -146,6 +147,35 @@ class RelaySpec:
 
 
 @dataclass
+class BooleanSpec:
+    """Boolean head: one fixed random logic unit (ml_genn.neurons.BooleanUnit) per field neuron position, reading k
+    field neurons from its local neighbourhood (radius cells, any channel); the heads read these units instead of the
+    fields, so no gradient path leads from the heads into the network. The fields keep the TD-error transport and the
+    e-prop feedback connections."""
+    k: int = 2
+    window: int = 10                 # input window [timesteps]
+    period: Optional[int] = None     # output spike interval while 1 (None: the field neurons' refractory period)
+    radius: int = 1                  # neighbourhood of each unit's inputs on the field sheet [cells]
+    seed: int = 0
+
+
+def boolean_inputs(shape, k, radius, rng):
+    """Explicit wiring of a Boolean layer on a field sheet of shape (h, w, c): for every unit (one per field neuron),
+    k distinct field neurons within radius cells (toroidal, any channel), with the weights 1, 2, ..., 2^(k-1)."""
+    h, w, c = shape
+    offsets = [(dy, dx) for dy in range(-radius, radius + 1) for dx in range(-radius, radius + 1)]
+    pre, post, weight = [], [], []
+    for y in range(h):
+        for x in range(w):
+            cand = np.array([(((y + dy) % h) * w + (x + dx) % w) * c + ch for dy, dx in offsets for ch in range(c)])
+            for ch in range(c):
+                unit = (y * w + x) * c + ch
+                chosen = rng.choice(cand, size=k, replace=False)
+                pre += list(chosen); post += [unit] * k; weight += [float(2 ** j) for j in range(k)]
+    return np.array(pre), np.array(post), np.array(weight)
+
+
+@dataclass
 class CueSpec:
     """Context cue (cued foraging): a Poisson population of two groups of n neurons, one per context, the active group
     firing at the input rate (set every move by the training script). Fixed-probability excitatory connections into
@@ -176,6 +206,10 @@ class NetworkSpec:
                                       # BlackBoxALIF with per-neuron dynamics the learning rules are not told about
     reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
     cue: Optional[CueSpec] = None    # None: no context-cue input (set by cued_foraging)
+    boolean_head: Optional[BooleanSpec] = None   # None: the heads read the fields; else Boolean units in between
+    code: Optional[int] = None       # ei_layers 0 only: the heads read a code population of this size (Poisson, rates
+                                     # set by the training script from a non-differentiable transform of the input and
+                                     # the cue) instead of the input itself
 
 
 @dataclass
@@ -194,6 +228,8 @@ class Built:
     inhibitory_to_slow: list = field(default_factory=list)   # I -> slow connections (I onto excitatory, like I -> E)
     reward_relay: Optional[Population] = None              # the relay population (ON then OFF neurons) or None
     cue: Optional[Population] = None                       # the context-cue population (one group per context) or None
+    code: Optional[Population] = None                      # the code population the heads read (ei_layers 0) or None
+    boolean: list = field(default_factory=list)            # Boolean head populations (policy, value), if any
     population_optimisers: dict = field(default_factory=dict)   # Population -> (owner, settings), e.g. ("L2", {...})
 
     @property
@@ -317,6 +353,7 @@ def _gain(conn: ConnSpec, g: float) -> ConnSpec:
 def build_network(spec: NetworkSpec, default_params) -> Built:
     network = Network(default_params)
     labels, rules, optimisers, i_to_e, i_to_i, i_to_s = {}, {}, {}, [], [], []
+    booleans = []
     slows = []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
@@ -399,15 +436,17 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             if spec.fields is not None or spec.reward_relay is not None:
                 raise ValueError("ei_layers 0: the heads read the input directly; set network.fields to null and use "
                                  "no reward relay")
+            # the heads read the input (and the cue) directly, or a code population computed from them by the
+            # training script (spec.code: the cue then enters only through the code)
+            code = Population(PoissonInput(), (int(spec.code),)) if spec.code else None
+            sources = [code] if code is not None else [inp] + ([cue] if cue is not None else [])
             for head in (policy, value):
-                Connection(inp, head, connectivity(ConnSpec(type="fixed", p=1.0), spec.input_shape, None),
-                           exc_inh_sign=None)
-                if cue is not None:
-                    Connection(cue, head, connectivity(ConnSpec(type="fixed", p=1.0), cue.shape, None),
+                for src in sources:
+                    Connection(src, head, connectivity(ConnSpec(type="fixed", p=1.0), src.shape, None),
                                exc_inh_sign=None)
             Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
             return Built(network, inp, layers, None, policy, value, labels, rules, i_to_e, i_to_i,
-                         slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue)
+                         slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, code=code)
         # input -> first layer (excitatory)
         first = spec.layers[0]
         for target in lpops(0):
@@ -467,6 +506,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                          src_sheet=ls.e_shape, tgt_sheet=spec.layers[k - 1].e_shape),
                                exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
+        if spec.boolean_head is not None and fields is None:
+            raise ValueError("boolean_head: the Boolean units read the field layers (network.fields must be set)")
         if fields is not None:
             fs = spec.fields
             for fld in fields:                                   # last layer -> fields
@@ -479,7 +520,20 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                       src_sheet=last_spec.e_shape, tgt_sheet=fs.shape),
                                exc_inh_sign=sign)
             for fld, head, name in ((fields[0], policy, "policy_feedback"), (fields[1], value, "value_feedback")):
-                Connection(fld, head, connectivity(ConnSpec(type="fixed", p=fs.readout_p), fs.shape, None),
+                if spec.boolean_head is not None:
+                    bs = spec.boolean_head
+                    period = bs.period if bs.period is not None else int(round(fs.neuron.tau_refrac or 3))
+                    bpop = Population(BooleanUnit(k=bs.k, window=bs.window, period=period,
+                                                  seed=bs.seed + len(booleans)), fs.shape)
+                    pre, post, w = boolean_inputs(fs.shape, bs.k, bs.radius,
+                                                  np.random.default_rng(bs.seed + 100 + len(booleans)))
+                    Connection(fld, bpop, Explicit(pre_ind=pre, post_ind=post, weight=w), exc_inh_sign=None)
+                    labels[bpop] = name.replace("_feedback", "_boolean")
+                    booleans.append(bpop)
+                    readout_src = bpop
+                else:
+                    readout_src = fld
+                Connection(readout_src, head, connectivity(ConnSpec(type="fixed", p=fs.readout_p), fs.shape, None),
                            exc_inh_sign=None)
                 if spec.explicit_feedback:
                     Connection(fld, head, FixedProbability(fs.readout_p, Normal(sd=1.0 / np.sqrt(spec.num_actions))),
@@ -507,7 +561,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
     return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay,
-                 slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue)
+                 slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, boolean=booleans)
 
 
 # --------------------------------------------------------------------------------------------------------------
@@ -664,6 +718,12 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         spec = replace(spec, layers=layers)
     if hp.get("cued_foraging"):
         spec = replace(spec, cue=_merge(CueSpec(), dict(hp["cued_foraging"].get("cue") or {})))
+    if hp.get("boolean_head"):
+        spec = replace(spec, boolean_head=_merge(BooleanSpec(), dict(hp["boolean_head"])))
+    if hp.get("code"):
+        if hp["ei_layers"] != 0:
+            raise ValueError("code: only with ei_layers 0 (the heads read the code instead of the input)")
+        spec = replace(spec, code=int(hp["code"]["n"]))
     if "reward_relay" in net:
         rr = net.pop("reward_relay")
         spec = replace(spec, reward_relay=None if rr is None else _merge(RelaySpec(), rr))

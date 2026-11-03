@@ -1,0 +1,2 @@
+{"policy_head": {"type": "noise_argmax", "sigma": 3.0},
+ "entropy_bonus": 0.0}

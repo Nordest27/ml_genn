@@ -1,0 +1,2 @@
+{"cnn_head": {"lr": 0.0001, "channels": [16, 16], "entropy": 0.01, "seed": 0},
+ "episodic_traces": true}

@@ -1319,6 +1319,23 @@ def test_trace_norm_turns_every_lambda_trace_into_a_running_average(rule):
             assert a == b
     assert changed >= 1
 
+
+def test_readout_lambda_sets_the_policy_readout_trace_only(request):
+    """readout_lambda: the policy readout's trace decay is readout_lambda while the hidden synapses keep td_lambda
+    (both appear as constants in the generated code; without the option only td_lambda does)."""
+    import glob
+    lam_readout, lam_hidden = 0.3 ** (1 / K), 0.8 ** (1 / K)   # _compile: td_lambda 0.8, gamma 0.5 (per K steps)
+
+    def constants(name, **kw):
+        compiled = _compile(EPropCompiler, name, PolicyType.GENERIC, hidden_rule={"preset": "proposed"}, **kw)[0]
+        with compiled:                    # the code is generated and built on loading
+            pass
+        return "".join(open(f).read() for f in glob.glob(f"{name}EPropCompiler_CODE/*.cc"))
+    code = constants(request.node.name, readout_lambda=lam_readout)
+    assert f"{lam_readout:.9e}f" in code and f"{lam_hidden:.9e}f" in code
+    assert f"{lam_readout:.9e}f" not in constants(request.node.name + "_default")
+
+
 def test_score_adaptation_off_uses_zfilter_alone_in_the_noise_scores():
     from ml_genn.compilers.eprop import hidden_rule_to_dict
     kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
@@ -1733,3 +1750,95 @@ def test_factor_norm_divides_the_update_by_each_factors_running_rms(request):
     assert err < 2e-4
     # and the normalisation does something: the per-synapse gains differ by more than the tolerance
     assert norm[sel].max() / norm[sel].min() > 2.0
+
+
+def test_boolean_units_between_hidden_layer_and_heads(request):
+    """Fixed logic units (BooleanUnit) between the hidden layer and the heads: they fire, the connections into them
+    stay fixed, the readout learns from their spikes, and the hidden layer still learns (from the broadcast TD error)."""
+    from ml_genn.connectivity import Explicit
+    from ml_genn.neurons import BooleanUnit
+    rng = np.random.default_rng(0)
+    w = lambda shape, mean, sd: (mean + sd * rng.standard_normal(shape)).astype(np.float32)
+    net = Network(default_params)
+    with net:
+        inp = Population(PoissonInput(), N_IN)
+        hid = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0,
+                                                    tau_adapt=300.0), N_HID)
+        bools = Population(BooleanUnit(k=2, window=5, period=3, seed=0), N_HID)
+        pol = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 4)
+        val = Population(LeakyIntegrate(tau_mem=10.0, bias=0.0, readout="var"), 1)
+        Connection(inp, hid, Dense(w((N_IN, N_HID), 0.15, 0.05)))
+        Connection(hid, hid, Dense(w((N_HID, N_HID), 0.0, 0.05)))
+        pre = np.concatenate([rng.choice(N_HID, 2, replace=False) for _ in range(N_HID)])
+        to_bool = Connection(hid, bools, Explicit(pre_ind=pre, post_ind=np.repeat(np.arange(N_HID), 2),
+                                                  weight=np.tile([1.0, 2.0], N_HID)))
+        Connection(bools, pol, Dense(w((N_HID, 4), 0.0, 0.5)))
+        Connection(bools, val, Dense(w((N_HID, 1), 0.0, 0.5)))
+        Connection(hid, pol, Dense(w((N_HID, 4), 0.0, 0.5)), feedback_name="policy_feedback")
+        Connection(hid, val, Dense(w((N_HID, 1), 0.0, 0.5)), feedback_name="value_feedback")
+        Connection(pol, val, Dense(weight=1.0), feedback_name="tde_transport")
+        Connection(hid, val, Dense(weight=1.0), feedback_name="tde_transport")
+    compiler = EPropCompiler(
+        example_timesteps=1, losses={pol: "mean_square_error", val: "mean_square_error"},
+        optimiser=SGD(1e-2, beta1=0.9), c_reg=1e-4, batch_size=1, feedback_type="random",
+        reward_decay=0.1 ** (1 / K), gamma=0.5 ** (1 / K), td_lambda=0.8 ** (1 / K), train_output_bias=False,
+        reset_time_between_batches=False, entropy_coeff=0.0, entropy_coeff_decay=1.0, entropy_coeff_min=0.0,
+        policy_heads={pol: PolicyType.GENERIC}, value_head=val, rng_seed=1234, backend=BACKEND,
+        hidden_rule={"preset": "proposed"})
+    compiled = compiler.compile(net, request.node.name)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        groups = {c: sg for c, sg in compiled.connection_populations.items() if not c.is_feedback}
+        g0 = {}
+        for c, sg in groups.items():
+            sg.vars["g"].pull_from_device()
+            g0[c] = sg.vars["g"].values.copy()
+        bpop = compiled.neuron_populations[bools]
+        fired = 0.0
+        ppop = compiled.neuron_populations[pol]
+        pg = np.array([0.3, -0.7, 0.2, 0.2], np.float32)               # as _run: a fixed policy-gradient pattern
+        for t in range(200):
+            if t % K == K - 1:
+                compiled.losses[val].set_var(compiled.neuron_populations[val], "reward", 1.0)
+                ppop.vars["pre_PG"].view[:] = pg; ppop.push_var_to_device("pre_PG")
+            compiled.step_time(cb)
+            bpop.vars["Cnt"].pull_from_device()
+            fired += float(np.sum(bpop.vars["Cnt"].view == 3))      # a unit that just fired
+        compiled.genn_model.custom_update("GradientLearn")         # one optimiser step on the accumulated updates
+        assert fired > 0
+        moved = {}
+        for c, sg in groups.items():
+            sg.vars["g"].pull_from_device()
+            moved[c] = float(np.abs(sg.vars["g"].values - g0[c]).max())
+        assert moved[to_bool] == 0.0                                  # static logic inputs
+        readout = [c for c in groups if c.source() is bools]
+        hidden = [c for c in groups if c.target() is hid]
+        assert all(moved[c] > 0 for c in readout) and any(moved[c] > 0 for c in hidden), moved
+
+
+def test_external_td_and_spike_counts(request):
+    """external_td: the value head's E is the training loop's ExtTd and reaches the hidden neurons' TdE; count_spikes:
+    hidden neurons count their spikes in SpkCount."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, external_td=True, count_spikes=True)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    vpop, hpop = compiled.neuron_populations[val], compiled.neuron_populations[hid]
+    with compiled:
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.linspace(0.2, 0.8, N_IN).astype(np.float32)})
+        spikes = 0.0
+        for t in range(60):
+            compiled.step_time(cb)
+            hpop.vars["RefracTime"].pull_from_device()
+            spikes += float(np.sum(hpop.vars["RefracTime"].view > 2.0))   # set to tau_refrac (3) on a spike
+        hpop.vars["SpkCount"].pull_from_device()
+        assert hpop.vars["SpkCount"].view.sum() == spikes > 0
+        vpop.vars["ExtTd"].view[:] = 0.37; vpop.vars["ExtTd"].push_to_device()
+        compiled.step_time(cb)
+        vpop.vars["E"].pull_from_device()
+        assert float(np.asarray(vpop.vars["E"].view).ravel()[0]) == pytest.approx(0.37)
+        compiled.step_time(cb)
+        hpop.vars["TdE"].pull_from_device()
+        assert np.allclose(hpop.vars["TdE"].view, 0.37, atol=1e-6)

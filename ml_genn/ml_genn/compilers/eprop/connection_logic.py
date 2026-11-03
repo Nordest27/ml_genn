@@ -59,7 +59,7 @@ def _build_rl_feedback_wum(conn, connect_snippet, compiler, compile_state,
 
         return WeightUpdateModel(
             model=get_feedback_model(FeedbackRule.POLICY_ADAPTIVE),
-            param_vals={"Alpha": alpha, "Lambda": compiler.td_lambda},
+            param_vals={"Alpha": alpha, "Lambda": compiler.readout_td_lambda},
             var_vals={"g": connect_snippet.weight, "DeltaG": 0.0, "RLTrace": 0.0},
             pre_var_vals={"ZFilter": 0.0},
             post_neuron_var_refs={"E_post": "E", "PG_post": "PG",
@@ -265,7 +265,7 @@ def build_output_wum(conn, connect_snippet, compiler, compile_state, target_pop,
             rule = OutputRule.POLICY_SYMMETRIC if symmetric else OutputRule.POLICY_RANDOM
             wum = WeightUpdateModel(
                 model=get_output_model(rule),
-                param_vals={"Alpha": alpha, "Lambda": compiler.td_lambda},
+                param_vals={"Alpha": alpha, "Lambda": compiler.readout_td_lambda},
                 var_vals={"g": connect_snippet.weight, "DeltaG": 0.0, "RLTrace": 0.0},
                 pre_var_vals={"ZFilter": 0.0},
                 post_neuron_var_refs={"E_post": "E", "PG_post": "PG", "TdE_post": "TdE"})

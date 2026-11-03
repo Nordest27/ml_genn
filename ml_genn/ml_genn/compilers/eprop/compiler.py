@@ -3,7 +3,7 @@ import numpy as np
 
 from copy import deepcopy
 from typing import Optional, Sequence
-from pygenn import SynapseMatrixConnectivity, SynapseMatrixType, create_var_ref, create_wu_var_ref
+from pygenn import SynapseMatrixConnectivity, SynapseMatrixType, VarAccess, create_var_ref, create_wu_var_ref
 
 from .. import Compiler
 from ..compiled_training_network import CompiledTrainingNetwork
@@ -18,7 +18,7 @@ from ...callbacks import (BatchProgressBar, CustomUpdateOnBatchBegin,
 from ...communicators import Communicator
 from ...losses import Loss, SparseCategoricalCrossentropy, default_losses
 from ...metrics import MetricsType
-from ...neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, ResonatorALIF, PlateauALIF, Input, LeakyIntegrate,
+from ...neurons import (AdaptiveLeakyIntegrateFire, BlackBoxALIF, ResonatorALIF, PlateauALIF, BooleanUnit, Input, LeakyIntegrate,
                         LeakyIntegrateFire, LeakyIntegrateFireInput)
 from ...optimisers import Optimiser, default_optimisers
 from ...synapses import Delta
@@ -237,6 +237,17 @@ class EPropCompiler(Compiler):
                                     population (e.g. a fast optimiser for the field layers of a nonlinear
                                     readout, a slow one for the reservoir layers); readout and feedback
                                     weights keep readout_optimiser, every other synapse uses ``optimiser``
+        external_td:                 The value head's TD error E is read from its ExtTd variable, set by the
+                                    training loop (e.g. from a host-side critic), instead of being computed
+                                    from the value readout; everything downstream of E is unchanged
+        count_spikes:                Every hidden ALIF neuron counts its spikes in SpkCount (for the training
+                                    loop to read and zero, e.g. as the input of a host-side head)
+        readout_lambda:              Trace decay (per step) of the policy head's readout weights and of
+                                    the feedback weights that mirror them (None: td_lambda). The decoupled
+                                    actor trace decays with lambda alone, so a long td_lambda makes the
+                                    readout's credit Monte-Carlo-like; a shorter readout_lambda keeps it
+                                    precise while the hidden layers keep the long trace. The value head's
+                                    trace decays with gamma and is unaffected.
         episodic:                    Episodic learning: a "TraceReset" custom update that zeros every
                                     synapse's lambda-traces (hidden rule and readout), for the training
                                     loop to call at each episode start, and an episode mode in the value
@@ -298,6 +309,9 @@ class EPropCompiler(Compiler):
                  train_readout: bool = True,
                  readout_optimiser=None,
                  population_optimisers: dict = None,
+                 readout_lambda: float = None,
+                 external_td: bool = False,
+                 count_spikes: bool = False,
                  episodic: bool = False,
                  fuse_weight_updates: bool = True,
                  population_rules: dict = None,
@@ -371,6 +385,9 @@ class EPropCompiler(Compiler):
         self._readout_optimiser = (None if readout_optimiser is None else
                                    get_object(readout_optimiser, Optimiser, "Optimiser", default_optimisers))
         self.episodic = episodic
+        self.readout_lambda = readout_lambda
+        self.external_td = external_td
+        self.count_spikes = count_spikes
         # one Optimiser object per distinct setting: populations sharing an object share one optimiser group
         self._population_optimisers = {p: get_object(o, Optimiser, "Optimiser", default_optimisers)
                                        for p, o in (population_optimisers or {}).items()}
@@ -379,6 +396,11 @@ class EPropCompiler(Compiler):
         self.value_transform = value_transform
         self.value_centring = value_centring
         self._configure_rl(gamma, td_lambda, self.policy_heads, value_head)
+
+    @property
+    def readout_td_lambda(self):
+        """Trace decay of the policy head's readout (and its feedback weights): readout_lambda, else td_lambda."""
+        return self.td_lambda if self.readout_lambda is None else self.readout_lambda
 
     def _configure_rl(self, gamma, td_lambda, policy_heads, value_head):
         """Validate and derive RL-specific configuration. Either both gamma
@@ -412,6 +434,8 @@ class EPropCompiler(Compiler):
 
         if pop.neuron.readout is not None:
             self._build_output_neuron_model(pop, model_copy, compile_state)
+        elif isinstance(pop.neuron, BooleanUnit):
+            pass                               # fixed logic units: no learning code, nothing to reset or regularise
         elif not isinstance(pop.neuron, Input):
             self._build_hidden_neuron_model(pop, model_copy, compile_state)
         else:
@@ -437,6 +461,11 @@ class EPropCompiler(Compiler):
         target_pop = conn.target()
         target_neuron = target_pop.neuron
 
+        if isinstance(target_neuron, BooleanUnit):
+            # the inputs of a logic unit are static: fixed weights (1, 2, 4, ... = the unit's input bits), no learning
+            return WeightUpdateModel(model={"vars": [("g", "scalar", VarAccess.READ_ONLY)],
+                                            "pre_spike_syn_code": "addToPost(g);"},
+                                     var_vals={"g": connect_snippet.weight})
         if conn.is_feedback:
             wum = conn_logic.build_feedback_wum(
                 conn, connect_snippet, self, compile_state, target_pop, alpha)
@@ -500,6 +529,9 @@ class EPropCompiler(Compiler):
 
     def _build_hidden_neuron_model(self, pop, model_copy, compile_state):
         neuron_logic.add_hidden_feedback_code(model_copy)
+        if self.count_spikes and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            model_copy.add_var("SpkCount", "scalar", 0.0)
+            model_copy.append_reset_code("SpkCount += 1.0;")
 
         if self.gamma_lambda is not None:
             any_backprop = any(r.backprop != 0 for r in [self.hidden_rule, *self.population_rules.values()])

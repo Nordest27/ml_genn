@@ -33,6 +33,7 @@ from async_trace_logger import AsyncTraceLogger
 import snake_hparams
 import snake_switch
 import snake_network
+import cnn_head
 
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
@@ -65,6 +66,25 @@ import csv
 #     start every synapse's lambda-traces (hidden rule and readout) and the value head's decaying reward are zeroed;
 #     the value head treats the end of an episode as terminal (value 0, no bootstrap, through the drain) and computes
 #     no TD error across the boundary. Neuron states, short filters, baselines and optimiser states are kept
+# cnn_head: None or {"lr": 1e-4, "channels": [16, 16], "entropy": 0.01, "seed": 0} - a host-side convolutional
+#     actor-critic (cnn_head.CNNHead, NumPy, online, one sample per move) reads the field layers' spike counts of each
+#     move (sheet x channels of both fields) and chooses the action; its TD error is written to the network's value
+#     head (external_td) and drives the hidden rule, and its policy error goes to the policy head (for e-prop's
+#     feedback). The network's own readout weights are frozen and unused
+# boolean_head: None or {"k": 2, "window": 10, "radius": 1, "seed": 0} - fixed random logic units (BooleanUnit, one per
+#     field neuron, k local field inputs, refractory-rate output) between the fields and the heads: the heads read
+#     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec)
+# code: None or {"type": "sparse_expansion", "n": 2000, "active": 0.05, "seed": 0} - ei_layers 0 only: the heads read
+#     a binary code of the input frame (and the cue) instead of the input: a fixed random projection onto n units, of
+#     which the top active * n fire (k-winners-take-all). Non-differentiable (the winner set changes in jumps); the
+#     sparse units respond to conjunctions of input features
+# policy_head: None (softmax: sample the softmax of the logits, PG = pi - onehot) or {"type": "noise_argmax", "sigma": s}
+#     - no policy distribution: the action is argmax(logits + s * xi), xi ~ N(0, 1) per action and decision, and the
+#     readout learns by node perturbation from its own exploration noise, PG = -xi / s (the Stein counterpart of the
+#     softmax's -grad log pi). The logged "probs" are the chosen action's one-hot
+# readout_lambda_env: None (td_lambda_env) or the policy head's readout trace decay per move: e.g. a short readout
+#     trace (0.8) under a long hidden one (td_lambda_env 0.99), so the readout's credit stays precise rather than
+#     Monte-Carlo-like (also the feedback weights that mirror it; the value head's trace decays with gamma)
 # episodic_debug: n > 0 - log every simulation step of the first n episodes (value head EpMode, TD error E, PrevVal,
 #     reward variable, and the summed |lambda-trace| of one hidden and one readout synapse group) to
 #     outputs/<prefix>(<rep>)_episodic_debug.csv, to check the episode-boundary mechanics
@@ -92,7 +112,8 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "drift_check": None, "activity_rewiring": None,
                         "black_box": None, "integrate_during_refrac": True,
                         "resonator": None, "plateau": None, "replay": None, "cued_foraging": None,
-                        "episodic_traces": False, "episodic_debug": 0}
+                        "episodic_traces": False, "episodic_debug": 0, "readout_lambda_env": None,
+                        "policy_head": None, "code": None, "boolean_head": None, "cnn_head": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -769,6 +790,21 @@ def build_compiled_network(connectivity_type="fixed"):
             raise ValueError("readout_optimiser needs the modular compiler (set hidden_rule)")
         ro = HP["readout_optimiser"]
         rule_kwargs["readout_optimiser"] = make_optimiser(ro["type"], ro.get("lr", HP["lr"]), ro.get("betas"))
+    if HP["policy_head"] is not None:
+        if HP["policy_head"].get("type") != "noise_argmax":
+            raise ValueError(f"policy_head type must be 'noise_argmax', not {HP['policy_head'].get('type')!r}")
+        if HP["entropy_bonus"] > 0:
+            raise ValueError("policy_head noise_argmax defines no distribution: set entropy_bonus to 0")
+    if HP["cnn_head"] is not None:
+        if HP["hidden_rule"] is None:
+            raise ValueError("cnn_head needs the modular compiler (set hidden_rule)")
+        if HP["policy_head"] is not None or HP["boolean_head"] is not None:
+            raise ValueError("cnn_head replaces the readout: no policy_head / boolean_head")
+        rule_kwargs.update(external_td=True, count_spikes=True, train_readout=False)
+    if HP["readout_lambda_env"] is not None:
+        if HP["hidden_rule"] is None:
+            raise ValueError("readout_lambda_env needs the modular compiler (set hidden_rule)")
+        rule_kwargs["readout_lambda"] = HP["readout_lambda_env"] ** (1 / WAIT_INC)
     if HP["episodic_traces"]:
         if HP["hidden_rule"] is None:
             raise ValueError("episodic_traces needs the modular compiler (set hidden_rule)")
@@ -849,6 +885,44 @@ def rho_bar_now():
 
 
 CUE_POP = built.cue
+CODE_POP = built.code
+
+
+class SparseExpansion:
+    """code: fixed random projection of [frame, cue one-hot] onto n units, top-k binary (k-winners-take-all)."""
+
+    def __init__(self, n, active=0.05, seed=0, n_in=None):
+        rng = np.random.default_rng(seed)
+        self.k = max(1, int(round(active * n)))
+        self.W = (rng.standard_normal((n, n_in)) / np.sqrt(n_in)).astype(np.float32)
+
+    def __call__(self, x):
+        h = self.W @ x
+        rates = np.zeros(len(h), dtype=np.float32)
+        rates[np.argpartition(-h, self.k)[:self.k]] = INPUT_RATE_SCALE
+        return rates
+
+
+code_transform = None
+if CODE_POP is not None:
+    if HP["code"].get("type", "sparse_expansion") != "sparse_expansion":
+        raise ValueError(f"code type must be 'sparse_expansion', not {HP['code'].get('type')!r}")
+    code_transform = SparseExpansion(int(HP["code"]["n"]), float(HP["code"].get("active", 0.05)),
+                                     int(HP["code"].get("seed", 0)),
+                                     n_in=INPUT_SIZE + (CUE_POP.shape[0] if CUE_POP is not None else 0))
+
+
+def feed_code(obs, env):
+    """code: the heads' input is the code of the current frame (and cue), recomputed whenever the frame is set."""
+    if code_transform is None:
+        return
+    x = np.clip(np.asarray(obs, dtype=np.float32).ravel(), 0.0, 1.0)
+    if CUE_POP is not None:
+        n = CUE_POP.shape[0] // 2
+        cue = np.zeros(2 * n, dtype=np.float32)
+        cue[n * env.cue:n * (env.cue + 1)] = 1.0
+        x = np.concatenate([x, cue])
+    compiled_net.set_input({CODE_POP: code_transform(x)})
 
 
 def feed_cue(env):
@@ -862,10 +936,67 @@ def feed_cue(env):
 
 
 def set_episode_mode(mode):
-    """episodic_traces: the value head's EpMode (0 within an episode, 1 terminal, 2 the first step of an episode)."""
+    """episodic_traces: the value head's EpMode (0 within an episode, 1 terminal, 2 the first step of an episode).
+    With a CNN head the TD error comes from the CNN, which handles episode ends itself."""
     vpop = compiled_net.neuron_populations[value]
+    if "EpMode" not in vpop.vars:
+        return
     vpop.vars["EpMode"].view[:] = mode
     vpop.vars["EpMode"].push_to_device()
+
+
+CNN = None
+cnn_state = {"prev": None, "r": 0.0, "ext": False}
+if HP["cnn_head"] is not None:
+    if not built.fields:
+        raise ValueError("cnn_head reads the field layers (network.fields must be set)")
+    _fshape = tuple(built.fields[0].shape)
+    CNN = cnn_head.CNNHead(_fshape[:2] + (2 * _fshape[2],), NUM_OUTPUT,
+                           channels=tuple(HP["cnn_head"].get("channels", (16, 16))),
+                           lr=float(HP["cnn_head"].get("lr", 1e-4)), entropy=float(HP["cnn_head"].get("entropy", 0.01)),
+                           seed=int(HP["cnn_head"].get("seed", 0)))
+
+
+def cnn_fields():
+    """The fields' spike counts since the last decision, as a (sheet, 2 x channels) image; the counters are zeroed."""
+    imgs = []
+    for fld in built.fields:
+        npop = compiled_net.neuron_populations[fld]
+        npop.vars["SpkCount"].pull_from_device()
+        imgs.append(np.asarray(npop.vars["SpkCount"].view, dtype=np.float64).reshape(fld.shape) / WAIT_INC)
+        npop.vars["SpkCount"].view[:] = 0.0
+        npop.vars["SpkCount"].push_to_device()
+    return np.concatenate(imgs, axis=-1)
+
+
+def set_ext_td(delta):
+    vpop = compiled_net.neuron_populations[value]
+    vpop.vars["ExtTd"].view[:] = delta
+    vpop.vars["ExtTd"].push_to_device()
+    cnn_state["ext"] = delta != 0.0
+
+
+def cnn_decide():
+    """CNN head at a decision: learn from the transition that just ended (one-step actor-critic, delta sent to the
+    network for one step), then return this state's logits and policy."""
+    logits, v, cache = CNN.forward(cnn_fields())
+    prev = cnn_state["prev"]
+    if prev is not None:
+        delta = cnn_state["r"] + HP["gamma_env"] * v - prev[3]
+        CNN.learn(prev[0], prev[1], prev[2], delta)
+        set_ext_td(delta)
+    cnn_state.update(prev=[cache, logits, None, v], r=0.0)
+    return logits, CNN.policy(logits)
+
+
+def cnn_terminal():
+    """CNN head at the end of an episode: the terminal transition (value 0, no bootstrap)."""
+    prev = cnn_state["prev"]
+    if prev is not None and prev[2] is not None:
+        delta = cnn_state["r"] - prev[3]
+        CNN.learn(prev[0], prev[1], prev[2], delta)
+        set_ext_td(delta)
+    cnn_state.update(prev=None, r=0.0)
 
 
 class EpisodicDebug:
@@ -1589,6 +1720,7 @@ def train_snake_agent_with_ipc(episodes=10000,
             """
             compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
             feed_cue(env)
+            feed_code(obs, env)
             # compiled_net.step_time(train_callback_list)
             # previous_value_estimate = compiled_net.get_readout(value)[0][0]
             env.wait_count = WAIT_INC
@@ -1644,14 +1776,28 @@ def train_snake_agent_with_ipc(episodes=10000,
                         shifted_logits = logits - logits.max()
                         exp_logs = np.exp(shifted_logits)
                         probs = exp_logs / (exp_logs.sum() + 1e-8)
+                        if CNN is not None:
+                            logits, probs = cnn_decide()
+                        noise_head = HP["policy_head"] is not None and HP["policy_head"]["type"] == "noise_argmax"
+                        if noise_head:
+                            head_xi = np.random.standard_normal(NUM_OUTPUT)
+                            head_sigma = float(HP["policy_head"].get("sigma", 1.0))
                         
                         # if abs(sum(probs) - 1.0) > 0.0001:
                         #     raise ValueError(f"BAD PROBS {probs}")
-                        action_label = np.random.choice(NUM_OUTPUT, p=probs)
+                        if noise_head:
+                            action_label = int(np.argmax(logits + head_sigma * head_xi))
+                            PG = -head_xi / head_sigma
+                            probs = np.zeros(NUM_OUTPUT)
+                            probs[action_label] = 1.0
+                        else:
+                            action_label = np.random.choice(NUM_OUTPUT, p=probs)
 
-                        y_true = np.zeros(NUM_OUTPUT)
-                        y_true[action_label] = 1.0
-                        PG = (probs - y_true)
+                            y_true = np.zeros(NUM_OUTPUT)
+                            y_true[action_label] = 1.0
+                            PG = (probs - y_true)
+                        if CNN is not None:
+                            cnn_state["prev"][2] = action_label
                         
                         # log_p = np.log(probs + 1e-8)
                         # entropy = -np.sum(probs * log_p)
@@ -1697,6 +1843,10 @@ def train_snake_agent_with_ipc(episodes=10000,
                                          else probs)
 
                 obs, reward, done = env.step(action_label)
+                if CNN is not None:
+                    cnn_state["r"] += reward
+                    if done:
+                        cnn_terminal()
                 if done and HP["episodic_traces"]:
                     set_episode_mode(1)            # this step's TD error and the drain: the terminal value is 0
                 total_reward += reward
@@ -1728,6 +1878,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                         current_run.append(frame_img.copy())
                     compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
                     feed_cue(env)
+                    feed_code(obs, env)
                 # spikes = make_rate_coded_spikes(
                 #     obs.reshape(-1),
                 #     compiled_net.genn_model.timestep,
@@ -1738,6 +1889,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
+                if CNN is not None and cnn_state["ext"]:
+                    set_ext_td(0.0)                # the TD error is a one-step impulse per transition
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "episode")
                 if HP["episodic_traces"] and episode_start and not done:
@@ -1860,6 +2013,8 @@ def train_snake_agent_with_ipc(episodes=10000,
             compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
 
             feed_cue(env)
+
+            feed_code(obs, env)
             for i in range(WAIT_INC):
                 gamma_disc_reward *= gamma
                 if i % WAIT_INC == 0:
@@ -1893,6 +2048,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 reward_trace = reward_trace * reward_decay
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
+                if CNN is not None and cnn_state["ext"]:
+                    set_ext_td(0.0)                # the TD error is a one-step impulse per transition
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "drain")
                 
