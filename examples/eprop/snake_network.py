@@ -167,6 +167,11 @@ class BooleanSpec:
     seed: int = 0
 
 
+def motor_pools(n, num_actions, seed):
+    """headless: the motor pool (action) of each of the n policy-field neurons, a balanced random partition."""
+    return np.random.default_rng(seed).permutation(n) % num_actions
+
+
 def boolean_inputs(shape, k, radius, rng):
     """Explicit wiring of a Boolean layer on a field sheet of shape (h, w, c): for every unit (one per field neuron),
     k distinct field neurons within radius cells (toroidal, any channel), with the weights 1, 2, ..., 2^(k-1)."""
@@ -215,6 +220,12 @@ class NetworkSpec:
     reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
     cue: Optional[CueSpec] = None    # None: no context-cue input (set by cued_foraging)
     boolean_head: Optional[BooleanSpec] = None   # None: the heads read the fields; else Boolean units in between
+    headless: Optional[int] = None   # None: the policy head reads its field through random weights; an int (seed): the
+                                     # policy field is split at random into num_actions motor pools and the policy
+                                     # head only sums each pool (fixed weights 1 / pool size; the training script acts
+                                     # on the most active pool), with the exact pool membership as its feedback
+    motor_rule: Optional[Union[str, dict]] = None   # headless: own rule for the policy field (the motor pools), e.g.
+                                                    # stronger weight noise; None: as the other fields
     code: Optional[int] = None       # ei_layers 0 only: the heads read a code population of this size (Poisson, rates
                                      # set by the training script from a non-differentiable transform of the input and
                                      # the cue) instead of the input itself
@@ -431,6 +442,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             labels[fields[0]], labels[fields[1]] = "policy_field", "value_field"
             if fs.rule is not None:
                 rules[fields[0]] = rules[fields[1]] = fs.rule
+            if spec.motor_rule is not None:
+                rules[fields[0]] = spec.motor_rule
             if fs.optimiser is not None:
                 optimisers[fields[0]] = optimisers[fields[1]] = ("fields", fs.optimiser)
 
@@ -514,6 +527,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                          src_sheet=ls.e_shape, tgt_sheet=spec.layers[k - 1].e_shape),
                                exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
+        if spec.headless is not None and (fields is None or spec.boolean_head is not None):
+            raise ValueError("headless: the motor pools are the policy field (network.fields must be set, no boolean_head)")
         if spec.boolean_head is not None and fields is None:
             raise ValueError("boolean_head: the Boolean units read the field layers (network.fields must be set)")
         if spec.boolean_head is not None and spec.boolean_head.heads not in ("both", "policy"):
@@ -566,6 +581,16 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                     readout_src = bpop
                 else:
                     readout_src = fld
+                if spec.headless is not None and head is policy:
+                    n_field = int(np.prod(fs.shape))
+                    pools = motor_pools(n_field, spec.num_actions, spec.headless)
+                    size = np.bincount(pools, minlength=spec.num_actions).astype(np.float64)
+                    Connection(readout_src, head, Explicit(pre_ind=np.arange(n_field), post_ind=pools,
+                                                           weight=1.0 / size[pools]), exc_inh_sign=None)
+                    if spec.explicit_feedback:
+                        Connection(fld, head, Explicit(pre_ind=np.arange(n_field), post_ind=pools,
+                                                       weight=np.ones(n_field)), feedback_name=name, exc_inh_sign=None)
+                    continue
                 Connection(readout_src, head, connectivity(ConnSpec(type="fixed", p=fs.readout_p), fs.shape, None),
                            exc_inh_sign=None)
                 if spec.explicit_feedback:
@@ -753,6 +778,14 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         spec = replace(spec, cue=_merge(CueSpec(), dict(hp["cued_foraging"].get("cue") or {})))
     if hp.get("boolean_head"):
         spec = replace(spec, boolean_head=_merge(BooleanSpec(), dict(hp["boolean_head"])))
+    if hp.get("headless"):
+        spec = replace(spec, headless=int(hp["headless"].get("seed", 0)))
+        if hp["headless"].get("motor_log_syn_sigma") is not None:
+            # the motor pools' own rule: the fields' rule (or the network's hidden rule) with stronger weight noise
+            base = (hp.get("network") or {}).get("fields", {}) or {}
+            base = base.get("rule") or hp.get("hidden_rule") or {"preset": "proposed"}
+            base = {"preset": base} if isinstance(base, str) else dict(base)
+            spec = replace(spec, motor_rule={**base, "log_syn_sigma": float(hp["headless"]["motor_log_syn_sigma"])})
     if hp.get("code"):
         if hp["ei_layers"] != 0:
             raise ValueError("code: only with ei_layers 0 (the heads read the code instead of the input)")

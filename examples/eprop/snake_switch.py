@@ -647,3 +647,80 @@ class ProbeRecorder:
                             variables=np.array(["apple_dy", "apple_dx", "danger_left", "danger_up", "danger_right",
                                                 "danger_down", "heading"]), extra_names=np.array(self.EXTRA),
                             board=np.array(self.board))
+
+
+class SelectionEnv:
+    """Candidate selection: a go / no-go categorical decision inside the RL loop ("does this instance have what we
+    want?"), the simplest test of learning a choice without a defined policy.
+
+    An episode presents up to `n_candidates` candidates, one per move. A candidate has `features` binary features
+    (each present with probability p), drawn as a fixed random pixel pattern in its own region of the frame (region j:
+    quadrant j for 4 features; channel j mod 3), with `noise` pixel flips. A candidate is good iff all `required`
+    features are present (default: features 0 and 1, a conjunction). At the end of each candidate's move the agent
+    decides: action 0 commits (good: `good_reward`, bad: `bad_reward`, and the episode ends), any other action skips
+    to the next candidate. Skipping them all ends the episode with `none_reward`. Exposes the Snake interface the
+    training loop uses (wait_count / wait_inc, snake, img); `snake` grows by one on a good commit, so the logged
+    length is 1 for a correct choice."""
+
+    def __init__(self, wait_inc, inp_shape, n_candidates=8, features=4, required=(0, 1), p=0.5, good_reward=1.0,
+                 bad_reward=-1.0, none_reward=0.0, noise=0.05, seed=None):
+        self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
+        self.inp_shape = tuple(inp_shape)
+        self.n_candidates, self.features, self.p, self.noise = int(n_candidates), int(features), float(p), float(noise)
+        self.required = [int(j) for j in required]
+        if not self.required or max(self.required) >= self.features:
+            raise ValueError("selection: required must name features 0 .. features - 1")
+        self.good_reward, self.bad_reward, self.none_reward = float(good_reward), float(bad_reward), float(none_reward)
+        self.rng = np.random.default_rng(seed)
+        h, w, c = self.inp_shape
+        side = int(np.ceil(np.sqrt(self.features)))
+        rh, rw = h // side, w // side
+        pattern_rng = np.random.default_rng(12345)        # the feature patterns are fixed across runs
+        self.patterns = np.zeros((self.features, h, w, c))
+        for j in range(self.features):
+            y0, x0 = (j // side) * rh, (j % side) * rw
+            self.patterns[j, y0:y0 + rh, x0:x0 + rw, j % c] = pattern_rng.random((rh, rw)) < 0.5
+        self.snake, self.done, self.index, self.present, self.obs = [None], False, 0, None, None
+        self.won = False
+
+    def _draw(self):
+        self.present = self.rng.random(self.features) < self.p
+        frame = np.clip(self.patterns[self.present].sum(axis=0), 0.0, 1.0)
+        flips = self.rng.random(frame.shape) < self.noise
+        self.obs = np.where(flips, 1.0 - frame, frame)
+
+    @property
+    def good(self):
+        return bool(self.present[self.required].all())
+
+    def reset(self):
+        self.snake, self.done, self.index = [None], False, 0
+        self.wait_count = self.wait_inc
+        self._draw()
+        return self.obs
+
+    def get_local_img_observation(self):
+        return self.obs
+
+    def step(self, action):
+        if self.done:
+            raise Exception("Environment needs reset. Call env.reset().")
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self.obs, 0.0, False
+        self.wait_count = self.wait_inc
+        if int(action) == 0:                               # commit to the candidate shown during the last move
+            good = self.good
+            self.done = True
+            if good:
+                self.snake.append(None)
+            return self.obs, self.good_reward if good else self.bad_reward, True
+        self.index += 1                                    # skip
+        if self.index >= self.n_candidates:
+            self.done = True
+            return self.obs, self.none_reward, True
+        self._draw()
+        return self.obs, 0.0, False
+
+    def img(self, scale=10):
+        return np.kron((self.obs * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))

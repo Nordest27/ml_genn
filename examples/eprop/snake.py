@@ -72,6 +72,18 @@ import csv
 #     feedback), whose readout weights are frozen and unused. The critic is the network's own value head, trained and
 #     defined every timestep as without the CNN; its TD error drives the hidden rule, and the CNN's advantage of a move
 #     is the discounted sum of those per-step TD errors over the move (= r + gamma^n V(next decision) - V(decision))
+# headless: None or {"seed": 0, "surrogate_tau": None} - no policy distribution: the policy field is split at random
+#     into one motor pool per action, the policy head only sums each pool (fixed, frozen weights) and the action is the
+#     most active pool at the decision (ties at random). Exploration is the network's own variability. The critic is
+#     the usual per-step value head. Without surrogate_tau the policy error is 0 (the perturbation rules need none);
+#     with it, softmax(pool activity / tau) - onehot is fed back through the exact pool membership (e-prop's best
+#     surrogate, a modelling choice the task does not define)
+#     "motor_log_syn_sigma": x - the policy field (motor pools) gets its own rule with weight noise exp(x - 5) (the
+#     default is x = 0, i.e. 0.0067): more of the variability that picks the action is noise the rule can credit
+# selection: None or {"n_candidates": 8, "features": 4, "required": [0, 1], "p": 0.5, "good_reward": 1.0,
+#     "bad_reward": -1.0, "none_reward": 0.0, "noise": 0.05, "seed": None} - instead of Snake, candidate selection
+#     (snake_switch.SelectionEnv): one candidate per move, two actions (0 commits to the candidate just shown, 1 skips
+#     it); good iff all required features are present. The logged score is the episode's reward
 # boolean_head: None or {"k": 2, "window": 10, "radius": 1, "seed": 0} - fixed random logic units (BooleanUnit, one per
 #     field neuron, k local field inputs, refractory-rate output) between the fields and the heads: the heads read
 #     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec).
@@ -121,7 +133,8 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "black_box": None, "integrate_during_refrac": True,
                         "resonator": None, "plateau": None, "replay": None, "cued_foraging": None,
                         "episodic_traces": False, "episodic_debug": 0, "readout_lambda_env": None,
-                        "policy_head": None, "code": None, "boolean_head": None, "cnn_head": None}
+                        "policy_head": None, "code": None, "boolean_head": None, "cnn_head": None,
+                        "headless": None, "selection": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -630,7 +643,7 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 # p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, SIGMA_H, HIDDEN_I_SHAPE)
 
 
-NUM_OUTPUT = 4
+NUM_OUTPUT = 2 if HP["selection"] else 4       # selection: commit / skip
 NUM_OUTPUT_CHART = NUM_OUTPUT
 if GAUSSIAN_TRACE_POLICY:
     NUM_OUTPUT = 1
@@ -803,6 +816,14 @@ def build_compiled_network(connectivity_type="fixed"):
             raise ValueError(f"policy_head type must be 'noise_argmax', not {HP['policy_head'].get('type')!r}")
         if HP["entropy_bonus"] > 0:
             raise ValueError("policy_head noise_argmax defines no distribution: set entropy_bonus to 0")
+    if HP["headless"] is not None:
+        if HP["hidden_rule"] is None:
+            raise ValueError("headless needs the modular compiler (set hidden_rule)")
+        if HP["policy_head"] is not None or HP["cnn_head"] is not None or HP["boolean_head"] is not None:
+            raise ValueError("headless has no policy head: no policy_head / cnn_head / boolean_head")
+        if HP["entropy_bonus"] > 0 and HP["headless"].get("surrogate_tau") is None:
+            raise ValueError("headless defines no policy distribution: set entropy_bonus to 0 (or a surrogate_tau)")
+        rule_kwargs.update(train_readout="value")
     if HP["cnn_head"] is not None:
         if HP["hidden_rule"] is None:
             raise ValueError("cnn_head needs the modular compiler (set hidden_rule)")
@@ -993,6 +1014,35 @@ def log_boolean(ep):
                      float((np.abs(1.0 - 2.0 * p) ** (k - 1)).mean())])
     with open(BOOLEAN_CSV, "a", newline="") as f:
         csv.writer(f).writerows(rows)
+
+
+def noise_argmax_policy(logits, sigma, samples=256):
+    """noise_argmax head: the policy it actually follows, P(argmax(logits + sigma xi) = a), estimated from fresh noise
+    samples (for the logged policy and its plots; the action and the PG use the single sample drawn at the decision)."""
+    wins = np.argmax(logits[None, :] + sigma * np.random.standard_normal((samples, NUM_OUTPUT)), axis=1)
+    return np.bincount(wins, minlength=NUM_OUTPUT) / samples
+
+
+def headless_share(pool_activity):
+    """headless display proxy: each motor pool's share of the pools' total activity (uniform when all are silent)."""
+    a = np.maximum(np.asarray(pool_activity, dtype=np.float64), 0.0)
+    return a / a.sum() if a.sum() > 0 else np.full(NUM_OUTPUT, 1.0 / NUM_OUTPUT)
+
+
+def headless_decide(pool_activity):
+    """headless: act on the most active motor pool (ties at random). Returns the action, the policy error sent back
+    (0, or the softmax surrogate with surrogate_tau) and the logged policy (each pool's share of the pools' activity,
+    a display proxy since no policy is defined, or the surrogate)."""
+    best = np.flatnonzero(pool_activity >= pool_activity.max() - 1e-9)
+    action = int(np.random.choice(best))
+    onehot = np.zeros(NUM_OUTPUT)
+    onehot[action] = 1.0
+    tau = HP["headless"].get("surrogate_tau")
+    if tau is None:
+        return action, np.zeros(NUM_OUTPUT), headless_share(pool_activity)
+    z = np.exp((pool_activity - pool_activity.max()) / float(tau))
+    surrogate = z / z.sum()
+    return action, surrogate - onehot, surrogate
 
 
 def cnn_fields():
@@ -1601,6 +1651,8 @@ def train_snake_agent_with_ipc(episodes=10000,
     opt_updt = 0
     with compiled_net:
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
+        if HP["selection"]:
+            env = snake_switch.SelectionEnv(WAIT_INC, INPUT_SHAPE, **HP["selection"])
         if HP["memory"]:
             env = snake_switch.MemoryEnv(env, **HP["memory"])
         if HP["cued_foraging"]:
@@ -1829,8 +1881,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                         if noise_head:
                             action_label = int(np.argmax(logits + head_sigma * head_xi))
                             PG = -head_xi / head_sigma
-                            probs = np.zeros(NUM_OUTPUT)
-                            probs[action_label] = 1.0
+                            probs = noise_argmax_policy(logits, head_sigma)   # logged policy only (not the PG)
+                        elif HP["headless"] is not None:
+                            action_label, PG, probs = headless_decide(logits)
                         else:
                             action_label = np.random.choice(NUM_OUTPUT, p=probs)
 
@@ -2070,6 +2123,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                         probs = probs / probs.sum()
                     elif CNN is not None:
                         probs = cnn_state["probs"]          # the device policy readout is frozen and unused
+                    elif HP["headless"] is not None:
+                        probs = headless_decide(compiled_net.get_readout(policy).flatten())[2]
                     else:
                         logits = compiled_net.get_readout(policy).flatten()
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
