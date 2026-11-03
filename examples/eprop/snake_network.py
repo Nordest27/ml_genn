@@ -154,6 +154,14 @@ class BooleanSpec:
     e-prop feedback connections."""
     k: int = 2
     window: int = 10                 # input window [timesteps]
+    hold: Optional[int] = None       # None: windowed inputs; else held bits, no window: a spike sets its bit for hold steps
+    tables: str = "random"           # truth-table family: "random", "unate" (fixed-sign effects) or "parity" (XOR / XNOR)
+    heads: str = "both"              # "both": both heads read logic units; "policy": only the policy head (the value
+                                     # head reads its field directly, so the critic keeps a linear view of the network)
+    position: str = "after_fields"   # "after_fields": fields -> logic -> heads; "before_fields": last layer's excitatory
+                                     # populations -> logic -> fields -> heads (the learned fields can re-code the logic
+                                     # outputs for the linear heads; the last layer reaches the fields only through it:
+                                     # its inhibitory population does not project to the fields)
     period: Optional[int] = None     # output spike interval while 1 (None: the field neurons' refractory period)
     radius: int = 1                  # neighbourhood of each unit's inputs on the field sheet [cells]
     seed: int = 0
@@ -508,23 +516,48 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         last, last_spec = layers[-1], spec.layers[-1]
         if spec.boolean_head is not None and fields is None:
             raise ValueError("boolean_head: the Boolean units read the field layers (network.fields must be set)")
+        if spec.boolean_head is not None and spec.boolean_head.heads not in ("both", "policy"):
+            raise ValueError(f"boolean_head heads must be 'both' or 'policy', not {spec.boolean_head.heads!r}")
+        if spec.boolean_head is not None and spec.boolean_head.position not in ("after_fields", "before_fields"):
+            raise ValueError(f"boolean_head position must be 'after_fields' or 'before_fields', not "
+                             f"{spec.boolean_head.position!r}")
+        logic_first = spec.boolean_head is not None and spec.boolean_head.position == "before_fields"
         if fields is not None:
             fs = spec.fields
-            for fld in fields:                                   # last layer -> fields
-                for src, src_shape, fan, sign, conn in ([(p, sh, f, sg, fs.conn) for p, sh, f, sg in src_pops(len(layers) - 1)]
-                                                        + [(last[1], last_spec.i_shape, last_spec.fan_in_i, -1,
-                                                            fs.conn_i or fs.conn)]):
+            field_sources = ([(p, sh, f, sg, fs.conn) for p, sh, f, sg in src_pops(len(layers) - 1)]
+                             + [(last[1], last_spec.i_shape, last_spec.fan_in_i, -1, fs.conn_i or fs.conn)])
+            if logic_first:
+                # before_fields: one logic unit per excitatory neuron of the last layer, reading k of them locally; the
+                # fields read the logic units (signed weights: a logic output carries no sign) and nothing else
+                bs = spec.boolean_head
+                period = bs.period if bs.period is not None else int(round(fs.neuron.tau_refrac or 3))
+                logic_sources = []
+                for src, src_shape, fan, sign, conn in field_sources:
+                    if sign < 0:
+                        continue
+                    bpop = Population(BooleanUnit(k=bs.k, window=bs.window, period=period, hold=bs.hold,
+                                                  tables=bs.tables, seed=bs.seed + len(booleans)), src_shape)
+                    pre, post, w = boolean_inputs(src_shape, bs.k, bs.radius,
+                                                  np.random.default_rng(bs.seed + 100 + len(booleans)))
+                    Connection(src, bpop, Explicit(pre_ind=pre, post_ind=post, weight=w), exc_inh_sign=None)
+                    labels[bpop] = f"logic_{len(booleans)}"
+                    booleans.append(bpop)
+                    logic_sources.append((bpop, src_shape, fan, None, conn))
+                field_sources = logic_sources
+            for fld in fields:                                   # last layer (or its logic units) -> fields
+                for src, src_shape, fan, sign, conn in field_sources:
                     if conn.type == "none":
                         continue
                     Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape,
                                                       src_sheet=last_spec.e_shape, tgt_sheet=fs.shape),
                                exc_inh_sign=sign)
             for fld, head, name in ((fields[0], policy, "policy_feedback"), (fields[1], value, "value_feedback")):
-                if spec.boolean_head is not None:
+                if (spec.boolean_head is not None and not logic_first
+                        and (spec.boolean_head.heads == "both" or head is policy)):
                     bs = spec.boolean_head
                     period = bs.period if bs.period is not None else int(round(fs.neuron.tau_refrac or 3))
-                    bpop = Population(BooleanUnit(k=bs.k, window=bs.window, period=period,
-                                                  seed=bs.seed + len(booleans)), fs.shape)
+                    bpop = Population(BooleanUnit(k=bs.k, window=bs.window, period=period, hold=bs.hold,
+                                                  tables=bs.tables, seed=bs.seed + len(booleans)), fs.shape)
                     pre, post, w = boolean_inputs(fs.shape, bs.k, bs.radius,
                                                   np.random.default_rng(bs.seed + 100 + len(booleans)))
                     Connection(fld, bpop, Explicit(pre_ind=pre, post_ind=post, weight=w), exc_inh_sign=None)

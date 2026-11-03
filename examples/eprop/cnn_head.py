@@ -97,9 +97,10 @@ class CNNHead:
         dlogits = delta * (pi - onehot) + self.entropy * pi * (logp + H)
         return dlogits, -delta
 
-    def learn(self, cache, logits, action, delta):
+    def learn(self, cache, logits, action, delta, train_value=True):
+        """train_value False: actor only (delta comes from an external critic; the value output is not trained)."""
         dlogits, dvalue = self.loss_gradients(cache, logits, action, delta)
-        self.adam(self.backward(cache, dlogits, dvalue))
+        self.adam(self.backward(cache, dlogits, dvalue if train_value else 0.0))
 
 
 def gradient_check(seed=0, eps=1e-6):

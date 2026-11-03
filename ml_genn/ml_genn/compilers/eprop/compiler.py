@@ -228,7 +228,9 @@ class EPropCompiler(Compiler):
                                     inhibitory plasticity instead of the hidden rule (PlasticInhibitionConfig,
                                     a dict of its fields, or True for the defaults)
         train_readout:               False keeps the readout (policy / value) weights at their
-                                    initial values, to test what the hidden rule learns on its own
+                                    initial values, to test what the hidden rule learns on its own;
+                                    "value" trains only the value head's readout (the policy readout
+                                    is frozen, e.g. when an external actor chooses the actions)
         readout_optimiser:           Optimiser for the readout weights, the output biases and
                                     the optimised feedback weights (None: ``optimiser``), e.g.
                                     Adam on the raw readout gradient when the hidden rule is
@@ -306,7 +308,7 @@ class EPropCompiler(Compiler):
                  activity_rewiring: dict = None,
                  dale_connections=None,
                  optimise_feedback: bool = False,
-                 train_readout: bool = True,
+                 train_readout=True,
                  readout_optimiser=None,
                  population_optimisers: dict = None,
                  readout_lambda: float = None,
@@ -435,7 +437,11 @@ class EPropCompiler(Compiler):
         if pop.neuron.readout is not None:
             self._build_output_neuron_model(pop, model_copy, compile_state)
         elif isinstance(pop.neuron, BooleanUnit):
-            pass                               # fixed logic units: no learning code, nothing to reset or regularise
+            # fixed logic units: no learning code, nothing to reset or regularise. When they feed hidden neurons, those
+            # synapses address their presynaptic ISynPertEps (as from an input population; the rule sends nothing
+            # there), so the unit gets that input as an unused sink
+            if self.gamma_lambda is not None:
+                model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
         elif not isinstance(pop.neuron, Input):
             self._build_hidden_neuron_model(pop, model_copy, compile_state)
         else:
@@ -489,7 +495,9 @@ class EPropCompiler(Compiler):
         # adaptive feedback connections have DeltaG; they are optimised only on request
         # (the original implementation never optimised them)
         readout_conn = (not conn.is_feedback and target_neuron.readout is not None)
-        if readout_conn and not self.train_readout:
+        frozen = (not self.train_readout
+                  or (self.train_readout == "value" and target_pop is not self.value_head))
+        if readout_conn and frozen:
             pass                               # frozen readout: the readout weights keep their initial values
         elif conn in self.plastic_inhibition:
             pass                               # updated by its own local rule, not the optimiser

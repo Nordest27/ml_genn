@@ -67,13 +67,21 @@ import csv
 #     the value head treats the end of an episode as terminal (value 0, no bootstrap, through the drain) and computes
 #     no TD error across the boundary. Neuron states, short filters, baselines and optimiser states are kept
 # cnn_head: None or {"lr": 1e-4, "channels": [16, 16], "entropy": 0.01, "seed": 0} - a host-side convolutional
-#     actor-critic (cnn_head.CNNHead, NumPy, online, one sample per move) reads the field layers' spike counts of each
-#     move (sheet x channels of both fields) and chooses the action; its TD error is written to the network's value
-#     head (external_td) and drives the hidden rule, and its policy error goes to the policy head (for e-prop's
-#     feedback). The network's own readout weights are frozen and unused
+#     actor (cnn_head.CNNHead, NumPy, online, one sample per move) reads the field layers' spike counts of each move
+#     (sheet x channels of both fields) and chooses the action; its policy error goes to the policy head (for e-prop's
+#     feedback), whose readout weights are frozen and unused. The critic is the network's own value head, trained and
+#     defined every timestep as without the CNN; its TD error drives the hidden rule, and the CNN's advantage of a move
+#     is the discounted sum of those per-step TD errors over the move (= r + gamma^n V(next decision) - V(decision))
 # boolean_head: None or {"k": 2, "window": 10, "radius": 1, "seed": 0} - fixed random logic units (BooleanUnit, one per
 #     field neuron, k local field inputs, refractory-rate output) between the fields and the heads: the heads read
-#     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec)
+#     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec).
+#     "hold": h replaces the window by held bits: an input spike sets its bit for h steps, the table is applied every step;
+#     "tables": "random" | "unate" | "parity" - the truth-table family (unate: each input's effect has a fixed sign;
+#     parity: XOR / XNOR for k = 2, no linear part for balanced inputs). Per episode, outputs/<prefix>_boolean.csv logs
+#     each Boolean population's input-bit and output on-fractions and the parity tables' linear part prod(1 - 2 p);
+#     "heads": "both" | "policy" - "policy": only the policy head reads logic units, the value head reads its field
+#     "position": "after_fields" | "before_fields" - before_fields: the logic units sit between the last layer's
+#     excitatory populations and the fields (last layer -> logic -> fields -> heads; the fields learn and re-code them)
 # code: None or {"type": "sparse_expansion", "n": 2000, "active": 0.05, "seed": 0} - ei_layers 0 only: the heads read
 #     a binary code of the input frame (and the cue) instead of the input: a fixed random projection onto n units, of
 #     which the top active * n fire (k-winners-take-all). Non-differentiable (the winner set changes in jumps); the
@@ -800,7 +808,7 @@ def build_compiled_network(connectivity_type="fixed"):
             raise ValueError("cnn_head needs the modular compiler (set hidden_rule)")
         if HP["policy_head"] is not None or HP["boolean_head"] is not None:
             raise ValueError("cnn_head replaces the readout: no policy_head / boolean_head")
-        rule_kwargs.update(external_td=True, count_spikes=True, train_readout=False)
+        rule_kwargs.update(count_spikes=True, train_readout="value")
     if HP["readout_lambda_env"] is not None:
         if HP["hidden_rule"] is None:
             raise ValueError("readout_lambda_env needs the modular compiler (set hidden_rule)")
@@ -946,7 +954,7 @@ def set_episode_mode(mode):
 
 
 CNN = None
-cnn_state = {"prev": None, "r": 0.0, "ext": False}
+cnn_state = {"prev": None, "adv": 0.0, "disc": 1.0, "probs": np.full(NUM_OUTPUT, 1.0 / NUM_OUTPUT)}
 if HP["cnn_head"] is not None:
     if not built.fields:
         raise ValueError("cnn_head reads the field layers (network.fields must be set)")
@@ -955,6 +963,36 @@ if HP["cnn_head"] is not None:
                            channels=tuple(HP["cnn_head"].get("channels", (16, 16))),
                            lr=float(HP["cnn_head"].get("lr", 1e-4)), entropy=float(HP["cnn_head"].get("entropy", 0.01)),
                            seed=int(HP["cnn_head"].get("seed", 0)))
+
+
+BOOLEAN_CSV = None
+
+
+def log_boolean(ep):
+    """boolean_head: per population, the mean on-fraction of the units' input bits (p) and outputs since the last call,
+    and the mean over units of prod_{other inputs} (1 - 2 p): an input's linear (first-order) effect through a parity
+    table, assuming independent inputs with the unit's mean on-fraction (0 when balanced; 1 is OR-like)."""
+    global BOOLEAN_CSV
+    k = int(HP["boolean_head"].get("k", 2))
+    if BOOLEAN_CSV is None:
+        BOOLEAN_CSV = f"outputs/{CSV_PREFIX}({REPETITION})_boolean.csv"
+        with open(BOOLEAN_CSV, "w", newline="") as f:
+            csv.writer(f).writerow(["episode", "population", "bit_on", "out_on", "parity_linear"])
+    rows = []
+    for idx, bpop in enumerate(built.boolean):
+        npop = compiled_net.neuron_populations[bpop]
+        vals = {}
+        for v in ("BitSum", "OutSum", "Samples"):
+            npop.vars[v].pull_from_device()
+            vals[v] = np.asarray(npop.vars[v].view, dtype=np.float64).ravel().copy()
+            npop.vars[v].view[:] = 0.0
+            npop.vars[v].push_to_device()
+        n = np.maximum(vals["Samples"], 1.0)
+        p = vals["BitSum"] / (k * n)
+        rows.append([ep, idx, float(p.mean()), float((vals["OutSum"] / n).mean()),
+                     float((np.abs(1.0 - 2.0 * p) ** (k - 1)).mean())])
+    with open(BOOLEAN_CSV, "a", newline="") as f:
+        csv.writer(f).writerows(rows)
 
 
 def cnn_fields():
@@ -969,34 +1007,37 @@ def cnn_fields():
     return np.concatenate(imgs, axis=-1)
 
 
-def set_ext_td(delta):
+def cnn_accumulate():
+    """After every timestep: add the value head's TD error (discounted from the move's decision) to the advantage of
+    the CNN's current move. Summed over a move the per-step TD errors telescope to r + gamma^n V(t + n) - V(t)."""
+    if cnn_state["prev"] is None:
+        return
     vpop = compiled_net.neuron_populations[value]
-    vpop.vars["ExtTd"].view[:] = delta
-    vpop.vars["ExtTd"].push_to_device()
-    cnn_state["ext"] = delta != 0.0
+    vpop.vars["E"].pull_from_device()
+    cnn_state["adv"] += cnn_state["disc"] * float(np.asarray(vpop.vars["E"].view).ravel()[0])
+    cnn_state["disc"] *= gamma
+
+
+def cnn_learn_move():
+    """The CNN actor learns its last move (state, action) from the move's advantage."""
+    prev = cnn_state["prev"]
+    if prev is not None and prev[2] is not None:
+        CNN.learn(prev[0], prev[1], prev[2], cnn_state["adv"], train_value=False)
+    cnn_state.update(adv=0.0, disc=1.0)
 
 
 def cnn_decide():
-    """CNN head at a decision: learn from the transition that just ended (one-step actor-critic, delta sent to the
-    network for one step), then return this state's logits and policy."""
-    logits, v, cache = CNN.forward(cnn_fields())
-    prev = cnn_state["prev"]
-    if prev is not None:
-        delta = cnn_state["r"] + HP["gamma_env"] * v - prev[3]
-        CNN.learn(prev[0], prev[1], prev[2], delta)
-        set_ext_td(delta)
-    cnn_state.update(prev=[cache, logits, None, v], r=0.0)
-    return logits, CNN.policy(logits)
+    """CNN actor at a decision: learn the move that just ended, then return this state's logits and policy."""
+    cnn_learn_move()
+    logits, _, cache = CNN.forward(cnn_fields())
+    cnn_state.update(prev=[cache, logits, None], probs=CNN.policy(logits))
+    return logits, cnn_state["probs"]
 
 
 def cnn_terminal():
-    """CNN head at the end of an episode: the terminal transition (value 0, no bootstrap)."""
-    prev = cnn_state["prev"]
-    if prev is not None and prev[2] is not None:
-        delta = cnn_state["r"] - prev[3]
-        CNN.learn(prev[0], prev[1], prev[2], delta)
-        set_ext_td(delta)
-    cnn_state.update(prev=None, r=0.0)
+    """CNN actor at the end of an episode (after the drain): learn the final move; the next episode starts afresh."""
+    cnn_learn_move()
+    cnn_state["prev"] = None
 
 
 class EpisodicDebug:
@@ -1843,10 +1884,6 @@ def train_snake_agent_with_ipc(episodes=10000,
                                          else probs)
 
                 obs, reward, done = env.step(action_label)
-                if CNN is not None:
-                    cnn_state["r"] += reward
-                    if done:
-                        cnn_terminal()
                 if done and HP["episodic_traces"]:
                     set_episode_mode(1)            # this step's TD error and the drain: the terminal value is 0
                 total_reward += reward
@@ -1889,8 +1926,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
-                if CNN is not None and cnn_state["ext"]:
-                    set_ext_td(0.0)                # the TD error is a one-step impulse per transition
+                if CNN is not None:
+                    cnn_accumulate()
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "episode")
                 if HP["episodic_traces"] and episode_start and not done:
@@ -2031,6 +2068,8 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                         probs = np.array([p_left, p_fwd, p_right])
                         probs = probs / probs.sum()
+                    elif CNN is not None:
+                        probs = cnn_state["probs"]          # the device policy readout is frozen and unused
                     else:
                         logits = compiled_net.get_readout(policy).flatten()
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
@@ -2048,8 +2087,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 reward_trace = reward_trace * reward_decay
                 relay_reward_context()
                 compiled_net.step_time(train_callback_list)
-                if CNN is not None and cnn_state["ext"]:
-                    set_ext_td(0.0)                # the TD error is a one-step impulse per transition
+                if CNN is not None:
+                    cnn_accumulate()
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "drain")
                 
@@ -2057,6 +2096,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 for o, custom_updates in compiled_net.optimisers:
                     for c in custom_updates:
                         o.set_step(c, opt_updt := opt_updt+1)
+            if CNN is not None:
+                cnn_terminal()                     # the final move's advantage includes the drain (terminal value 0)
             
             # compiled_net.genn_model.custom_update("GradientLearn")
             # for o, custom_updates in compiled_net.optimisers:
@@ -2147,6 +2188,8 @@ def train_snake_agent_with_ipc(episodes=10000,
             running_avg.append(avg)
 
             policy_monitor.end_episode(ep, compiled_net.genn_model.timestep, getattr(env, "switches", 0))
+            if built.boolean:
+                log_boolean(ep)
             with open(CSV_OUTPUT, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([

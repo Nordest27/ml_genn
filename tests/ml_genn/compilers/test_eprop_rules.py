@@ -1842,3 +1842,27 @@ def test_external_td_and_spike_counts(request):
         compiled.step_time(cb)
         hpop.vars["TdE"].pull_from_device()
         assert np.allclose(hpop.vars["TdE"].view, 0.37, atol=1e-6)
+
+
+def test_train_readout_value_only(request):
+    """train_readout "value": the value head's readout learns, the policy readout keeps its initial weights (an
+    external actor), and the hidden layer still learns from the value head's TD error."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed"}, train_readout="value")
+    g0 = {}
+    probe_moved = {}
+
+    def probe(c, when):
+        for conn, sg in c.connection_populations.items():
+            if conn.is_feedback:
+                continue
+            sg.vars["g"].pull_from_device()
+            if when == "start":
+                g0[conn] = sg.vars["g"].values.copy()
+            else:
+                probe_moved[conn.target()] = max(probe_moved.get(conn.target(), 0.0),
+                                                 float(np.abs(sg.vars["g"].values - g0[conn]).max()))
+
+    _run(compiled, inp, pol, val, probe=probe)
+    assert probe_moved[pol] == 0.0
+    assert probe_moved[val] > 0 and probe_moved[hid] > 0, probe_moved
