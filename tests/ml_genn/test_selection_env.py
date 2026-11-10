@@ -35,3 +35,18 @@ def test_motor_pools_are_a_balanced_partition():
     import snake_network
     pools = snake_network.motor_pools(48, 4, seed=3)
     assert sorted(np.bincount(pools).tolist()) == [12, 12, 12, 12]
+
+
+def test_selection_env_switch_changes_the_required_features():
+    env = snake_switch.SelectionEnv(0, (10, 10, 3), n_candidates=8, seed=0, switch_moves=50, required_after=[(2, 3)])
+    seen = []                              # (switches, ctype, good) at each decision, judged before the step
+    for _ in range(200):
+        env.reset()
+        done = False
+        while not done:
+            seen.append((env.switches, env.ctype, env.good))
+            _, _, done = env.step(1)
+    assert env.switches == len(seen) // 50
+    for sw, t, good in seen:
+        req = (0, 1) if sw % 2 == 0 else (2, 3)
+        assert good == all((t >> j) & 1 for j in req)

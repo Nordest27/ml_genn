@@ -132,6 +132,13 @@ class FieldSpec:
     readout_p: float = 0.99999       # field -> head (fixed probability, weights N(0, 1 / sqrt(fan_in)))
     rule: Optional[Union[str, dict]] = None
     optimiser: Optional[dict] = None   # {"type", "lr", "betas"}: own optimiser for the synapses onto the fields
+    internal: Optional[ConnSpec] = None    # None: plain fields; else each field is an E/I layer: the field (E) and its
+                                           # own inhibitory population, recurrently connected like a hidden layer's
+                                           # four internal connections (E->E, E->I, I->E, I->I)
+    internal_ei: Optional[ConnSpec] = None  # ... the field's E -> its I population (None: internal)
+    internal_i: Optional[ConnSpec] = None  # ... the connections from the field's I population (None: internal)
+    i_shape: Optional[Shape] = None        # ... the field I population's shape (None: the field's)
+    fan_in: Optional[float] = None         # ... their fan-in (toroidal connectivity without p_max; None: the last layer's)
 
 
 @dataclass
@@ -226,6 +233,7 @@ class NetworkSpec:
                                      # on the most active pool), with the exact pool membership as its feedback
     motor_rule: Optional[Union[str, dict]] = None   # headless: own rule for the policy field (the motor pools), e.g.
                                                     # stronger weight noise; None: as the other fields
+    motor_optimiser: Optional[dict] = None   # headless: own optimiser for the synapses onto the policy field
     code: Optional[int] = None       # ei_layers 0 only: the heads read a code population of this size (Poisson, rates
                                      # set by the training script from a non-differentiable transform of the input and
                                      # the cue) instead of the input itself
@@ -374,6 +382,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
     labels, rules, optimisers, i_to_e, i_to_i, i_to_s = {}, {}, {}, [], [], []
     booleans = []
     slows = []
+    field_inh = []
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
         layers = []
@@ -446,6 +455,35 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 rules[fields[0]] = spec.motor_rule
             if fs.optimiser is not None:
                 optimisers[fields[0]] = optimisers[fields[1]] = ("fields", fs.optimiser)
+            if fs.internal is not None:          # fields as E/I layers: each with its own inhibitory population
+                last_spec = spec.layers[-1]
+                fan = fs.fan_in if fs.fan_in is not None else last_spec.fan_in_e
+                i_shape = fs.i_shape or fs.shape
+                for fld in fields:
+                    fi = Population(_alif(fs.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac,
+                                          spec.resonator, spec.plateau), i_shape)
+                    labels[fi] = f"{labels[fld]}_I"
+                    field_inh.append(fi)
+                    for pre, post, sign in ((fld, fld, +1), (fld, fi, +1), (fi, fld, -1), (fi, fi, -1)):
+                        spec_c = (fs.internal_i if (sign < 0 and fs.internal_i is not None) else
+                                  fs.internal_ei if (post is fi and fs.internal_ei is not None) else fs.internal)
+                        if spec_c.type == "none":
+                            continue
+                        c = Connection(pre, post, connectivity(spec_c, pre.shape, sign, fan, last_spec.sigma,
+                                                               tgt_shape=post.shape, same=pre is post,
+                                                               src_sheet=fs.shape, tgt_sheet=fs.shape),
+                                       exc_inh_sign=sign)
+                        if pre is fi and post is fld:
+                            i_to_e.append(c)
+                        elif pre is fi and post is fi:
+                            i_to_i.append(c)
+            if spec.motor_optimiser is not None:
+                optimisers[fields[0]] = ("motor", spec.motor_optimiser)
+            for fld, fi in zip(fields, field_inh):   # a field's I population learns like the field
+                if fld in rules:
+                    rules[fi] = rules[fld]
+                if fld in optimisers:
+                    optimisers[fi] = optimisers[fld]
 
         policy = Population(LeakyIntegrate(tau_mem=spec.head_tau_mem, bias=0.0, readout="var"), spec.num_actions)
         value = Population(LeakyIntegrate(tau_mem=spec.head_tau_mem, bias=0.0, readout="var"), 1)
@@ -527,8 +565,9 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                          src_sheet=ls.e_shape, tgt_sheet=spec.layers[k - 1].e_shape),
                                exc_inh_sign=sign)
         last, last_spec = layers[-1], spec.layers[-1]
-        if spec.headless is not None and (fields is None or spec.boolean_head is not None):
-            raise ValueError("headless: the motor pools are the policy field (network.fields must be set, no boolean_head)")
+        if spec.headless is not None and spec.boolean_head is not None and (
+                fields is None or spec.boolean_head.position != "before_fields"):
+            raise ValueError("headless: a boolean_head only before the fields")
         if spec.boolean_head is not None and fields is None:
             raise ValueError("boolean_head: the Boolean units read the field layers (network.fields must be set)")
         if spec.boolean_head is not None and spec.boolean_head.heads not in ("both", "policy"):
@@ -599,15 +638,28 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         else:                                                    # heads read the last layer directly
             for src, src_shape in [(p, sh) for p, sh, _, _ in src_pops(len(layers) - 1)] + [(last[1], last_spec.i_shape)]:
                 for head in (policy, value):
+                    if spec.headless is not None and head is policy:
+                        continue
                     Connection(src, head, connectivity(ConnSpec(type="fixed", p=spec.direct_readout_p), src_shape, None),
                                exc_inh_sign=None)
+            if spec.headless is not None and (spec.motor_rule is not None or spec.motor_optimiser is not None):
+                raise ValueError("headless without fields: motor_log_syn_sigma / motor_local / motor_optimiser act on "
+                                 "the policy field (set network.fields)")
+            if spec.headless is not None:
+                # headless without fields: the motor pools are the last layer's E neurons (the layer is the motor
+                # population); the value head reads the last layer as usual
+                n_e = int(np.prod(last_spec.e_shape))
+                pools = motor_pools(n_e, spec.num_actions, spec.headless)
+                size = np.bincount(pools, minlength=spec.num_actions).astype(np.float64)
+                Connection(last[0], policy, Explicit(pre_ind=np.arange(n_e), post_ind=pools, weight=1.0 / size[pools]),
+                           exc_inh_sign=None)          # (e-prop's feedback: the EI layers' random feedback below)
 
         # TD-error transport into the value head: from the policy head and every hidden population
         Connection(policy, value, Dense(weight=1.0), feedback_name="tde_transport")
         for k in range(len(layers)):
             for pop in lpops(k):
                 Connection(pop, value, Dense(weight=1.0), feedback_name="tde_transport")
-        for fld in (fields or ()):
+        for fld in list(fields or ()) + field_inh:
             Connection(fld, value, Dense(weight=1.0), feedback_name="tde_transport")
 
         # explicit random feedback from the EI layers
@@ -780,12 +832,20 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
         spec = replace(spec, boolean_head=_merge(BooleanSpec(), dict(hp["boolean_head"])))
     if hp.get("headless"):
         spec = replace(spec, headless=int(hp["headless"].get("seed", 0)))
-        if hp["headless"].get("motor_log_syn_sigma") is not None:
+        hl = hp["headless"]
+        if hl.get("motor_log_syn_sigma") is not None or hl.get("motor_local") is False:
             # the motor pools' own rule: the fields' rule (or the network's hidden rule) with stronger weight noise
+            # and / or without the local objectives (which push the pools toward quiet, stable activity)
             base = (hp.get("network") or {}).get("fields", {}) or {}
             base = base.get("rule") or hp.get("hidden_rule") or {"preset": "proposed"}
             base = {"preset": base} if isinstance(base, str) else dict(base)
-            spec = replace(spec, motor_rule={**base, "log_syn_sigma": float(hp["headless"]["motor_log_syn_sigma"])})
+            if hl.get("motor_log_syn_sigma") is not None:
+                base["log_syn_sigma"] = float(hl["motor_log_syn_sigma"])
+            if hl.get("motor_local") is False:
+                base["local"] = None
+            spec = replace(spec, motor_rule=base)
+        if hl.get("motor_optimiser") is not None:
+            spec = replace(spec, motor_optimiser=dict(hl["motor_optimiser"]))
     if hp.get("code"):
         if hp["ei_layers"] != 0:
             raise ValueError("code: only with ei_layers 0 (the heads read the code instead of the input)")
@@ -802,4 +862,20 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             if "shape" in fd:
                 fd["shape"] = _shape(fd["shape"], channels)
             spec = replace(spec, fields=_merge(spec.fields, fd))
-    return _merge(spec, net)
+    spec = _merge(spec, net)
+    fe = hp.get("field_ei")
+    if fe is not None:
+        # fields as E/I layers with the last hidden layer's internal connectivity (sigma in field cells), weights scaled
+        # by gain_ee (E -> E, 0: none), gain_ei (E -> I) and gain_i (I -> E, I -> I); the I population is as much
+        # smaller than the field as the layer's I is than its E
+        if spec.fields is None or not spec.layers:
+            raise ValueError("field_ei needs fields and at least one hidden layer")
+        ls, fs = spec.layers[-1], spec.fields
+        side = fe.get("i_side") or max(1, int(round(fs.shape[0] * ls.i_shape[0] / ls.e_shape[0])))
+        spec = replace(spec, fields=replace(
+            fs, internal=(_gain(ls.internal, float(fe.get("gain_ee", 1.0))) if fe.get("gain_ee", 1.0)
+                          else ConnSpec(type="none")),
+            internal_ei=_gain(ls.internal, float(fe.get("gain_ei", 1.0))),
+            internal_i=_gain(ls.internal_i or ls.internal, float(fe.get("gain_i", 1.0))),
+            i_shape=(int(side), int(side), fs.shape[2])))
+    return spec

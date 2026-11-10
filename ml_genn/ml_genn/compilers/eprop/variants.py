@@ -224,6 +224,11 @@ class HiddenRuleConfig:
     drift: float = 1.0               # c_P: TD error x lambda-trace of the drift part
     gradient: float = 1.0            # c_G: TD error x lambda-trace of the gradient part
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
+    center_eligibility: Optional[float] = None   # decay d of each synapse's running mean of its drift-eligibility
+                                     # increment (psi - psibar) * pre * noise, subtracted before it enters the drift
+                                     # trace: the part of the drift shared by all states (the state-independent
+                                     # direction of the synapse) is removed, the per-state freeze is kept
+                                     # (None: off; d should span many states, e.g. 0.9999)
     drift_td: float = 1.0            # weight of the TD error in the drift's modulator (0: no outcome sign)
     surprise_drift: float = 0.0      # c_S: adds c_S * (|delta| - mean|delta|) to the drift's modulator: the drift then
                                      # freezes responses around surprising moments (good or bad) and keeps routine
@@ -262,6 +267,11 @@ class HiddenRuleConfig:
     diagnose_gradients: bool = False     # diagnostic: synapses with an e-prop term (and noise) also accumulate
                                          # AccE = sum delta * e-prop trace, AccG = sum delta * gradient-part trace
                                          # (gate -PsiBar) and AccG1 (gate -1), without using G or G1 to learn
+    diagnose_parts: bool = False         # diagnostic: synapses with drift and gradient parts also keep each part's
+                                         # own lambda-trace (same lambda, normalisation and episodic reset as the
+                                         # learning trace) and accumulate AccP = sum delta * drift-part trace and
+                                         # AccGp = sum delta * gradient-part trace, the two parts' contributions to
+                                         # the TD-driven update (unscaled by factor_norm); learning is unchanged
     recipient_homeostat: bool = False    # SIGNAL_RECIPIENTS: the e-prop populations keep the noise and the homeostat
                                          # (keeps them alive; their learning signal stays e-prop only)
     backprop: float = 0.0            # c_B: TD error x lambda-trace of eFiltered * L, where L is the backward projection
@@ -307,7 +317,7 @@ class HiddenRuleConfig:
             raise ValueError("drift, gradient, homeostat and local objectives need noise "
                              "(noise=NoisePlacement.NONE)")
         if self.estimator is Estimator.EXACT:
-            if self.drift != 0 or self.homeostat != 0 or self.center_drift:
+            if self.drift != 0 or self.homeostat != 0 or self.center_drift or self.center_eligibility is not None:
                 raise ValueError("the exact estimator has no drift: use drift=0, homeostat=0")
             if self.noise is NoisePlacement.NODE:
                 raise ValueError("the exact estimator is implemented for weight noise only")

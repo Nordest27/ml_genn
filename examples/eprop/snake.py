@@ -78,12 +78,51 @@ import csv
 #     the usual per-step value head. Without surrogate_tau the policy error is 0 (the perturbation rules need none);
 #     with it, softmax(pool activity / tau) - onehot is fed back through the exact pool membership (e-prop's best
 #     surrogate, a modelling choice the task does not define)
+#     "decoder": "argmax" | "vector" - vector: two motor pools (left, right) read as a population vector
+#     x = (right - left) / (right + left) in [-1, 1] that steers (x < -threshold turn left, x > threshold turn right,
+#     else forward; relative to the snake's heading): a fixed continuous decoder with no distribution;
+#     "threshold": 0.1 - the vector decoder's turn threshold (the pools start nearly balanced, |x| ~ 0.1-0.2);
+#     "decoder": "max" | "topk" | "lse" - the action is the pool with the largest statistic of its neurons' spike
+#     counts over the move (counted in SpkCount, read on the host; ties at random): "max" the most active neuron,
+#     "topk" the mean of its "k" (5) most active neurons, "lse" log(mean(exp(beta * count))) / beta with "beta" (1.0),
+#     from the pool mean (beta -> 0) to the pool max (beta -> inf); deterministic, no distribution, random pools;
+#     "popvec" (continuous actions, reach): every motor neuron has a fixed random preferred direction (seeded by
+#     "seed") and the action is the population vector gain * sum_i c_i u_i / sum_i c_i of the spike counts c over
+#     the move ("gain", 4.0; clipped to unit length by the environment)
 #     "motor_log_syn_sigma": x - the policy field (motor pools) gets its own rule with weight noise exp(x - 5) (the
 #     default is x = 0, i.e. 0.0067): more of the variability that picks the action is noise the rule can credit
+#     "motor_local": false - no local objectives in the motor pools (they push the pools toward quiet, stable
+#     activity, i.e. away from the variability the decisions need); "motor_optimiser": {"type", "lr", "betas"} - own
+#     optimiser for the synapses onto the motor pools (fast motor pools, slow hidden layers)
 # selection: None or {"n_candidates": 8, "features": 4, "required": [0, 1], "p": 0.5, "good_reward": 1.0,
 #     "bad_reward": -1.0, "none_reward": 0.0, "noise": 0.05, "seed": None} - instead of Snake, candidate selection
 #     (snake_switch.SelectionEnv): one candidate per move, two actions (0 commits to the candidate just shown, 1 skips
 #     it); good iff all required features are present. The logged score is the episode's reward
+# diagnose_parts_every: None or n - with a hidden rule that has "diagnose_parts": true, every n timesteps the
+#     accumulated drift-part and gradient-part updates (AccP, AccGp) of every hidden connection are saved to
+#     outputs/<prefix>(<rep>)_parts/<timestep>.npz and zeroed (diagnostic of the rule's two parts)
+# reach: None or {"speed": 0.08, "radius": 0.08, "progress": 10.0, "reach_reward": 1.0, "max_moves": 40, "near": 0.3,
+#     "noise": 0.0, "blob": 1, "seed": None} - instead of Snake, continuous reaching (snake_switch.ReachEnv): a point
+#     agent moves toward a target with a 2D velocity each move; egocentric view; needs headless with decoder "popvec".
+#     The logged score is the episode's reward (progress + reach bonus); "Snake len" 1 = reached
+# field_ei: None or {"gain_ee": 1.0, "gain_ei": 1.0, "gain_i": 1.0, "i_side": None} - each field becomes an E/I layer:
+#     its own inhibitory population (side i_side, default as much smaller than the field as the last layer's I is than
+#     its E) and the last hidden layer's four internal connections inside the field, weights scaled by gain_ee (E -> E;
+#     0: none), gain_ei (E -> I) and gain_i (I -> E, I -> I); the field I populations learn under the field's rule
+# move_log: None or {"probe_every": 250000, "probe_moves": 200} - selection or reach: one row per decision in
+#     outputs/<prefix>(<rep>)_moves.csv (timestep, episode, switches, candidate type, good, action, the readout / motor
+#     pool activities, the sum of the per-step TD errors from this decision to the next one or the episode's end,
+#     drain included); with a rule that has "diagnose_parts": true, every probe_every timesteps the next probe_moves
+#     moves' drift eligibility (AccPx: the drift part's trace increments without the TD error, summed over the move)
+#     of every hidden connection is saved to outputs/<prefix>(<rep>)_moves/<timestep>.npz, one row per move, keyed
+#     by the decision timestep (episode drains are left out); "aggregate": true keeps, instead of every move, per
+#     connection and per candidate type the eligibility summed over odd and even presentations (S: types x 2 x
+#     synapses), the counts (C) and the summed squared norm of single moves (SQ: types), saved once the probe ends
+#     (split-half state specificity and single-move noise for large networks); "include": ["->policy_field", ...]
+#     probes only the connections whose "source->target" name contains one of the strings (all by default; the
+#     aggregate sums take 16 x 2 x synapses floats); "activity": n records, for the first n
+#     moves, every hidden ALIF population's spike count per neuron over each move (counted in SpkCount) with the
+#     candidate type, saved to outputs/<prefix>(<rep>)_activity.npz (separation of states vs. trial-to-trial noise)
 # boolean_head: None or {"k": 2, "window": 10, "radius": 1, "seed": 0} - fixed random logic units (BooleanUnit, one per
 #     field neuron, k local field inputs, refractory-rate output) between the fields and the heads: the heads read
 #     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec).
@@ -134,7 +173,8 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "resonator": None, "plateau": None, "replay": None, "cued_foraging": None,
                         "episodic_traces": False, "episodic_debug": 0, "readout_lambda_env": None,
                         "policy_head": None, "code": None, "boolean_head": None, "cnn_head": None,
-                        "headless": None, "selection": None}
+                        "headless": None, "selection": None, "diagnose_parts_every": None,
+                        "move_log": None, "field_ei": None, "reach": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -643,7 +683,10 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 # p_max_h2 = compute_p_max(DESIRED_FAN_IN_H2, SIGMA_H, HIDDEN_I_SHAPE)
 
 
-NUM_OUTPUT = 2 if HP["selection"] else 4       # selection: commit / skip
+HEADLESS_VECTOR = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") == "vector"
+HEADLESS_COUNTS = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") in ("max", "topk", "lse", "popvec")
+HEADLESS_POPVEC = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") == "popvec"
+NUM_OUTPUT = 2 if (HP["selection"] or HEADLESS_VECTOR or HP["reach"]) else 4   # selection: commit / skip; vector: left / right pools
 NUM_OUTPUT_CHART = NUM_OUTPUT
 if GAUSSIAN_TRACE_POLICY:
     NUM_OUTPUT = 1
@@ -819,8 +862,17 @@ def build_compiled_network(connectivity_type="fixed"):
     if HP["headless"] is not None:
         if HP["hidden_rule"] is None:
             raise ValueError("headless needs the modular compiler (set hidden_rule)")
-        if HP["policy_head"] is not None or HP["cnn_head"] is not None or HP["boolean_head"] is not None:
-            raise ValueError("headless has no policy head: no policy_head / cnn_head / boolean_head")
+        if HP["headless"].get("decoder", "argmax") not in ("argmax", "vector", "max", "topk", "lse", "popvec"):
+            raise ValueError(f"headless decoder must be 'argmax', 'vector', 'max', 'topk', 'lse' or 'popvec', not "
+                             f"{HP['headless']['decoder']!r}")
+        if bool(HP["reach"]) != HEADLESS_POPVEC:
+            raise ValueError("reach needs headless decoder 'popvec' (and 'popvec' needs reach)")
+        if HEADLESS_VECTOR and (HP["selection"] or HP["headless"].get("surrogate_tau") is not None):
+            raise ValueError("headless decoder 'vector' steers the snake: no selection task, no surrogate_tau")
+        if (HP["policy_head"] is not None or HP["cnn_head"] is not None
+                or (HP["boolean_head"] is not None and HP["boolean_head"].get("position") != "before_fields")):
+            raise ValueError("headless has no policy head: no policy_head / cnn_head / boolean_head (a boolean_head "
+                             "only before the fields)")
         if HP["entropy_bonus"] > 0 and HP["headless"].get("surrogate_tau") is None:
             raise ValueError("headless defines no policy distribution: set entropy_bonus to 0 (or a surrogate_tau)")
         rule_kwargs.update(train_readout="value")
@@ -830,6 +882,12 @@ def build_compiled_network(connectivity_type="fixed"):
         if HP["policy_head"] is not None or HP["boolean_head"] is not None:
             raise ValueError("cnn_head replaces the readout: no policy_head / boolean_head")
         rule_kwargs.update(count_spikes=True, train_readout="value")
+    if HEADLESS_COUNTS:
+        if HP["headless"].get("surrogate_tau") is not None:
+            raise ValueError("headless count decoders: no surrogate_tau")
+        rule_kwargs.update(count_spikes=True)
+    if HP["move_log"] is not None and HP["move_log"].get("activity"):
+        rule_kwargs.update(count_spikes=True)
     if HP["readout_lambda_env"] is not None:
         if HP["hidden_rule"] is None:
             raise ValueError("readout_lambda_env needs the modular compiler (set hidden_rule)")
@@ -989,6 +1047,158 @@ if HP["cnn_head"] is not None:
 BOOLEAN_CSV = None
 
 
+def dump_parts():
+    """diagnose_parts_every: save and zero every hidden connection's AccP / AccGp (keyed source->target)."""
+    out_dir = f"outputs/{CSV_PREFIX}({REPETITION})_parts"
+    os.makedirs(out_dir, exist_ok=True)
+    arrays = {}
+    for conn, sg in compiled_net.connection_populations.items():
+        if conn.is_feedback or "AccP" not in sg.vars:
+            continue
+        key = f"{built.labels.get(conn.source(), conn.source().name)}->{built.labels.get(conn.target(), conn.target().name)}"
+        for v, tag in (("AccP", "P"), ("AccGp", "G")):
+            sg.vars[v].pull_from_device()
+            arrays[f"{key}|{tag}"] = np.asarray(sg.vars[v].values, dtype=np.float32).copy()
+            sg.vars[v].values = np.zeros_like(sg.vars[v].values)
+            sg.vars[v].push_to_device()
+    np.savez_compressed(f"{out_dir}/{compiled_net.genn_model.timestep}.npz", **arrays)
+
+
+class MoveLog:
+    """move_log: per-decision rows (with the TD errors that follow each decision) and probe dumps of the drift
+    eligibility per move."""
+
+    def __init__(self, cfg, env):
+        self.every, self.n = int(cfg.get("probe_every", 250000)), int(cfg.get("probe_moves", 200))
+        self.info_keys = list(env.move_info()) if hasattr(env, "move_info") else []
+        self.aggregate = bool(cfg.get("aggregate", False))
+        self.path = f"outputs/{CSV_PREFIX}({REPETITION})_moves.csv"
+        self.dir = f"outputs/{CSV_PREFIX}({REPETITION})_moves"
+        with open(self.path, "w", newline="") as f:
+            csv.writer(f).writerow(["timestep", "episode", "switches", "ctype", "good", "action"]
+                                   + [f"pool{i}" for i in range(NUM_OUTPUT)] + self.info_keys + ["td_after"])
+        self.pending, self.next_probe, self.probe = None, 0, None
+        self.n_act = int(cfg.get("activity") or 0)
+        self.act_pops = [(built.labels.get(p, p.name), gp) for p, gp in compiled_net.neuron_populations.items()
+                         if "SpkCount" in gp.vars] if self.n_act else []
+        self.act = {"ctype": [], "timestep": [], **{k: [] for k, _ in self.act_pops}}
+        self.conns = [(f"{built.labels.get(c.source(), c.source().name)}->"
+                       f"{built.labels.get(c.target(), c.target().name)}", sg)
+                      for c, sg in compiled_net.connection_populations.items()
+                      if not c.is_feedback and "AccPx" in sg.vars]
+        if cfg.get("include"):
+            self.conns = [(k, sg) for k, sg in self.conns if any(x in k for x in cfg["include"])]
+
+    def _take(self):
+        out = {}
+        for key, sg in self.conns:
+            sg.vars["AccPx"].pull_from_device()
+            out[key] = np.asarray(sg.vars["AccPx"].values, dtype=np.float32).copy()
+            sg.vars["AccPx"].values = np.zeros_like(sg.vars["AccPx"].values)
+            sg.vars["AccPx"].push_to_device()
+        return out
+
+    def _flush(self):
+        if self.pending is not None and self.info_keys:
+            # filled after the environment step of this decision (the cosine, speed and distance of the action taken;
+            # 'good' = the action pointed within 45 degrees of the target)
+            info = self.env.move_info()
+            k0 = 6 + NUM_OUTPUT
+            self.pending[k0:k0 + len(self.info_keys)] = [float(info[k]) for k in self.info_keys]
+            self.pending[4] = int(self.env.good)
+        if self.pending is not None:
+            with open(self.path, "a", newline="") as f:
+                csv.writer(f).writerow(self.pending)
+            self.pending = None
+
+    def decide(self, env, ep, action, pools):
+        """At a decision, before env.step: the candidate shown during the move that just ended."""
+        self._flush()
+        t = compiled_net.genn_model.timestep
+        self.pending = [t, ep, env.switches, env.ctype, int(env.good), int(action) if np.ndim(action) == 0 else -1] + \
+                       [float(x) for x in np.ravel(pools)] + [float("nan")] * len(self.info_keys) + [0.0]
+        self.env = env
+        if self.act_pops and len(self.act["ctype"]) < self.n_act:
+            for k, gp in self.act_pops:
+                if MOTOR and gp is MOTOR["gp"]:      # count decoders read (and zero) the motor counters first
+                    self.act[k].append(MOTOR["last"].astype(np.float32))
+                    continue
+                gp.vars["SpkCount"].pull_from_device()
+                self.act[k].append(np.asarray(gp.vars["SpkCount"].view, dtype=np.float32).ravel().copy())
+                gp.vars["SpkCount"].view[:] = 0.0
+                gp.vars["SpkCount"].push_to_device()
+            self.act["ctype"].append(env.ctype)
+            self.act["timestep"].append(t)
+            if len(self.act["ctype"]) == self.n_act:
+                np.savez_compressed(f"outputs/{CSV_PREFIX}({REPETITION})_activity.npz",
+                                    **{k: np.array(v) for k, v in self.act.items()})
+        if not self.conns:
+            return
+        if self.probe is None and t >= self.next_probe:
+            self._take()                   # starts clean at a move boundary: the next decision records a full move
+            self.probe = {"t": [], "x": {k: [] for k, _ in self.conns}, "started": False}
+            if self.aggregate:
+                self.probe["agg"] = {k: (np.zeros((16, 2, sg.vars["AccPx"].values.size), np.float32), np.zeros((16, 2)),
+                                         np.zeros(16)) for k, sg in self.conns}
+            self.next_probe += self.every
+            return
+        if self.probe is not None:
+            if self.probe["started"]:
+                x = self._take()
+                self.probe["t"].append(t)
+                if self.aggregate:      # the move that just ended showed the candidate decided on now
+                    ct = env.ctype
+                    for k in x:
+                        S, C, SQ = self.probe["agg"][k]
+                        h = int(C[ct].sum()) % 2
+                        S[ct, h] += x[k]
+                        C[ct, h] += 1
+                        SQ[ct] += float(x[k].astype(np.float64) @ x[k])
+                else:
+                    for k in x:
+                        self.probe["x"][k].append(x[k])
+            else:
+                self._take()
+            self.probe["started"] = True
+            if len(self.probe["t"]) >= self.n:
+                os.makedirs(self.dir, exist_ok=True)
+                if self.aggregate:
+                    out = {}
+                    for k, (S, C, SQ) in self.probe["agg"].items():
+                        out[f"{k}|S"], out[f"{k}|C"], out[f"{k}|SQ"] = S.astype(np.float32), C, SQ
+                    for k, sg in self.conns:   # synapse -> (pre, post) neuron, in the order of the variables
+                        try:
+                            sg.pull_connectivity_from_device()
+                            out[f"{k}|pre"] = np.asarray(sg.get_sparse_pre_inds()).copy()
+                            out[f"{k}|post"] = np.asarray(sg.get_sparse_post_inds()).copy()
+                        except Exception:  # not sparse connectivity: no indices
+                            pass
+                    np.savez_compressed(f"{self.dir}/agg_{self.probe['t'][0]}.npz", **out)
+                    print(f"move_log: aggregate probe saved ({len(self.probe['t'])} moves)", flush=True)
+                else:
+                    np.savez_compressed(f"{self.dir}/{self.probe['t'][0]}.npz", timestep=np.array(self.probe["t"]),
+                                        **{k: np.stack(v).astype(np.float16) for k, v in self.probe["x"].items()})
+                self.probe = None
+
+    def td(self, e):
+        if self.pending is not None:
+            self.pending[-1] += float(e)
+
+    def end_episode(self):
+        """After the drain: the last row is complete; the drain's increments are not a move of their own."""
+        self._flush()
+        if self.act_pops and len(self.act["ctype"]) < self.n_act:
+            for _, gp in self.act_pops:     # the drain is not a move: the next episode's first move starts clean
+                gp.vars["SpkCount"].view[:] = 0.0
+                gp.vars["SpkCount"].push_to_device()
+        if self.probe is not None:
+            self._take()
+            self.probe["started"] = True   # the next episode's first decision closes a full move
+
+
+MOVE_LOG = None
+
+
 def log_boolean(ep):
     """boolean_head: per population, the mean on-fraction of the units' input bits (p) and outputs since the last call,
     and the mean over units of prod_{other inputs} (1 - 2 p): an input's linear (first-order) effect through a parity
@@ -1027,6 +1237,60 @@ def headless_share(pool_activity):
     """headless display proxy: each motor pool's share of the pools' total activity (uniform when all are silent)."""
     a = np.maximum(np.asarray(pool_activity, dtype=np.float64), 0.0)
     return a / a.sum() if a.sum() > 0 else np.full(NUM_OUTPUT, 1.0 / NUM_OUTPUT)
+
+
+def headless_steer(pool_activity, dir_idx):
+    """headless decoder 'vector': the left / right pools' population vector x = (right - left) / (right + left)
+    steers relative to the heading (x < -threshold: turn left, x > threshold: turn right, else forward; silent
+    pools: forward). Returns the absolute direction, the policy error (0) and the logged pool shares."""
+    a = np.maximum(np.asarray(pool_activity, dtype=np.float64), 0.0)
+    x = (a[1] - a[0]) / (a[0] + a[1]) if a.sum() > 0 else 0.0
+    th = float(HP["headless"].get("threshold", 0.1))
+    turn = -1 if x < -th else (1 if x > th else 0)
+    return (dir_idx + turn) % 4, np.zeros(NUM_OUTPUT), headless_share(a)
+
+
+MOTOR = {}
+
+
+def headless_counts():
+    """Count decoders: each motor pool's statistic of its neurons' spike counts since the last call (the counters of
+    the motor population are zeroed; the counts are kept in MOTOR["last"] for the move log)."""
+    if not MOTOR:
+        pop = built.fields[0] if built.fields is not None else built.layers[-1][0]
+        n = int(np.prod(pop.shape))
+        MOTOR.update(gp=compiled_net.neuron_populations[pop], label=built.labels.get(pop, pop.name),
+                     pools=snake_network.motor_pools(n, NUM_OUTPUT, int(HP["headless"]["seed"])))
+    gp = MOTOR["gp"]
+    gp.vars["SpkCount"].pull_from_device()
+    c = np.asarray(gp.vars["SpkCount"].view, dtype=np.float64).ravel().copy()
+    gp.vars["SpkCount"].view[:] = 0.0
+    gp.vars["SpkCount"].push_to_device()
+    MOTOR["last"] = c
+    dec = HP["headless"]["decoder"]
+    if dec == "popvec":
+        if "u" not in MOTOR:
+            ang = np.random.default_rng(int(HP["headless"]["seed"]) + 7).uniform(0, 2 * np.pi, c.size)
+            MOTOR["u"] = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+        return float(HP["headless"].get("gain", 4.0)) * (c @ MOTOR["u"]) / max(c.sum(), 1.0)
+    out = np.zeros(NUM_OUTPUT)
+    for a in range(NUM_OUTPUT):
+        x = c[MOTOR["pools"] == a]
+        if dec == "max":
+            out[a] = x.max()
+        elif dec == "topk":
+            out[a] = np.sort(x)[-int(HP["headless"].get("k", 5)):].mean()
+        else:
+            b = float(HP["headless"].get("beta", 1.0))
+            out[a] = (np.log(np.mean(np.exp(b * (x - x.max())))) + b * x.max()) / b
+    return out
+
+
+def headless_counts_reset():
+    """After the drain: the drain's spikes are not part of the next episode's first move."""
+    if MOTOR:
+        MOTOR["gp"].vars["SpkCount"].view[:] = 0.0
+        MOTOR["gp"].vars["SpkCount"].push_to_device()
 
 
 def headless_decide(pool_activity):
@@ -1647,12 +1911,16 @@ def train_snake_agent_with_ipc(episodes=10000,
     This function is essentially your train_snake_agent() with the plotting removed.
     Instead it sends metrics and best_run frames via the provided queues.
     """
-    global BOARD_SIZE
+    global BOARD_SIZE, MOVE_LOG
     opt_updt = 0
     with compiled_net:
         env = SnakeEnv(size=BOARD_SIZE, visible_range=VISIBLE_RANGE, wait_inc=WAIT_INC, scale=SCALE, inp_shape=INPUT_SHAPE, bounded_camera=BOUNDED_CAMERA)
         if HP["selection"]:
             env = snake_switch.SelectionEnv(WAIT_INC, INPUT_SHAPE, **HP["selection"])
+        if HP["reach"]:
+            env = snake_switch.ReachEnv(WAIT_INC, INPUT_SHAPE, **HP["reach"])
+        if HP["move_log"] and (HP["selection"] or HP["reach"]):
+            MOVE_LOG = MoveLog(HP["move_log"], env)
         if HP["memory"]:
             env = snake_switch.MemoryEnv(env, **HP["memory"])
         if HP["cued_foraging"]:
@@ -1882,8 +2150,16 @@ def train_snake_agent_with_ipc(episodes=10000,
                             action_label = int(np.argmax(logits + head_sigma * head_xi))
                             PG = -head_xi / head_sigma
                             probs = noise_argmax_policy(logits, head_sigma)   # logged policy only (not the PG)
+                        elif HEADLESS_VECTOR:
+                            action_label, PG, probs = headless_steer(logits, env.dir_idx)
                         elif HP["headless"] is not None:
-                            action_label, PG, probs = headless_decide(logits)
+                            if HEADLESS_COUNTS:
+                                logits = headless_counts()
+                            if HEADLESS_POPVEC:     # continuous action: the population vector itself
+                                action_label, PG = logits.copy(), np.zeros(NUM_OUTPUT)
+                                probs = headless_share(np.abs(logits))     # display proxy only
+                            else:
+                                action_label, PG, probs = headless_decide(logits)
                         else:
                             action_label = np.random.choice(NUM_OUTPUT, p=probs)
 
@@ -1892,6 +2168,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                             PG = (probs - y_true)
                         if CNN is not None:
                             cnn_state["prev"][2] = action_label
+                        if MOVE_LOG is not None:
+                            MOVE_LOG.decide(env, ep, action_label, logits)
                         
                         # log_p = np.log(probs + 1e-8)
                         # entropy = -np.sum(probs * log_p)
@@ -1981,6 +2259,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 compiled_net.step_time(train_callback_list)
                 if CNN is not None:
                     cnn_accumulate()
+                if HP["diagnose_parts_every"] and compiled_net.genn_model.timestep % int(HP["diagnose_parts_every"]) == 0:
+                    dump_parts()
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "episode")
                 if HP["episodic_traces"] and episode_start and not done:
@@ -2096,6 +2376,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                 compiled_net.neuron_populations[value].vars["E"].pull_from_device() 
                 td_error_sum_abs += abs(compiled_net.neuron_populations[value].vars["E"].view[0])
                 td_error_sum += float(compiled_net.neuron_populations[value].vars["E"].view[0])
+                if MOVE_LOG is not None:
+                    MOVE_LOG.td(compiled_net.neuron_populations[value].vars["E"].view[0])
                 abs_td_sum = abs_td_decay * abs_td_sum + abs(compiled_net.neuron_populations[value].vars["E"].view[0])
                 abs_td_weight = abs_td_decay * abs_td_weight + 1.0
                 ep_frames += 1
@@ -2124,7 +2406,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                     elif CNN is not None:
                         probs = cnn_state["probs"]          # the device policy readout is frozen and unused
                     elif HP["headless"] is not None:
-                        probs = headless_decide(compiled_net.get_readout(policy).flatten())[2]
+                        probs = headless_share(compiled_net.get_readout(policy).flatten())
                     else:
                         logits = compiled_net.get_readout(policy).flatten()
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
@@ -2146,6 +2428,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                     cnn_accumulate()
                 if episodic_debug is not None:
                     episodic_debug.log(ep, "drain")
+                if MOVE_LOG is not None:
+                    compiled_net.neuron_populations[value].vars["E"].pull_from_device()
+                    MOVE_LOG.td(compiled_net.neuron_populations[value].vars["E"].view[0])
                 
                 compiled_net.genn_model.custom_update("GradientLearn")
                 for o, custom_updates in compiled_net.optimisers:
@@ -2153,6 +2438,10 @@ def train_snake_agent_with_ipc(episodes=10000,
                         o.set_step(c, opt_updt := opt_updt+1)
             if CNN is not None:
                 cnn_terminal()                     # the final move's advantage includes the drain (terminal value 0)
+            if MOVE_LOG is not None:
+                MOVE_LOG.end_episode()
+            if HEADLESS_COUNTS:
+                headless_counts_reset()
             
             # compiled_net.genn_model.custom_update("GradientLearn")
             # for o, custom_updates in compiled_net.optimisers:

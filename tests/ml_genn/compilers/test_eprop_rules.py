@@ -190,6 +190,22 @@ def test_original_preset_matches_monolithic_compiler(request):
     np.testing.assert_allclose(h_new, h_mono, rtol=1e-5, atol=1e-7)
 
 
+def test_center_eligibility_subtracts_each_synapse_running_mean_increment():
+    """center_eligibility: the drift trace integrates the increment minus the synapse's running mean of it (the part
+    shared by all states); the mean follows the raw increment with the given decay."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], center_drift=True, center_eligibility=0.9999)
+    model = build_td_hidden_model(cfg, **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "EligMean" in {v[0] for v in model["vars"]}
+    assert "RLNoisePtrace = Lambda * RLNoisePtrace + (pInc - EligMean);" in syn
+    assert re.search(r"EligMean = 0\.9999 \* EligMean \+ (0\.0001|1e-04|0\.00010*\d*) \* pInc;", syn)
+    # the mean is updated after the trace uses it
+    assert syn.index("(pInc - EligMean)") < syn.index("EligMean = ")
+    plain = build_td_hidden_model(replace(cfg, center_eligibility=None), **kw)["model"]
+    assert "EligMean" not in {v[0] for v in plain["vars"]}
+
+
 def test_rule_dict_round_trip():
     from ml_genn.compilers.eprop import hidden_rule_from_dict, hidden_rule_to_dict, LocalRoute
     for name, rule in PRESETS.items():
@@ -1866,3 +1882,28 @@ def test_train_readout_value_only(request):
     _run(compiled, inp, pol, val, probe=probe)
     assert probe_moved[pol] == 0.0
     assert probe_moved[val] > 0 and probe_moved[hid] > 0, probe_moved
+
+
+@pytest.mark.parametrize("trace_norm", [False, True])
+def test_diagnose_parts_splits_the_combined_trace_into_drift_and_gradient(request, trace_norm):
+    """diagnose_parts: the drift-part and gradient-part traces add up to the learning trace exactly, and AccP / AccGp
+    accumulate delta times each of them."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed", "diagnose_parts": True,
+                                                         "trace_norm": trace_norm})
+    got = {}
+
+    def probe(c, when):
+        if when != "end":
+            return
+        for conn, sg in c.connection_populations.items():
+            if conn.target() is hid and not conn.is_feedback:
+                for v in ("RLNoiseTrace", "PartPtrace", "PartGtrace", "AccP", "AccGp"):
+                    sg.vars[v].pull_from_device()
+                    got.setdefault(v, []).append(sg.vars[v].values.copy())
+
+    _run(compiled, inp, pol, val, probe=probe)
+    cat = {k: np.concatenate([x.ravel() for x in v]) for k, v in got.items()}
+    assert np.abs(cat["RLNoiseTrace"]).max() > 0
+    assert np.allclose(cat["PartPtrace"] + cat["PartGtrace"], cat["RLNoiseTrace"], rtol=1e-4, atol=1e-6)
+    assert np.abs(cat["AccP"]).max() > 0 and np.abs(cat["AccGp"]).max() > 0

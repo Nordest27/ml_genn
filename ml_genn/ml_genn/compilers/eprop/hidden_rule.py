@@ -61,7 +61,7 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 
 _LAMBDA_TRACES = ("RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLTrace", "RLValueTrace", "RLBackTrace",
-                  "ReviveTrace", "DiagGtrace", "DiagG1trace")
+                  "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
 
 def _normalise_traces(lines):
@@ -101,17 +101,18 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     local = cfg.local
     route = local.route if local is not None else None
     diag = cfg.diagnose_gradients and cfg.eprop != 0 and cfg.noise is not NoisePlacement.NONE and not exact
+    parts = cfg.diagnose_parts and cfg.noise is not NoisePlacement.NONE and not exact
 
     # --- which traces ---------------------------------------------------------------------------
     # A single combined trace suffices when drift and gradient share the TD-error modulator and no
     # term needs one of them separately.
-    needs_split = (cfg.center_drift or cfg.homeostat != 0 or exact
+    needs_split = (cfg.center_drift or cfg.center_eligibility is not None or cfg.homeostat != 0 or exact
                    or route is LocalRoute.GRADIENT_TRACE or cfg.surprise_drift != 0 or cfg.drift_td != 1.0)
     use_abs_td = cfg.homeostat != 0 or cfg.surprise_drift != 0
     use_P = needs_split and (cfg.drift != 0 or cfg.homeostat != 0)
     use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE)
     use_combined = (not needs_split) and (cfg.drift != 0 or cfg.gradient != 0)
-    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back or diag
+    uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back or diag or parts
                    or (use_combined and cfg.drift + cfg.gradient != 0)
                    or (route is LocalRoute.GRADIENT_INSTANT and not exact))
     use_eprop = cfg.eprop != 0
@@ -190,6 +191,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("RLNoiseGtrace", use_G), ("RLTrace", use_eprop), ("RLBackTrace", use_backprop),
                        ("RLValueTrace", use_eprop and cfg.eprop_center_value),
                        ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag),
+                       ("PartPtrace", parts), ("PartGtrace", parts), ("AccP", parts), ("AccGp", parts), ("AccPx", parts),
+                       ("EligMean", use_P and cfg.center_eligibility is not None),
                        ("XiSq", fn_noise), ("ReviveTrace", use_revive),
                        ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None)):
         if used:
@@ -375,6 +378,8 @@ else {
         dg.append(_scaled(cfg.backprop, "reward * RLBackTrace"))
     if diag:   # same timing as the learning terms: accumulate with the traces before this step's update
         syn.append("AccE += reward * RLTrace;\nAccG += reward * DiagGtrace;\nAccG1 += reward * DiagG1trace;")
+    if parts:  # same timing as the learning terms: the traces before this step's update
+        syn.append("AccP += reward * PartPtrace;\nAccGp += reward * PartGtrace;")
     if route is LocalRoute.WHOLE_TRACE:
         # original implementation: local rewards computed here (after the reset) on the whole trace
         whole = ("RLNoiseTrace" if use_combined else
@@ -440,7 +445,13 @@ else {
         d = cfg.coactivity_decay
         syn.append(f"CoAct = {_f(d)} * CoAct + {_f(1 - d)} * ZFilter * Psi;\nAge += 1.0;")
     if use_P:
-        syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
+        if cfg.center_eligibility is not None:   # minus the synapse's running mean increment (shared by all states)
+            d = cfg.center_eligibility
+            syn.append(f"const scalar pInc = {p_score};")
+            syn.append("RLNoisePtrace = Lambda * RLNoisePtrace + (pInc - EligMean);")
+            syn.append(f"EligMean = {_f(d)} * EligMean + {_f(1 - d)} * pInc;")
+        else:
+            syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
     if use_G:
         syn.append(f"RLNoiseGtrace = Lambda * RLNoiseGtrace + {g_score};")
     if use_eprop:
@@ -453,6 +464,11 @@ else {
             syn.append(f"RLTrace = Lambda * RLTrace + eFiltered * (PG_post - {_f(cfg.eprop_value)} * VE_post);")
     if use_backprop:
         syn.append("RLBackTrace = Lambda * RLBackTrace + eFiltered * Back_post;")
+    if parts:   # the drift and gradient parts of the score, each scaled by its weight in the rule
+        syn.append(f"PartPtrace = Lambda * PartPtrace + {_f(cfg.drift)} * (Psi - PsiBar) * {pre_P} * normXi;")
+        # the drift part's eligibility increments without the TD error (what one state contributes to the trace)
+        syn.append(f"AccPx += {_f(cfg.drift)} * (Psi - PsiBar) * {pre_P} * normXi;")
+        syn.append(f"PartGtrace = Lambda * PartGtrace - {_f(cfg.gradient)} * PsiBar * {pre_G} * normXi;")
     if diag:
         syn.append(f"DiagGtrace = Lambda * DiagGtrace - PsiBar * {pre} * normXi;")
         syn.append(f"DiagG1trace = Lambda * DiagG1trace - {pre} * normXi;")

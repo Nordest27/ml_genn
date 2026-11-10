@@ -660,10 +660,14 @@ class SelectionEnv:
     decides: action 0 commits (good: `good_reward`, bad: `bad_reward`, and the episode ends), any other action skips
     to the next candidate. Skipping them all ends the episode with `none_reward`. Exposes the Snake interface the
     training loop uses (wait_count / wait_inc, snake, img); `snake` grows by one on a good commit, so the logged
-    length is 1 for a correct choice."""
+    length is 1 for a correct choice.
+
+    `switch_moves`: every that many decisions the required features change to the next set in `required_after`
+    (cycling through [required] + required_after), so the correct action flips for some candidate types (`switches`
+    counts the changes). `ctype` is the shown candidate's type, sum_j present_j 2^j."""
 
     def __init__(self, wait_inc, inp_shape, n_candidates=8, features=4, required=(0, 1), p=0.5, good_reward=1.0,
-                 bad_reward=-1.0, none_reward=0.0, noise=0.05, seed=None):
+                 bad_reward=-1.0, none_reward=0.0, noise=0.05, seed=None, switch_moves=None, required_after=((2, 3),)):
         self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
         self.inp_shape = tuple(inp_shape)
         self.n_candidates, self.features, self.p, self.noise = int(n_candidates), int(features), float(p), float(noise)
@@ -672,6 +676,11 @@ class SelectionEnv:
             raise ValueError("selection: required must name features 0 .. features - 1")
         self.good_reward, self.bad_reward, self.none_reward = float(good_reward), float(bad_reward), float(none_reward)
         self.rng = np.random.default_rng(seed)
+        self.required_sets = [list(self.required)] + [[int(j) for j in r] for r in required_after]
+        if any(not r or max(r) >= self.features for r in self.required_sets):
+            raise ValueError("selection: required_after must name features 0 .. features - 1")
+        self.switch_moves = None if switch_moves is None else int(switch_moves)
+        self.moves, self.switches = 0, 0
         h, w, c = self.inp_shape
         side = int(np.ceil(np.sqrt(self.features)))
         rh, rw = h // side, w // side
@@ -688,6 +697,10 @@ class SelectionEnv:
         frame = np.clip(self.patterns[self.present].sum(axis=0), 0.0, 1.0)
         flips = self.rng.random(frame.shape) < self.noise
         self.obs = np.where(flips, 1.0 - frame, frame)
+
+    @property
+    def ctype(self):
+        return int((self.present * (2 ** np.arange(self.features))).sum())
 
     @property
     def good(self):
@@ -709,8 +722,12 @@ class SelectionEnv:
             self.wait_count -= 1
             return self.obs, 0.0, False
         self.wait_count = self.wait_inc
+        good = self.good                                   # judged by the rule in force when the candidate was shown
+        self.moves += 1
+        if self.switch_moves and self.moves % self.switch_moves == 0:
+            self.switches += 1
+            self.required = self.required_sets[self.switches % len(self.required_sets)]
         if int(action) == 0:                               # commit to the candidate shown during the last move
-            good = self.good
             self.done = True
             if good:
                 self.snake.append(None)
@@ -724,3 +741,115 @@ class SelectionEnv:
 
     def img(self, scale=10):
         return np.kron((self.obs * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))
+
+
+class ReachEnv:
+    """Continuous reaching: a point agent moves with a 2D velocity toward a target (the apple) in the unit square.
+
+    The view is egocentric: the agent sits at the centre of the frame and the frame spans +-1 world units, so the
+    whole square is always visible. Channel 0: the agent (centre), channel 1: the target (a small blob at its offset),
+    channel 2 (with `walls`): everything outside the square. Each move the agent's velocity is the action (a 2D vector,
+    clipped to unit length) times `speed`; the reward is `progress` x (distance before - distance after), plus
+    `reach_reward` when the target is within `radius` (the episode ends; `snake` grows by one), and the episode
+    ends without a bonus after `max_moves`. The optimal action in every state is the unit vector to the target, so
+    `last_cos` (the cosine between the action taken and that direction) measures per-state correctness. `ctype`
+    bins the state into 16 types for the move log: 8 direction sectors x 2 distance bins (near: < `near`).
+    Exposes the Snake interface the training loop uses (wait_count / wait_inc, snake, img)."""
+
+    def __init__(self, wait_inc, inp_shape, speed=0.08, radius=0.08, progress=10.0, reach_reward=1.0, max_moves=40,
+                 near=0.3, noise=0.0, blob=1, walls=False, seed=None):
+        self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
+        self.inp_shape = tuple(inp_shape)
+        self.speed, self.radius, self.progress, self.reach_reward = float(speed), float(radius), float(progress), \
+            float(reach_reward)
+        self.max_moves, self.near, self.noise, self.blob = int(max_moves), float(near), float(noise), int(blob)
+        self.walls = bool(walls)
+        self.rng = np.random.default_rng(seed)
+        self.switches = 0
+        self.snake, self.done, self.moves = [None], False, 0
+        self.pos = self.target = None
+        self.last_cos, self.last_speed = float("nan"), 0.0
+        self._obs = None
+
+    # ---- state
+    @property
+    def offset(self):
+        return self.target - self.pos
+
+    @property
+    def ctype(self):
+        d = self.offset
+        sector = int(np.floor((np.arctan2(d[1], d[0]) + np.pi) / (2 * np.pi) * 8)) % 8
+        return sector + 8 * int(np.linalg.norm(d) >= self.near)
+
+    @property
+    def good(self):
+        """1 if the last action pointed within 45 degrees of the target (for the move log)."""
+        return bool(self.last_cos > np.cos(np.pi / 4))
+
+    def move_info(self):
+        dist = float("nan") if self.pos is None else float(np.linalg.norm(self.offset))
+        return {"cos": self.last_cos, "speed": self.last_speed, "dist": dist}
+
+    def _render(self):
+        h, w, c = self.inp_shape
+        img = np.zeros((h, w, c))
+        cy, cx = h // 2, w // 2
+        img[cy, cx, 0] = 1.0
+        ys, xs = np.mgrid[0:h, 0:w]
+        wy, wx = self.pos[1] + (ys - cy) * 2.0 / h, self.pos[0] + (xs - cx) * 2.0 / w
+        if self.walls:
+            img[..., 2] = ((wx < 0) | (wx > 1) | (wy < 0) | (wy > 1)).astype(float)
+        d = self.offset
+        ty, tx = int(round(cy + d[1] * h / 2.0)), int(round(cx + d[0] * w / 2.0))
+        b = self.blob
+        img[max(0, ty - b):ty + b + 1, max(0, tx - b):tx + b + 1, 1] = 1.0
+        if self.noise > 0:
+            flips = self.rng.random(img.shape) < self.noise
+            img = np.where(flips, 1.0 - img, img)
+        self._obs = img
+
+    def reset(self):
+        self.snake, self.done, self.moves = [None], False, 0
+        self.wait_count = self.wait_inc
+        self.pos = self.rng.uniform(0.1, 0.9, 2)
+        while True:
+            self.target = self.rng.uniform(0.1, 0.9, 2)
+            if np.linalg.norm(self.offset) > 2 * self.radius:
+                break
+        self.last_cos, self.last_speed = float("nan"), 0.0
+        self._render()
+        return self._obs
+
+    def get_local_img_observation(self):
+        return self._obs
+
+    def step(self, action):
+        if self.done:
+            raise Exception("Environment needs reset. Call env.reset().")
+        if self.wait_count > 0:
+            self.wait_count -= 1
+            return self._obs, 0.0, False
+        self.wait_count = self.wait_inc
+        a = np.asarray(action, dtype=np.float64).ravel()[:2]
+        n = np.linalg.norm(a)
+        if n > 1:
+            a = a / n
+        d0 = np.linalg.norm(self.offset)
+        self.last_cos = float(a @ self.offset / (np.linalg.norm(a) * d0)) if np.linalg.norm(a) > 0 else 0.0
+        self.last_speed = float(np.linalg.norm(a))
+        self.pos = np.clip(self.pos + self.speed * a, 0.0, 1.0)
+        self.moves += 1
+        d1 = np.linalg.norm(self.offset)
+        reward = self.progress * (d0 - d1)
+        if d1 < self.radius:
+            self.snake.append(None)
+            self.done = True
+            reward += self.reach_reward
+        elif self.moves >= self.max_moves:
+            self.done = True
+        self._render()
+        return self._obs, reward, self.done
+
+    def img(self, scale=10):
+        return np.kron((self._obs * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))
