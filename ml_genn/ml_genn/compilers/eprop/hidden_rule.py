@@ -61,6 +61,7 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 
 
 _LAMBDA_TRACES = ("RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLTrace", "RLValueTrace", "RLBackTrace", "RLHebbTrace",
+                  "RLContrTrace",
                   "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
 
@@ -106,13 +107,19 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     # --- which traces ---------------------------------------------------------------------------
     # A single combined trace suffices when drift and gradient share the TD-error modulator and no
     # term needs one of them separately.
-    use_contrast = cfg.contrast != 0
+    use_contrast = local is not None and local.contrast != 0
+    # the contrast reward's credit: inside the shared local reward (LocR, its route), or on its own route
+    contrast_route = (local.contrast_route or local.route) if use_contrast else None
+    contrast_own = use_contrast and local.contrast_route is not None and local.contrast_route is not local.route
+    use_cdrift = cfg.contrast_drift != 0
     needs_split = (cfg.center_drift or cfg.center_eligibility is not None or cfg.split_optimiser or cfg.homeostat != 0 or exact
-                   or use_contrast
+                   or use_cdrift
+                   or contrast_route is LocalRoute.GRADIENT_TRACE
                    or route is LocalRoute.GRADIENT_TRACE or cfg.surprise_drift != 0 or cfg.drift_td != 1.0)
     use_abs_td = cfg.homeostat != 0 or cfg.surprise_drift != 0
     use_P = needs_split and (cfg.drift != 0 or cfg.homeostat != 0)
-    use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE or use_contrast)
+    use_G = needs_split and (cfg.gradient != 0 or route is LocalRoute.GRADIENT_TRACE
+                             or contrast_route is LocalRoute.GRADIENT_TRACE)
     use_combined = (not needs_split) and (cfg.drift != 0 or cfg.gradient != 0)
     uses_psibar = (cfg.homeostat != 0 or use_P or (use_G and not exact) or send_back or diag or parts
                    or (use_combined and cfg.drift + cfg.gradient != 0)
@@ -139,7 +146,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     if use_hebb and cfg.factor_norm is not None:
         raise NotImplementedError("hebb is not implemented with factor_norm")
     back_activity = cfg.backprop != 0 and cfg.backprop_signal == "activity"
-    use_ztrace = use_hebb or use_contrast or back_activity   # the postsynaptic spike trace and its running mean
+    use_ztrace = use_hebb or use_contrast or back_activity or use_cdrift   # the postsynaptic spike trace, its mean
     use_backprop = cfg.backprop != 0
     send_back = send_back and use_backprop
     use_efiltered = cfg.fire_rate_gradient or use_eprop or use_backprop
@@ -202,7 +209,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("DiagGtrace", diag), ("DiagG1trace", diag), ("AccE", diag), ("AccG", diag), ("AccG1", diag),
                        ("PartPtrace", parts), ("PartGtrace", parts), ("AccP", parts), ("AccGp", parts), ("AccPx", parts),
                        ("EligMean", use_P and cfg.center_eligibility is not None),
-                       ("RLHebbTrace", use_hebb),
+                       ("RLHebbTrace", use_hebb), ("RLContrTrace", use_cdrift),
                        ("XiSq", fn_noise), ("ReviveTrace", use_revive),
                        ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None)):
         if used:
@@ -215,7 +222,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
                        ("TdMean", cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
                        ("AbsTd", use_abs_td), ("HebbZ", use_ztrace), ("HebbMean", use_ztrace),
-                       ("ContrD", use_contrast), ("ContrR", use_contrast), ("ContrMean", use_contrast),
+                       ("DevMean", use_cdrift and cfg.contrast_drift_centre != 0.0),
+                       ("ContrD", use_contrast), ("ContrR", use_contrast), ("ContrMean", contrast_own),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
                        ("ZDec", use_decorr), ("ZDecMean", use_decorr), ("TdSq", fn_td), ("PsiSq", fn_post), ("DeadDist", use_revive),
                        ("ProxyPrevV", proxy), ("ProxyZ", proxy), ("ProxyMean", proxy), ("ProxyVar", proxy),
@@ -257,8 +265,12 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     if use_contrast:   # the neuron's reward: the TD error times the trace of its squared deviation from its mean
         mod_c = "(TdE_post + PRew_post - TdMean)" if cfg.center_drift else "(TdE_post + PRew_post)"
         post_dyn.append(f"ContrR = {mod_c} * ContrD;")
-        post_dyn.append(f"ContrMean = {_f(cfg.td_stats_decay)} * ContrMean + {_f(1 - cfg.td_stats_decay)} * ContrR;")
+        if contrast_own:
+            post_dyn.append(f"ContrMean = {_f(cfg.td_stats_decay)} * ContrMean + {_f(1 - cfg.td_stats_decay)} * ContrR;")
         post_dyn.append("ContrD = Lambda * ContrD + (HebbZ - HebbMean) * (HebbZ - HebbMean);")
+    if use_cdrift and cfg.contrast_drift_centre != 0.0:   # running mean of the squared deviation (the gate's centre)
+        post_dyn.append(f"DevMean = {_f(cfg.hebb_decay)} * DevMean + {_f(1 - cfg.hebb_decay)} * "
+                        "(HebbZ - HebbMean) * (HebbZ - HebbMean);")
     if use_ztrace:   # the postsynaptic spike trace (like ZFilter for the presynaptic side) and its running mean
         post_dyn.append(f"HebbMean = {_f(cfg.hebb_decay)} * HebbMean + {_f(1 - cfg.hebb_decay)} * HebbZ;")
         post_dyn.append("HebbZ *= Alpha;")
@@ -324,6 +336,8 @@ else {
             else:
                 terms.append(f"- {_f(local.decorr)} * (ZDec - ZDecMean) * (InhNow_post - InhMean_post)"
                              " / (InhMean_post + 1e-6)")
+        if use_contrast and not contrast_own:
+            terms.append(f"+ {_f(local.contrast)} * ContrR")
         post_dyn.append("LocR = 0.0 " + " ".join(terms) + ";")
         post_dyn.append(f"LocMean = {_f(local.baseline_decay)} * LocMean + {_f(1 - local.baseline_decay)} * LocR;")
         if use_decorr:
@@ -390,6 +404,9 @@ else {
         dg.append(f"{_f(cfg.homeostat)} * AbsTd * {deviation} * RLNoisePtrace")
     if use_hebb:     # w -= lr * DeltaG: a positive TD error raises the weights with a positive Hebbian trace
         dg.append(f"- {_f(cfg.hebb)} * " + ("(reward - TdMean)" if cfg.center_drift else "reward") + " * RLHebbTrace")
+    if use_cdrift:   # w -= lr * DeltaG: a positive TD error ascends the squared deviation (sharpens the response)
+        dg.append(f"- {_f(cfg.contrast_drift)} * " + ("(reward - TdMean)" if cfg.center_drift else "reward")
+                  + " * RLContrTrace")
     if use_revive:   # worse-than-expected outcomes push neurons outside the psi range back into it (dV/dW = ZFilter)
         dg.append(f"- {_f(cfg.revive)} * fmax(0.0, -reward) * ReviveTrace")
     n_td = len(dg)                                  # the TD terms (factor normalisation: all four factors)
@@ -426,9 +443,9 @@ else {
     elif route is LocalRoute.GRADIENT_TRACE:
         dg.append("(LocR - LocMean) * RLNoiseGtrace")
         g_terms.add(len(dg) - 1)
-    if use_contrast:   # a local reward through the gradient score trace (the TD error judges earlier activity);
-        # factor_norm: as a local objective (post, pre, noise) and, since the reward contains it, the TD factor
-        dg.append(("FnTd * " if fn is not None else "") + f"{_f(cfg.contrast)} * (ContrR - ContrMean) * RLNoiseGtrace")
+    if contrast_own:   # the contrast reward on its own route (factor_norm: a local objective plus the TD factor)
+        score_c = "RLNoiseGtrace" if contrast_route is LocalRoute.GRADIENT_TRACE else f"({g_score})"
+        dg.append(("FnTd * " if fn is not None else "") + f"{_f(local.contrast)} * (ContrR - ContrMean) * {score_c}")
         g_terms.add(len(dg) - 1)
     if fn is not None:
         # each factor divided by its running RMS (bias-corrected: the means start at t = 0, dt = 1 ms) plus the floor
@@ -492,6 +509,11 @@ else {
             syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
     if use_hebb:
         syn.append("RLHebbTrace = Lambda * RLHebbTrace + (HebbZ - HebbMean) * ZFilter;")
+    if use_cdrift:   # the gate times the noise score, as the drift's (psi - psibar) * pre * xi
+        k = cfg.contrast_drift_centre
+        centre = "" if k == 0.0 else (" - DevMean" if k == 1.0 else f" - {_f(k)} * DevMean")
+        syn.append(f"RLContrTrace = Lambda * RLContrTrace + ((HebbZ - HebbMean) * (HebbZ - HebbMean){centre})"
+                   f" * {pre_P} * normXi;")
     if use_G:
         syn.append(f"RLNoiseGtrace = Lambda * RLNoiseGtrace + {g_score};")
     if use_eprop:

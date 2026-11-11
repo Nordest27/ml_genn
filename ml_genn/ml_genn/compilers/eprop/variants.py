@@ -134,6 +134,20 @@ class LocalObjectives:
                                      # inhibitory channel (switched on automatically) and a GRADIENT_* route
     cancel_tau: float = 1000.0       # ... time constant (ms) of the running mean of |dI_exc|
     cancel_eps: float = 0.1          # ... floor of the denominator, as a fraction of that mean
+    contrast: float = 0.0            # weight of the contrast reward, a TD-gated local reward:
+                                     # r_i = (delta - mean delta) * trace[(zpost - mean zpost)^2] (zpost the
+                                     # postsynaptic spike trace, its mean a running average with the rule's
+                                     # hebb_decay; delta centred with the rule's center_drift). After a positive TD
+                                     # error a neuron is rewarded for having been far from its usual activity, in
+                                     # either direction; in expectation dW ~ delta (zpost - mean) psi pre (active
+                                     # neurons up, near-threshold inactive ones down, nothing where psi = 0), plus
+                                     # the gradient part weighted by the squared deviation. Credited like the other
+                                     # local rewards (part of the same per-neuron reward and baseline), unless
+                                     # contrast_route says otherwise
+    contrast_route: Optional[LocalRoute] = None   # None: the contrast reward follows `route`; GRADIENT_INSTANT /
+                                     # GRADIENT_TRACE: credited on its own (own running-mean baseline) through the
+                                     # instantaneous score or the gradient score's lambda-trace, whatever `route` the
+                                     # other local rewards use (GRADIENT_TRACE reproduces the runs of 2026-11-11)
     decorr_norm: str = "covariance"  # "covariance": the reward above (its size also shrinks when the neuron fires
                                      # less, so going quiet lowers the penalty); "correlation": divided by the
                                      # neuron's spiking spread sqrt(zbar (1 - zbar)) and its inhibition's s.d.:
@@ -252,16 +266,23 @@ class HiddenRuleConfig:
                                      # (the drift only lowers the near-threshold ones); a negative one reverses it.
                                      # Needs no noise. Stays with the drift under split_optimiser
     hebb_decay: float = 0.9999       # decay of the running mean of the postsynaptic spike trace
-    contrast: float = 0.0            # c_C: the contrast reward, a local reward credited through the neuron's own noise
-                                     # (the gradient score trace): r_i = delta * trace[(zpost - mean zpost)^2], minus
-                                     # its running mean. After a positive TD error a neuron is rewarded for having
-                                     # been far from its usual activity, in either direction; in expectation
-                                     # dW ~ delta * (zpost - mean) * psi * pre: active neurons up, near-threshold
-                                     # inactive ones down, nothing where psi = 0 (self-limiting); a negative TD
-                                     # error reverses it. delta is centred with center_drift; zpost and its mean as
-                                     # for hebb (hebb_decay). Goes with the gradient terms under split_optimiser;
-                                     # with factor_norm it is normalised like a local objective (post, pre,
-                                     # noise) plus the TD factor
+    contrast_drift: float = 0.0      # c_K: the contrast leg, a drift with the squared deviation as its gate:
+                                     # dW = lr * c_K * delta * trace[(dev^2 - mean dev^2) * pre * xi / sigma^2],
+                                     # dev = zpost - mean zpost (the postsynaptic spike trace and its running mean,
+                                     # hebb_decay), mean dev^2 a running mean with the same decay; delta centred with
+                                     # center_drift. By Stein's lemma its expectation is delta x the weight
+                                     # derivative of the squared deviation through the true dynamics,
+                                     # 2 dev x (firing sensitivity) x pre: after a positive TD error the response
+                                     # sharpens (active neurons up, near-threshold quiet ones down), after a negative
+                                     # one it relaxes towards the usual activity. The centred gate cancels the
+                                     # REINFORCE part on average, as for the drift. The clean form of
+                                     # local.contrast (one trace of the product instead of two traces multiplied).
+                                     # Stays with the drift under split_optimiser
+    contrast_drift_centre: float = 0.0   # kappa: the gate is dev^2 - kappa * mean dev^2. 0 (default): it keeps a
+                                     # REINFORCE part weighted by the neuron's mean squared deviation, with the same
+                                     # sign as G (both ascend the return; the drift instead descends its gate, which
+                                     # is why its gate needs psi - psibar and G's -psibar has the opposite sign);
+                                     # 1: centred, the REINFORCE part cancels on average (the pure local derivative)
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
@@ -371,11 +392,20 @@ class HiddenRuleConfig:
                              "estimator=TRACE")
         if self.backprop_signal not in ("noise", "activity"):
             raise ValueError(f"backprop_signal must be 'noise' or 'activity', not {self.backprop_signal!r}")
-        if (self.center_drift and self.drift == 0 and self.hebb == 0 and self.contrast == 0
+        has_contrast = self.local is not None and self.local.contrast != 0
+        if not 0.0 <= self.contrast_drift_centre <= 1.0:
+            raise ValueError("contrast_drift_centre must be in [0, 1]")
+        if self.contrast_drift != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
+            raise ValueError("contrast_drift needs noise and estimator=TRACE")
+        if (self.center_drift and self.drift == 0 and self.hebb == 0 and not has_contrast and self.contrast_drift == 0
                 and not (self.backprop != 0 and self.backprop_signal == "activity")):
             raise ValueError("center_drift needs drift != 0 (or hebb / contrast != 0)")
-        if self.contrast != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
-            raise ValueError("contrast is credited through the gradient score trace: it needs noise and estimator=TRACE")
+        if has_contrast and self.estimator is Estimator.EXACT:
+            raise ValueError("the contrast reward is credited through the gradient score: it needs estimator=TRACE")
+        if has_contrast and self.local.contrast_route is LocalRoute.WHOLE_TRACE:
+            raise ValueError("contrast_route must be None, GRADIENT_INSTANT or GRADIENT_TRACE")
+        if has_contrast and self.local.contrast_route is None and self.local.route is LocalRoute.WHOLE_TRACE:
+            raise ValueError("the contrast reward needs a GRADIENT_* route (or its own contrast_route)")
         if self.factor_norm is not None and (self.eprop != 0 or self.backprop != 0 or self.diagnose_gradients
                                              or self.estimator is Estimator.EXACT):
             raise ValueError("factor_norm is implemented for the perturbation rule (trace estimator, no e-prop, "
@@ -465,7 +495,8 @@ def get_hidden_rule(rule) -> HiddenRuleConfig:
         raise ValueError(f"unknown hidden rule preset '{rule}'; available: {sorted(PRESETS)}")
 
 
-_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "dv_mode": DVMode,
+_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "contrast_route": LocalRoute,
+                "dv_mode": DVMode,
                 "eprop_scope": EpropScope}
 
 

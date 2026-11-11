@@ -763,7 +763,7 @@ class EPropCompiler(Compiler):
 
     # the lambda-traces that carry credit over time (hidden rule and readout); short filters such as ZFilter,
     # epsilonA, NoiseTrace and eFiltered follow the neuron's own state and are not reset
-    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLHebbTrace",
+    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLHebbTrace", "RLContrTrace",
                         "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
     def _add_trace_reset(self, genn_model, connection_populations):

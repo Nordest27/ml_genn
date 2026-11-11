@@ -229,24 +229,50 @@ def test_hebb_adds_a_td_gated_covariance_term():
     assert "RLHebbTrace" not in {v[0] for v in plain["vars"]} and "HebbZ" not in plain["post_spike_code"]
 
 
-def test_contrast_is_a_td_gated_local_reward_on_the_gradient_score_trace():
-    """contrast: r_i = (delta - mean) * trace[(zpost - mean zpost)^2], credited as (r_i - mean r_i) * RLNoiseGtrace
-    (the sign of the gradient part), in DeltaGG under split_optimiser."""
+def test_contrast_is_part_of_the_shared_local_reward_and_follows_its_route():
+    """local.contrast: r_i = (delta - mean) * trace[(zpost - mean zpost)^2] is added to the neuron's local reward
+    (LocR, one baseline), credited by the local route like the other local rewards; in DeltaGG under split_optimiser."""
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
     kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
-    cfg = replace(PRESETS["drift_only"], drift=0.0, center_drift=True, contrast=2.0)
-    model = build_td_hidden_model(cfg, **kw)["model"]
-    syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
-    assert {"HebbZ", "HebbMean", "ContrD", "ContrR", "ContrMean"} <= {v[0] for v in model["post_vars"]}
-    assert "RLNoiseGtrace" in {v[0] for v in model["vars"]} and "RLNoisePtrace" not in {v[0] for v in model["vars"]}
-    assert "2.0 * (ContrR - ContrMean) * RLNoiseGtrace" in syn[syn.index("DeltaG +="):].split(";")[0]
-    assert "ContrR = (TdE_post + PRew_post - TdMean) * ContrD;" in post
-    assert "ContrD = Lambda * ContrD + (HebbZ - HebbMean) * (HebbZ - HebbMean);" in post
-    # the reward uses the trace of the activity before this step, and the spike trace before its decay
-    assert post.index("ContrR = ") < post.index("ContrD = ") < post.index("HebbZ *= Alpha;")
-    split = build_td_hidden_model(replace(PRESETS["proposed"], contrast=1.0, split_optimiser=True), **kw)["model"]["synapse_dynamics_code"]
-    assert "ContrR" in split[split.index("DeltaGG +="):].split(";")[0]
+    for route, score in ((LocalRoute.GRADIENT_INSTANT, "(-PsiBar * ZFilter * normXi)"),
+                         (LocalRoute.GRADIENT_TRACE, "RLNoiseGtrace")):
+        loc = LocalObjectives(route=route, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, contrast=2.0)
+        cfg = replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc)
+        model = build_td_hidden_model(cfg, **kw)["model"]
+        syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
+        assert {"HebbZ", "HebbMean", "ContrD", "ContrR", "LocR"} <= {v[0] for v in model["post_vars"]}
+        assert "ContrMean" not in {v[0] for v in model["post_vars"]}
+        locr = post[post.index("LocR = "):].split(";")[0]
+        assert "+ 2.0 * ContrR" in locr and "ZDec" in locr                     # one reward with decorr
+        assert f"(LocR - LocMean) * {score}" in syn[syn.index("DeltaG +="):].split(";")[0]
+        assert "ContrR = (TdE_post + PRew_post - TdMean) * ContrD;" in post
+        assert "ContrD = Lambda * ContrD + (HebbZ - HebbMean) * (HebbZ - HebbMean);" in post
+        # the reward uses the deviation trace before this step, the trace the spike trace before its decay, and LocR
+        # the reward of this step
+        assert post.index("ContrR = ") < post.index("ContrD = ") < post.index("HebbZ *= Alpha;")
+        assert post.index("ContrR = ") < post.index("LocR = ")
+    split = build_td_hidden_model(replace(PRESETS["proposed"], split_optimiser=True, local=LocalObjectives(
+        dv=0.0, vreg=0.0, rate=0.0, contrast=1.0)), **kw)["model"]["synapse_dynamics_code"]
+    assert "LocR" in split[split.index("DeltaGG +="):].split(";")[0]
     plain = build_td_hidden_model(PRESETS["drift_only"], **kw)["model"]
     assert "ContrD" not in {v[0] for v in plain["post_vars"]}
+
+
+def test_contrast_route_credits_it_on_its_own():
+    """contrast_route different from route: its own baseline and score (GRADIENT_TRACE: the runs of 2026-11-11)."""
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, contrast=2.0,
+                          contrast_route=LocalRoute.GRADIENT_TRACE)
+    model = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
+    assert "ContrMean" in {v[0] for v in model["post_vars"]} and "ContrR" not in post[post.index("LocR = "):].split(";")[0]
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "2.0 * (ContrR - ContrMean) * RLNoiseGtrace" in dg and "(LocR - LocMean) * (-PsiBar" in dg
+    r = hidden_rule_from_dict({"preset": "proposed", "local": {"contrast": 1.0, "contrast_route": "GRADIENT_TRACE"}})
+    assert r.local.contrast_route is LocalRoute.GRADIENT_TRACE
+    with pytest.raises(ValueError):
+        hidden_rule_from_dict({"preset": "proposed", "local": {"contrast": 1.0, "contrast_route": "WHOLE_TRACE"}})
 
 
 def test_backprop_activity_sends_the_spike_deviation_and_raises_drive_after_positive_td():
@@ -268,18 +294,72 @@ def test_backprop_activity_wiring_and_signal(request):
     assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
 
 
-def test_contrast_with_factor_norm_uses_the_td_and_local_factors():
-    from ml_genn.compilers.eprop.variants import FactorNorm
+def test_contrast_with_factor_norm():
+    """In LocR it is normalised like the other local objectives; on its own route also by the TD factor."""
+    from ml_genn.compilers.eprop.variants import FactorNorm, LocalObjectives, LocalRoute
     kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
-    cfg = replace(PRESETS["proposed"], center_drift=True, contrast=1.0, factor_norm=FactorNorm())
-    syn = build_td_hidden_model(cfg, **kw)["model"]["synapse_dynamics_code"]
-    dg = syn[syn.index("DeltaG +="):].split(";")[0]
-    assert "FnPost * FnPre * FnXi * (FnTd * 1.0 * (ContrR - ContrMean) * RLNoiseGtrace)" in dg
+    loc = LocalObjectives(dv=0.0, vreg=0.0, rate=0.0, contrast=1.0)
+    syn = build_td_hidden_model(replace(PRESETS["proposed"], center_drift=True, local=loc, factor_norm=FactorNorm()),
+                                **kw)["model"]["synapse_dynamics_code"]
+    assert "FnPost * FnPre * FnXi * ((LocR - LocMean)" in syn[syn.index("DeltaG +="):].split(";")[0]
+    own = replace(loc, contrast_route=LocalRoute.GRADIENT_TRACE)
+    syn = build_td_hidden_model(replace(PRESETS["proposed"], center_drift=True, local=own, factor_norm=FactorNorm()),
+                                **kw)["model"]["synapse_dynamics_code"]
+    assert "FnPost * FnPre * FnXi * (FnTd * 1.0 * (ContrR - ContrMean) * RLNoiseGtrace)" in syn
 
 
 def test_contrast_alone_changes_the_hidden_weights(request):
     compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
-                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "contrast": 1.0})
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
+                                                         "local": {"dv": 0.0, "vreg": 0.0, "rate": 0.0,
+                                                                   "contrast": 1.0}})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_contrast_drift_is_a_drift_with_the_centred_squared_deviation_as_gate():
+    """contrast_drift: DeltaG -= c_K * (delta - mean) * RLContrTrace, the trace of ((z - mean z)^2 - mean dev^2) * pre
+    * normXi (as the drift's (psi - psibar) * pre * normXi); stays in DeltaG under split_optimiser."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], center_drift=True, contrast_drift=0.5, contrast_drift_centre=1.0)
+    model = build_td_hidden_model(cfg, **kw)["model"]
+    syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
+    assert "RLContrTrace" in {v[0] for v in model["vars"]}
+    assert {"HebbZ", "HebbMean", "DevMean"} <= {v[0] for v in model["post_vars"]}
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "- 0.5 * (reward - TdMean) * RLContrTrace" in dg and "RLNoisePtrace" in dg
+    assert ("RLContrTrace = Lambda * RLContrTrace + ((HebbZ - HebbMean) * (HebbZ - HebbMean) - DevMean)"
+            " * ZFilter * normXi;") in syn
+    assert syn.index("* RLContrTrace") < syn.index("RLContrTrace = ")      # the term uses the trace before its update
+    assert post.index("DevMean = ") < post.index("HebbMean = ") < post.index("HebbZ *= Alpha;")
+    alone = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, contrast_drift=1.0),
+                                  **kw)["model"]["synapse_dynamics_code"]
+    assert "RLContrTrace" in alone and "RLNoisePtrace" not in alone[alone.index("DeltaG +="):].split(";")[0]
+    split = build_td_hidden_model(replace(PRESETS["proposed"], contrast_drift=1.0, split_optimiser=True),
+                                  **kw)["model"]["synapse_dynamics_code"]
+    assert "RLContrTrace" in split[split.index("DeltaG +="):].split(";")[0]
+    assert "RLContrTrace" not in split[split.index("DeltaGG +="):].split(";")[0]
+    plain = build_td_hidden_model(PRESETS["drift_only"], **kw)["model"]
+    assert "RLContrTrace" not in {v[0] for v in plain["vars"]}
+
+
+def test_contrast_drift_centre_keeps_part_of_the_reinforce_term():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    base = replace(PRESETS["drift_only"], center_drift=True, contrast_drift=1.0)
+    assert base.contrast_drift_centre == 0.0                     # uncentred by default
+    m0 = build_td_hidden_model(base, **kw)["model"]
+    assert "((HebbZ - HebbMean) * (HebbZ - HebbMean)) * ZFilter * normXi;" in m0["synapse_dynamics_code"]
+    assert "DevMean" not in {v[0] for v in m0["post_vars"]} and "DevMean" not in m0["post_dynamics_code"]
+    half = build_td_hidden_model(replace(base, contrast_drift_centre=0.5), **kw)["model"]["synapse_dynamics_code"]
+    assert "(HebbZ - HebbMean) - 0.5 * DevMean)" in half
+    with pytest.raises(ValueError):
+        replace(base, contrast_drift_centre=1.5)
+
+
+def test_contrast_drift_alone_changes_the_hidden_weights(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
+                                                         "contrast_drift": 1.0})
     h = _run(compiled, inp, pol, val, steps=100)
     assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
 

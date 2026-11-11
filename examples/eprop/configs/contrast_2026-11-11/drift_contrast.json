@@ -1,1 +1,1 @@
-{"hidden_rule": {"contrast": 1.0, "center_drift": true, "drift": 1.0, "gradient": 0.0}}
+{"hidden_rule": {"center_drift": true, "drift": 1.0, "gradient": 0.0, "local": {"contrast": 1.0}}}
