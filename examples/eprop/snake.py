@@ -112,7 +112,7 @@ import csv
 # move_log: None or {"probe_every": 250000, "probe_moves": 200} - selection or reach: one row per decision in
 #     outputs/<prefix>(<rep>)_moves.csv (timestep, episode, switches, candidate type, good, action, the readout / motor
 #     pool activities, the sum of the per-step TD errors from this decision to the next one or the episode's end,
-#     drain included); with a rule that has "diagnose_parts": true, every probe_every timesteps the next probe_moves
+#     drain included, the critic's value V at the decision step and its mean over the move just shown); with a rule that has "diagnose_parts": true, every probe_every timesteps the next probe_moves
 #     moves' drift eligibility (AccPx: the drift part's trace increments without the TD error, summed over the move)
 #     of every hidden connection is saved to outputs/<prefix>(<rep>)_moves/<timestep>.npz, one row per move, keyed
 #     by the decision timestep (episode drains are left out); "aggregate": true keeps, instead of every move, per
@@ -958,6 +958,15 @@ def build_compiled_network(connectivity_type="fixed"):
 
 compiled_net, network, input_pop, hidden_layers, policy, value, built = \
     build_compiled_network(connectivity_type=CONNECTIVITY_TYPE)
+# split_optimiser: the gradient-score terms have their own optimiser updates (group GradientLearnG)
+SPLIT_LEARN = any("DeltaGG" in sg.vars for sg in compiled_net.connection_populations.values())
+
+
+def gradient_learn():
+    compiled_net.genn_model.custom_update("GradientLearn")
+    if SPLIT_LEARN:
+        compiled_net.genn_model.custom_update("GradientLearnG")
+
 
 RELAY_POP = built.reward_relay
 
@@ -1076,8 +1085,10 @@ class MoveLog:
         self.dir = f"outputs/{CSV_PREFIX}({REPETITION})_moves"
         with open(self.path, "w", newline="") as f:
             csv.writer(f).writerow(["timestep", "episode", "switches", "ctype", "good", "action"]
-                                   + [f"pool{i}" for i in range(NUM_OUTPUT)] + self.info_keys + ["td_after"])
+                                   + [f"pool{i}" for i in range(NUM_OUTPUT)] + self.info_keys + ["td_after", "value",
+                                                                                                  "value_mean"])
         self.pending, self.next_probe, self.probe = None, 0, None
+        self.v_sum, self.v_n = 0.0, 0
         self.n_act = int(cfg.get("activity") or 0)
         self.act_pops = [(built.labels.get(p, p.name), gp) for p, gp in compiled_net.neuron_populations.items()
                          if "SpkCount" in gp.vars] if self.n_act else []
@@ -1115,8 +1126,13 @@ class MoveLog:
         """At a decision, before env.step: the candidate shown during the move that just ended."""
         self._flush()
         t = compiled_net.genn_model.timestep
+        vgp = compiled_net.neuron_populations[value]
+        vgp.vars["PrevVal"].pull_from_device()
+        v_now = float(np.asarray(vgp.vars["PrevVal"].view).ravel()[0])     # the critic's V at the decision step
         self.pending = [t, ep, env.switches, env.ctype, int(env.good), int(action) if np.ndim(action) == 0 else -1] + \
-                       [float(x) for x in np.ravel(pools)] + [float("nan")] * len(self.info_keys) + [0.0]
+                       [float(x) for x in np.ravel(pools)] + [float("nan")] * len(self.info_keys) + [0.0, v_now,
+                       (self.v_sum / self.v_n) if self.v_n else float("nan")]
+        self.v_sum, self.v_n = 0.0, 0
         self.env = env
         if self.act_pops and len(self.act["ctype"]) < self.n_act:
             for k, gp in self.act_pops:
@@ -1181,12 +1197,18 @@ class MoveLog:
                 self.probe = None
 
     def td(self, e):
+        """Every step: adds the step's TD error to the pending decision's td_after, and the critic's value to the
+        running mean V over the move that is being shown (value_mean of the next decision)."""
         if self.pending is not None:
-            self.pending[-1] += float(e)
+            self.pending[-3] += float(e)
+        vgp = compiled_net.neuron_populations[value]
+        vgp.vars["PrevVal"].pull_from_device()
+        self.v_sum += float(np.asarray(vgp.vars["PrevVal"].view).ravel()[0]); self.v_n += 1
 
     def end_episode(self):
         """After the drain: the last row is complete; the drain's increments are not a move of their own."""
         self._flush()
+        self.v_sum, self.v_n = 0.0, 0          # the drain's values belong to no move
         if self.act_pops and len(self.act["ctype"]) < self.n_act:
             for _, gp in self.act_pops:     # the drain is not a move: the next episode's first move starts clean
                 gp.vars["SpkCount"].view[:] = 0.0
@@ -1231,6 +1253,24 @@ def noise_argmax_policy(logits, sigma, samples=256):
     samples (for the logged policy and its plots; the action and the PG use the single sample drawn at the decision)."""
     wins = np.argmax(logits[None, :] + sigma * np.random.standard_normal((samples, NUM_OUTPUT)), axis=1)
     return np.bincount(wins, minlength=NUM_OUTPUT) / samples
+
+
+HEADLESS_LAST = {"probs": None, "margin": None, "scale": None}
+
+
+def headless_contrast(stats):
+    """headless display proxy for the discrete decoders: softmax of the pool statistics in units of the running mean
+    decision margin (EMA 0.99), so a typical margin shows the winner at ~0.73 and a decisive one near 1, whatever
+    the statistic's scale (uniform when all are equal). Display only: no policy is defined."""
+    x = np.asarray(stats, dtype=np.float64)
+    m = HEADLESS_LAST["margin"] or 0.0
+    sc = HEADLESS_LAST["scale"]
+    sc = m if sc is None else 0.99 * sc + 0.01 * m
+    HEADLESS_LAST["scale"] = sc
+    if not sc or sc <= 1e-9:
+        return np.full(NUM_OUTPUT, 1.0 / NUM_OUTPUT)
+    z = np.exp((x - x.max()) / sc)
+    return z / z.sum()
 
 
 def headless_share(pool_activity):
@@ -1295,15 +1335,18 @@ def headless_counts_reset():
 
 def headless_decide(pool_activity):
     """headless: act on the most active motor pool (ties at random). Returns the action, the policy error sent back
-    (0, or the softmax surrogate with surrogate_tau) and the logged policy (each pool's share of the pools' activity,
-    a display proxy since no policy is defined, or the surrogate)."""
+    (0, or the softmax surrogate with surrogate_tau) and the logged policy (headless_contrast of the pool statistics,
+    a display proxy since no policy is defined, or the surrogate); the decision margin goes to HEADLESS_LAST."""
     best = np.flatnonzero(pool_activity >= pool_activity.max() - 1e-9)
     action = int(np.random.choice(best))
     onehot = np.zeros(NUM_OUTPUT)
     onehot[action] = 1.0
+    top = np.sort(np.asarray(pool_activity, dtype=np.float64))
+    HEADLESS_LAST["margin"] = float(top[-1] - top[-2]) if top.size > 1 else 0.0
     tau = HP["headless"].get("surrogate_tau")
     if tau is None:
-        return action, np.zeros(NUM_OUTPUT), headless_share(pool_activity)
+        HEADLESS_LAST["probs"] = headless_contrast(pool_activity)
+        return action, np.zeros(NUM_OUTPUT), HEADLESS_LAST["probs"]
     z = np.exp((pool_activity - pool_activity.max()) / float(tau))
     surrogate = z / z.sum()
     return action, surrogate - onehot, surrogate
@@ -2189,7 +2232,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                             compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = e_now
                             compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
                             entropy_bonus *= HP["entropy_bonus_decay_env"]
-                        policy_monitor.decision(probs, PG, coeff_now, e_now, abs_td_now)
+                        policy_monitor.decision(probs, PG, coeff_now, e_now, abs_td_now,
+                                                margin=HEADLESS_LAST["margin"] if HP["headless"] is not None else None)
                         if HP["entropy_reward"] > 0:
                             ent_r = HP["entropy_reward"] * float(
                                 -(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
@@ -2319,7 +2363,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                     #     for c in custom_updates:
                     #         o.set_step(c, opt_updt := opt_updt+1)
                 
-                compiled_net.genn_model.custom_update("GradientLearn")
+                gradient_learn()
                 for o, custom_updates in compiled_net.optimisers:
                     for c in custom_updates:
                         o.set_step(c, opt_updt := opt_updt+1)
@@ -2406,7 +2450,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                     elif CNN is not None:
                         probs = cnn_state["probs"]          # the device policy readout is frozen and unused
                     elif HP["headless"] is not None:
-                        probs = headless_share(compiled_net.get_readout(policy).flatten())
+                        probs = (HEADLESS_LAST["probs"] if HEADLESS_LAST["probs"] is not None
+                                 else headless_share(compiled_net.get_readout(policy).flatten()))   # last decision's
                     else:
                         logits = compiled_net.get_readout(policy).flatten()
                         probs = np.exp((logits-logits.max())) / (np.exp((logits-logits.max())).sum() + 1e-8)
@@ -2432,7 +2477,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                     compiled_net.neuron_populations[value].vars["E"].pull_from_device()
                     MOVE_LOG.td(compiled_net.neuron_populations[value].vars["E"].view[0])
                 
-                compiled_net.genn_model.custom_update("GradientLearn")
+                gradient_learn()
                 for o, custom_updates in compiled_net.optimisers:
                     for c in custom_updates:
                         o.set_step(c, opt_updt := opt_updt+1)

@@ -90,6 +90,8 @@ def _run(compiled, inp, pol, val, steps=200, inspect=None, probe=None):
                                              1.0 if (t // K) % 2 == 0 else -1.0)
             compiled.step_time(cb)
             compiled.genn_model.custom_update("GradientLearn")
+            if any("DeltaGG" in pop.vars for pop in compiled.connection_populations.values()):
+                compiled.genn_model.custom_update("GradientLearnG")      # split_optimiser
             for o, cus in compiled.optimisers:
                 for c in cus:
                     upd += 1; o.set_step(c, upd)
@@ -204,6 +206,119 @@ def test_center_eligibility_subtracts_each_synapse_running_mean_increment():
     assert syn.index("(pInc - EligMean)") < syn.index("EligMean = ")
     plain = build_td_hidden_model(replace(cfg, center_eligibility=None), **kw)["model"]
     assert "EligMean" not in {v[0] for v in plain["vars"]}
+
+
+def test_hebb_adds_a_td_gated_covariance_term():
+    """hebb: DeltaG -= c_B * (delta - mean) * trace[(zpost - mean zpost) * ZFilter] (w -= lr * DeltaG, so a positive TD
+    error strengthens the active inputs of neurons that fired above their running average); no noise needed."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], center_drift=True, hebb=0.5)
+    model = build_td_hidden_model(cfg, **kw)["model"]
+    syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
+    assert "RLHebbTrace" in {v[0] for v in model["vars"]}
+    assert {"HebbZ", "HebbMean"} <= {v[0] for v in model["post_vars"]}
+    assert "- 0.5 * (reward - TdMean) * RLHebbTrace" in syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "RLHebbTrace = Lambda * RLHebbTrace + (HebbZ - HebbMean) * ZFilter;" in syn
+    assert syn.index("* RLHebbTrace") < syn.index("RLHebbTrace = ")          # the term uses the trace before its update
+    assert "HebbZ += 1.0;" in model["post_spike_code"]
+    assert post.index("HebbMean = ") < post.index("HebbZ *= Alpha;")
+    alone = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, hebb=1.0, center_drift=True), **kw)["model"]
+    dg = alone["synapse_dynamics_code"]
+    assert "RLNoisePtrace" not in dg and "RLHebbTrace" in dg
+    plain = build_td_hidden_model(PRESETS["drift_only"], **kw)["model"]
+    assert "RLHebbTrace" not in {v[0] for v in plain["vars"]} and "HebbZ" not in plain["post_spike_code"]
+
+
+def test_contrast_is_a_td_gated_local_reward_on_the_gradient_score_trace():
+    """contrast: r_i = (delta - mean) * trace[(zpost - mean zpost)^2], credited as (r_i - mean r_i) * RLNoiseGtrace
+    (the sign of the gradient part), in DeltaGG under split_optimiser."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], drift=0.0, center_drift=True, contrast=2.0)
+    model = build_td_hidden_model(cfg, **kw)["model"]
+    syn, post = model["synapse_dynamics_code"], model["post_dynamics_code"]
+    assert {"HebbZ", "HebbMean", "ContrD", "ContrR", "ContrMean"} <= {v[0] for v in model["post_vars"]}
+    assert "RLNoiseGtrace" in {v[0] for v in model["vars"]} and "RLNoisePtrace" not in {v[0] for v in model["vars"]}
+    assert "2.0 * (ContrR - ContrMean) * RLNoiseGtrace" in syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "ContrR = (TdE_post + PRew_post - TdMean) * ContrD;" in post
+    assert "ContrD = Lambda * ContrD + (HebbZ - HebbMean) * (HebbZ - HebbMean);" in post
+    # the reward uses the trace of the activity before this step, and the spike trace before its decay
+    assert post.index("ContrR = ") < post.index("ContrD = ") < post.index("HebbZ *= Alpha;")
+    split = build_td_hidden_model(replace(PRESETS["proposed"], contrast=1.0, split_optimiser=True), **kw)["model"]["synapse_dynamics_code"]
+    assert "ContrR" in split[split.index("DeltaGG +="):].split(";")[0]
+    plain = build_td_hidden_model(PRESETS["drift_only"], **kw)["model"]
+    assert "ContrD" not in {v[0] for v in plain["post_vars"]}
+
+
+def test_backprop_activity_sends_the_spike_deviation_and_raises_drive_after_positive_td():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["proposed_backprop"], backprop_signal="activity", center_drift=True)
+    model = build_td_hidden_model(cfg, send_back=True, **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "addToPre(g * (HebbZ - HebbMean));" in syn and "addToPre(g * (-PsiBar" not in syn
+    assert {"HebbZ", "HebbMean"} <= {v[0] for v in model["post_vars"]}
+    assert "- 1.0 * (reward - TdMean) * RLBackTrace" in syn[syn.index("DeltaG +="):].split(";")[0]
+    noise = build_td_hidden_model(PRESETS["proposed_backprop"], send_back=True, **kw)["model"]["synapse_dynamics_code"]
+    assert "addToPre(g * (-PsiBar * normXi));" in noise and "(reward * RLBackTrace)" in noise
+
+
+def test_backprop_activity_wiring_and_signal(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed_backprop", "backprop_signal": "activity"})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_contrast_with_factor_norm_uses_the_td_and_local_factors():
+    from ml_genn.compilers.eprop.variants import FactorNorm
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["proposed"], center_drift=True, contrast=1.0, factor_norm=FactorNorm())
+    syn = build_td_hidden_model(cfg, **kw)["model"]["synapse_dynamics_code"]
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "FnPost * FnPre * FnXi * (FnTd * 1.0 * (ContrR - ContrMean) * RLNoiseGtrace)" in dg
+
+
+def test_contrast_alone_changes_the_hidden_weights(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "contrast": 1.0})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_hebb_alone_changes_the_hidden_weights(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "hebb": 1.0})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_split_optimiser_puts_the_gradient_score_terms_in_their_own_accumulator():
+    """split_optimiser: the drift-trace terms stay in DeltaG, the gradient part and the local objectives (credited
+    through the gradient score) go to DeltaGG."""
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["proposed"], split_optimiser=True,
+                  local=LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=1.0, rate=0.0))
+    model = build_td_hidden_model(cfg, **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "DeltaGG" in {v[0] for v in model["vars"]}
+    dgg = syn[syn.index("DeltaGG +="):].split(";")[0]
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "RLNoiseGtrace" in dgg and "LocR - LocMean" in dgg and "RLNoisePtrace" not in dgg
+    assert "RLNoisePtrace" in dg and "RLNoiseGtrace" not in dg and "LocR" not in dg
+    plain = build_td_hidden_model(replace(cfg, split_optimiser=False), **kw)["model"]
+    assert "DeltaGG" not in {v[0] for v in plain["vars"]}
+
+
+def test_split_optimiser_trains_through_a_second_optimiser(request):
+    """The DeltaGG terms get their own optimiser copy (own moments, own update group) on the same weights."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed", "split_optimiser": True})
+    hidden = [p for c, p in compiled.connection_populations.items() if c.target() is hid and not c.is_feedback]
+    assert hidden and all("DeltaGG" in p.vars for p in hidden)
+    opts = [o for o, _ in compiled.optimisers]
+    assert len(opts) == len({id(o) for o in opts}) >= 2      # the copy is a distinct optimiser object
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
 
 
 def test_rule_dict_round_trip():

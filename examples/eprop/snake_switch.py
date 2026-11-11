@@ -524,9 +524,10 @@ def entropy_error(probs, coeff):
 class PolicyMonitor:
     """Per-episode log of the policy: mean entropy (nats; uniform over 4 actions = 1.386), mean max probability,
     the effective entropy coefficient, the running |TD error| and the size of the entropy term relative to the
-    reward-driven policy-gradient term, ||E|| / (|delta| * ||PG||): ~0.01 = negligible, ~1 = as strong."""
+    reward-driven policy-gradient term, ||E|| / (|delta| * ||PG||): ~0.01 = negligible, ~1 = as strong; with a
+    headless decoder, the mean decision margin (the winning pool's statistic minus the runner-up's; NaN otherwise)."""
     COLUMNS = ["episode", "timestep", "switch", "decisions", "entropy", "max_prob", "entropy_coeff", "abs_td",
-               "entropy_vs_pg"]
+               "entropy_vs_pg", "margin"]
 
     def __init__(self, log_path):
         self.log_path = log_path
@@ -537,9 +538,13 @@ class PolicyMonitor:
 
     def _reset(self):
         self.n, self.h, self.maxp, self.coeff, self.e_norm, self.pg_norm, self.abs_td = 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        self.margin, self.n_margin = 0.0, 0
 
-    def decision(self, probs, pg, coeff=0.0, e=None, abs_td=0.0):
+    def decision(self, probs, pg, coeff=0.0, e=None, abs_td=0.0, margin=None):
         p = np.asarray(probs, dtype=np.float64)
+        if margin is not None:
+            self.margin += float(margin)
+            self.n_margin += 1
         self.n += 1
         self.h += float(-(p * np.log(np.clip(p, 1e-8, 1.0))).sum())
         self.maxp += float(p.max())
@@ -554,7 +559,7 @@ class PolicyMonitor:
             return None
         ratio = self.e_norm / self.pg_norm if self.pg_norm > 0 else float("nan")
         row = [episode, int(timestep), switch, self.n, self.h / self.n, self.maxp / self.n, self.coeff / self.n,
-               self.abs_td / self.n, ratio]
+               self.abs_td / self.n, ratio, self.margin / self.n_margin if self.n_margin else float("nan")]
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.5g}" if isinstance(x, float) else x for x in row])
         self._reset()
@@ -664,10 +669,19 @@ class SelectionEnv:
 
     `switch_moves`: every that many decisions the required features change to the next set in `required_after`
     (cycling through [required] + required_after), so the correct action flips for some candidate types (`switches`
-    counts the changes). `ctype` is the shown candidate's type, sum_j present_j 2^j."""
+    counts the changes). `ctype` is the shown candidate's type, sum_j present_j 2^j.
+
+    `commit_types` / `skip_types` (lists of candidate types) switch to the contingency table used to test whether a
+    rewarded candidate action is reinforced: a commit on a type in `commit_types` or a skip on a type in `skip_types`
+    gets `table_reward` (negative: a punishment), everything else 0; no decision ends the episode (it ends after
+    `n_candidates`), so the two actions differ only in their reward. `good` is then "the type is in commit_types"."""
 
     def __init__(self, wait_inc, inp_shape, n_candidates=8, features=4, required=(0, 1), p=0.5, good_reward=1.0,
-                 bad_reward=-1.0, none_reward=0.0, noise=0.05, seed=None, switch_moves=None, required_after=((2, 3),)):
+                 bad_reward=-1.0, none_reward=0.0, noise=0.05, seed=None, switch_moves=None, required_after=((2, 3),),
+                 commit_types=None, skip_types=None, table_reward=1.0):
+        self.table = None if commit_types is None and skip_types is None else (
+            {int(t) for t in (commit_types or ())}, {int(t) for t in (skip_types or ())})
+        self.table_reward = float(table_reward)
         self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
         self.inp_shape = tuple(inp_shape)
         self.n_candidates, self.features, self.p, self.noise = int(n_candidates), int(features), float(p), float(noise)
@@ -704,6 +718,8 @@ class SelectionEnv:
 
     @property
     def good(self):
+        if self.table is not None:
+            return self.ctype in self.table[0]
         return bool(self.present[self.required].all())
 
     def reset(self):
@@ -724,6 +740,13 @@ class SelectionEnv:
         self.wait_count = self.wait_inc
         good = self.good                                   # judged by the rule in force when the candidate was shown
         self.moves += 1
+        if self.table is not None:                         # contingency table: reward by (type, action), no early end
+            hit = self.ctype in self.table[0 if int(action) == 0 else 1]
+            self.index += 1
+            self.done = self.index >= self.n_candidates
+            if not self.done:
+                self._draw()
+            return self.obs, self.table_reward if hit else 0.0, self.done
         if self.switch_moves and self.moves % self.switch_moves == 0:
             self.switches += 1
             self.required = self.required_sets[self.switches % len(self.required_sets)]

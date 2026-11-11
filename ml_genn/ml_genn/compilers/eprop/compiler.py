@@ -622,9 +622,12 @@ class EPropCompiler(Compiler):
         readout_custom_updates = []          # stays empty without a readout_optimiser
         population_custom_updates = {}       # id(optimiser) -> (optimiser, custom updates) for population_optimisers
         deep_r_record_rewirings_ccus = []
+        split_custom_updates = {}
         dale_rewiring_required = self._add_weight_optimisers(
             genn_model, connection_populations, compile_state, optimiser_custom_updates,
-            readout_custom_updates, deep_r_record_rewirings_ccus, population_custom_updates)
+            readout_custom_updates, deep_r_record_rewirings_ccus, population_custom_updates,
+            split_custom_updates)
+        split_updates = [u for _, ups in split_custom_updates.values() for u in ups]
         population_updates = [u for _, ups in population_custom_updates.values() for u in ups]
 
         self._add_bias_optimisers(genn_model, neuron_populations, compile_state,
@@ -641,6 +644,10 @@ class EPropCompiler(Compiler):
         base_train_callbacks, base_validate_callbacks = self._build_callbacks(
             compile_state, optimiser_custom_updates + readout_custom_updates + population_updates,
             deep_r_record_rewirings_ccus, dale_rewiring_required)
+        if split_updates:
+            if self.full_batch_size > 1:
+                base_train_callbacks.append(CustomUpdateOnBatchEnd("GradientBatchReduceG"))
+            base_train_callbacks.append(CustomUpdateOnBatchEnd("GradientLearnG"))
 
         optimisers = []
         if len(optimiser_custom_updates) > 0:
@@ -648,6 +655,7 @@ class EPropCompiler(Compiler):
         if len(readout_custom_updates) > 0:
             optimisers.append((self._readout_optimiser, readout_custom_updates))
         optimisers += [(o, ups) for o, ups in population_custom_updates.values() if ups]
+        optimisers += [(o, ups) for o, ups in split_custom_updates.values() if ups]
 
         return CompiledTrainingNetwork(
             genn_model, neuron_populations, connection_populations,
@@ -689,7 +697,8 @@ class EPropCompiler(Compiler):
 
     def _add_weight_optimisers(self, genn_model, connection_populations, compile_state,
                                optimiser_custom_updates, readout_custom_updates,
-                               deep_r_record_rewirings_ccus, population_custom_updates=None):
+                               deep_r_record_rewirings_ccus, population_custom_updates=None,
+                               split_custom_updates=None):
         """Add Deep-R / Dale rewiring infrastructure and an optimiser custom
         update for every weight that needs one. Returns whether Dale
         rewiring was used anywhere.
@@ -742,12 +751,19 @@ class EPropCompiler(Compiler):
                 optimiser, updates = self._optimiser, optimiser_custom_updates
             updates.append(self._create_optimiser_custom_update(
                 f"Weight{i}", weight_var_ref, delta_g_var_ref, genn_model, True, optimiser))
+            if "DeltaGG" in genn_pop.vars and split_custom_updates is not None:
+                # split_optimiser: the gradient-score terms get their own copy of the optimiser (own moments) on
+                # the same weight, in their own update group (no two updates of one weight in one kernel)
+                o2, ups2 = split_custom_updates.setdefault(id(optimiser), (deepcopy(optimiser), []))
+                ups2.append(self._create_optimiser_custom_update(
+                    f"WeightG{i}", weight_var_ref, create_wu_var_ref(genn_pop, "DeltaGG"), genn_model, True, o2,
+                    group="GradientLearnG"))
 
         return dale_rewiring_required
 
     # the lambda-traces that carry credit over time (hidden rule and readout); short filters such as ZFilter,
     # epsilonA, NoiseTrace and eFiltered follow the neuron's own state and are not reset
-    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace",
+    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLHebbTrace",
                         "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
     def _add_trace_reset(self, genn_model, connection_populations):
@@ -812,7 +828,7 @@ class EPropCompiler(Compiler):
         return train_callbacks, validate_callbacks
 
     def _create_optimiser_custom_update(self, name_suffix, var_ref,
-                                        gradient_ref, genn_model, wu, optimiser):
+                                        gradient_ref, genn_model, wu, optimiser, group="GradientLearn"):
         if self.full_batch_size > 1:
             reduction_optimiser_model = CustomUpdateModel(
                 GRADIENT_BATCH_REDUCE_MODEL, {}, {"ReducedGradient": 0.0},
@@ -820,7 +836,7 @@ class EPropCompiler(Compiler):
 
             genn_reduction = self.add_custom_update(
                 genn_model, reduction_optimiser_model,
-                "GradientBatchReduce", "CUBatchReduce" + name_suffix)
+                group.replace("GradientLearn", "GradientBatchReduce"), "CUBatchReduce" + name_suffix)
             reduced_gradient = (create_wu_var_ref(genn_reduction, "ReducedGradient") if wu
                                 else create_var_ref(genn_reduction, "ReducedGradient"))
             optimiser_model = optimiser.get_model(reduced_gradient, var_ref, False, None)
@@ -828,4 +844,4 @@ class EPropCompiler(Compiler):
             optimiser_model = optimiser.get_model(gradient_ref, var_ref, True, None)
 
         return self.add_custom_update(genn_model, optimiser_model,
-                                      "GradientLearn", "CUGradientLearn" + name_suffix)
+                                      group, "CUGradientLearn" + name_suffix)

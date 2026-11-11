@@ -224,6 +224,11 @@ class HiddenRuleConfig:
     drift: float = 1.0               # c_P: TD error x lambda-trace of the drift part
     gradient: float = 1.0            # c_G: TD error x lambda-trace of the gradient part
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
+    split_optimiser: bool = False    # the gradient part (and the local objectives, credited through the same noise
+                                     # score) accumulate in their own gradient variable DeltaGG with its own
+                                     # optimiser state; the drift-trace terms stay in DeltaG. Both steps go to the same
+                                     # weight, each normalised by its own statistics (one term's noise no longer sets
+                                     # the other's step size). Needs the split traces (drift and gradient both used)
     center_eligibility: Optional[float] = None   # decay d of each synapse's running mean of its drift-eligibility
                                      # increment (psi - psibar) * pre * noise, subtracted before it enters the drift
                                      # trace: the part of the drift shared by all states (the state-independent
@@ -239,6 +244,24 @@ class HiddenRuleConfig:
                                      # > 0 below it (inputs pushed up), < 0 above it (saturated: pushed down), 0 inside
                                      # and while refractory; dV/dW = ZFilter needs no psi, so it acts where the drift
                                      # and every psi-gated term vanish
+    hebb: float = 0.0                # c_B: the potentiating half of the freeze, a TD-gated covariance Hebbian term:
+                                     # dW += lr * c_B * delta * trace[(zpost - mean zpost) * ZFilter], zpost the
+                                     # postsynaptic spike trace (decay alpha), its mean a running average per neuron
+                                     # (hebb_decay); delta is centred with center_drift. A positive TD error
+                                     # strengthens the active inputs of the neurons that fired above their average
+                                     # (the drift only lowers the near-threshold ones); a negative one reverses it.
+                                     # Needs no noise. Stays with the drift under split_optimiser
+    hebb_decay: float = 0.9999       # decay of the running mean of the postsynaptic spike trace
+    contrast: float = 0.0            # c_C: the contrast reward, a local reward credited through the neuron's own noise
+                                     # (the gradient score trace): r_i = delta * trace[(zpost - mean zpost)^2], minus
+                                     # its running mean. After a positive TD error a neuron is rewarded for having
+                                     # been far from its usual activity, in either direction; in expectation
+                                     # dW ~ delta * (zpost - mean) * psi * pre: active neurons up, near-threshold
+                                     # inactive ones down, nothing where psi = 0 (self-limiting); a negative TD
+                                     # error reverses it. delta is centred with center_drift; zpost and its mean as
+                                     # for hebb (hebb_decay). Goes with the gradient terms under split_optimiser;
+                                     # with factor_norm it is normalised like a local objective (post, pre,
+                                     # noise) plus the TD factor
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
@@ -276,6 +299,13 @@ class HiddenRuleConfig:
                                          # (keeps them alive; their learning signal stays e-prop only)
     backprop: float = 0.0            # c_B: TD error x lambda-trace of eFiltered * L, where L is the backward projection
                                      # of the downstream hidden neurons' gradient scores through the forward weights
+    backprop_signal: str = "noise"   # what each hidden neuron sends back through its incoming weights: "noise", its
+                                     # gradient score -psibar * xi / sigma^2 (symmetric e-prop with perturbation-
+                                     # estimated learning signals); "activity", its spike-trace deviation from its
+                                     # running mean (zpost - mean zpost, as for hebb): the upstream neuron then gets
+                                     # dW = lr * c_B * delta * trace[e * sum_k w_kj (z_k - mean z_k)] (a positive TD
+                                     # error makes it drive the targets that fired above their average more); no
+                                     # noise needed; delta centred with center_drift
     local: Optional[LocalObjectives] = None
     fire_rate_gradient: bool = True  # e-prop-style firing-rate regulariser c_reg (F - F*) eFiltered
     vreg_gradient: float = 0.0       # e-prop-style voltage regulariser (gradient, not noise-credited): the derivative of
@@ -311,6 +341,8 @@ class HiddenRuleConfig:
                                      # the instantaneous local rewards do not change when lambda does
 
     def __post_init__(self):
+        if self.split_optimiser and self.estimator is Estimator.EXACT:
+            raise ValueError("split_optimiser: the exact estimator has no drift part")
         uses_noise = (self.drift != 0 or self.gradient != 0 or self.homeostat != 0
                       or (self.local is not None))
         if uses_noise and self.noise is NoisePlacement.NONE:
@@ -337,8 +369,13 @@ class HiddenRuleConfig:
         if self.backprop != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
             raise ValueError("backprop propagates the trace estimator's gradient score: it needs noise and "
                              "estimator=TRACE")
-        if self.center_drift and self.drift == 0:
-            raise ValueError("center_drift needs drift != 0")
+        if self.backprop_signal not in ("noise", "activity"):
+            raise ValueError(f"backprop_signal must be 'noise' or 'activity', not {self.backprop_signal!r}")
+        if (self.center_drift and self.drift == 0 and self.hebb == 0 and self.contrast == 0
+                and not (self.backprop != 0 and self.backprop_signal == "activity")):
+            raise ValueError("center_drift needs drift != 0 (or hebb / contrast != 0)")
+        if self.contrast != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
+            raise ValueError("contrast is credited through the gradient score trace: it needs noise and estimator=TRACE")
         if self.factor_norm is not None and (self.eprop != 0 or self.backprop != 0 or self.diagnose_gradients
                                              or self.estimator is Estimator.EXACT):
             raise ValueError("factor_norm is implemented for the perturbation rule (trace estimator, no e-prop, "
