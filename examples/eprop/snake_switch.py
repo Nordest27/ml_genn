@@ -366,7 +366,7 @@ def pseudo_derivative(v, a, beta, v_thresh, refrac):
 
 class NeuronMonitor:
     def __init__(self, compiled_net, populations, labels, log_path, report_every=10000, psi_eps=0.01,
-                 silent_hz=0.5, dt_ms=1.0, weights=True, score_factors=False):
+                 silent_hz=0.5, dt_ms=1.0, weights=True, score_factors=False, ip_max_bias=None):
         """populations: hidden ALIF ml_genn Populations; labels: their names in the log.
         weights: also log, per connection group into a hidden population, how far its weights have moved from
         their initial values (||W - W0|| / ||W0||), to see which layers learn when.
@@ -416,6 +416,13 @@ class NeuronMonitor:
         cols += [f"net|{name}" for name, *_, sign in self.weight_groups if sign is not None]
         cols += [f"epsA|{name}" for name, *_ in self.score_groups]
         cols += [f"piNeg|{name}" for name, *_ in self.score_groups]
+        # intrinsic plasticity: per population with a bias, its mean and 10th / 90th percentile across neurons and
+        # the fractions of neurons at the upper / lower limit (|bias| >= 99 % of max_bias)
+        self.ip_max = ip_max_bias
+        self.ip_pops = [(l, compiled_net.neuron_populations[p]) for l, p in zip(self.labels, self.pops)
+                        if "IPBias" in compiled_net.neuron_populations[p].vars]
+        for l, _ in self.ip_pops:
+            cols += [f"ip|{l}_mean", f"ip|{l}_p10", f"ip|{l}_p90", f"ip|{l}_at_max", f"ip|{l}_at_min"]
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(cols)
 
@@ -505,6 +512,12 @@ class NeuronMonitor:
             negs.append(float(np.sum(np.abs(zf) * (zf - adapt < 0)) / (np.sum(np.abs(zf)) + 1e-30)))
         row += ratios + negs
         self.samples = 0
+        for _, npop in self.ip_pops:
+            npop.vars["IPBias"].pull_from_device()
+            b = np.asarray(npop.vars["IPBias"].view, dtype=np.float64).ravel()
+            m = self.ip_max if self.ip_max else max(float(np.abs(b).max()), 1e-12)
+            row += [float(b.mean()), float(np.percentile(b, 10)), float(np.percentile(b, 90)),
+                    float(np.mean(b >= 0.99 * m)), float(np.mean(b <= -0.99 * m))]
         with open(self.log_path, "a", newline="") as f:
             csv.writer(f).writerow([f"{x:.4g}" if isinstance(x, float) else x for x in row])
         return row

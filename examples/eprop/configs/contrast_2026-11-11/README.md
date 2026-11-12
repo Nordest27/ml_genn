@@ -29,8 +29,17 @@ moment weighted by lambda^age as in TD(lambda), instead of the local reward's pr
 weighted by the neuron's mean squared deviation, with the same sign as G (both ascend the return); 1 removes it.
 It stays with the drift under `split_optimiser`.
 
+`contrast_drift_gate`: `"covariance"` (default) uses the gate dev^2. Its derivative has a positive mean (firing more
+means more variance), so with an uncentred TD error the mean TD error pushes every rate one way (on the GPU: the leg
+alone drained to 0 Hz; with the drift, the rates rose to 60 Hz), and with a centred one the gate's link to the rate
+still pushes the rates up. `"rate_neutral"` uses dev^2 - F * z, F = mean dev^2 / mean z (the trace's Fano-like
+ratio): a pure rate change leaves it unchanged, so neither the mean TD error nor the rate can push the rates. Its
+expected update is delta x (2 dev - F) x sensitivity x pre, a BCM-like threshold at mean z + F / 2. In a simulated
+spike train (10 ms trace) the old gate grows 4x from 10 to 40 Hz, the new one stays within +-0.005 (Poisson) or
+-0.02 at 40 Hz with a 5 ms refractory period. Untested in learning when this zip was made (CPU tests running).
+
 Contingency test (selectivity, 4 runs each): local-reward contrast +0.68; contrast leg centred (kappa 1) +0.54;
-contrast leg kappa 0 about +0.62 (runs at 72-84 % when this zip was made); drift + local-reward contrast +0.70;
+contrast leg kappa 0 +0.63; drift + local-reward contrast +0.70;
 drift + centred leg +0.56. Not yet run on the selection task.
 
 ## Why (CPU, small mexhat, L1 as the motor population, log-sum-exp decoder)
@@ -55,6 +64,8 @@ drift + centred leg +0.56. Not yet run on the selection task.
 | `contrast_only.json` | contrast alone: no drift, no G, no homeostat (decorr and the other local rewards stay) |
 | `contrast_leg.json` | adds the contrast leg (`contrast_drift` 1.0, kappa 0) to your rule as it is |
 | `drift_contrast_leg.json` | drift + contrast leg, no G |
+| `contrast_leg_rate_neutral.json` | the contrast leg with the rate-neutral gate |
+| `drift_contrast_leg_rate_neutral.json` | drift + contrast leg with the rate-neutral gate, no G (works with your uncentred TD error) |
 | `split_optimiser.json` | G and the local objectives (contrast included) get their own optimiser copy, separate from the drift |
 
 Suggested order, one at a time: `contrast_as_tested.json` on your best headless config, then `drift_contrast.json`
@@ -65,7 +76,11 @@ tuned. With SGD + factor_norm it is normalised like the other local objectives (
 
 ## New options (headers of `variants.py`)
 
-- `hidden_rule.contrast_drift`, `hidden_rule.contrast_drift_centre`: the contrast leg above.
+- `hidden_rule.contrast_drift`, `hidden_rule.contrast_drift_centre`, `hidden_rule.contrast_drift_gate`: the contrast
+  leg above.
+- `move_log.activity_at`: a list of timesteps; records the activity window (`activity` moves) starting at each of
+  them, saved to `<prefix>(<rep>)_activity_<t>.npz` (for activity after learning; join with `_moves.csv` on the
+  timestep for the actions).
 - `hidden_rule.local.contrast`, `hidden_rule.local.contrast_route`: the reward above (the rule's `hebb_decay` sets the
   running mean of the spike trace).
 - `hidden_rule.hebb`: the TD-gated Hebbian term (not recommended: it ran away; not available with factor_norm).

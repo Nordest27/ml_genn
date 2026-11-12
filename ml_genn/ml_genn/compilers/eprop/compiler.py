@@ -211,6 +211,11 @@ class EPropCompiler(Compiler):
         dale_connections:           if given, Dale rewiring applies only to these connections (e.g. every layer's
                                     I -> E, so the inhibition a neuron receives stays inhibitory); None: every
                                     connection with an excitatory / inhibitory sign
+        intrinsic_plasticity:       None (default) or {"eta": 1e-5, "psi_target": 0.07, "decay": 0.999,
+                                    "max_bias": 1.0}: a slow per-neuron bias in every hidden ALIF population
+                                    (plain ALIF only), homeostatic on the neuron's own psi (neuron_logic.
+                                    add_intrinsic_plasticity): keeps neurons near threshold without touching
+                                    the weights
         inhibitory_reversal:         None (default): current-based synapses. A value E_inh < 0
                                     (rest 0, threshold ~0.61): inhibitory hidden synapses
                                     (exc_inh_sign -1) act through the driving force
@@ -304,6 +309,7 @@ class EPropCompiler(Compiler):
                  hidden_rule="proposed",
                  value_feedback_ret_e: float = 0.0,
                  inhibitory_reversal: Optional[float] = None,
+                 intrinsic_plasticity: Optional[dict] = None,
                  dale_local_rewiring: bool = False,
                  activity_rewiring: dict = None,
                  dale_connections=None,
@@ -376,6 +382,11 @@ class EPropCompiler(Compiler):
                     raise ValueError("plastic inhibition scaling: one scaling_tau / scaling_warmup per population")
         self.value_feedback_ret_e = value_feedback_ret_e
         self.inhibitory_reversal = inhibitory_reversal
+        if intrinsic_plasticity is not None:
+            unknown = set(intrinsic_plasticity) - {"eta", "psi_target", "decay", "max_bias", "mode"}
+            if unknown:
+                raise ValueError(f"intrinsic_plasticity: unknown keys {sorted(unknown)}")
+        self.intrinsic_plasticity = intrinsic_plasticity
         self.dale_local_rewiring = dale_local_rewiring
         # {"max_add": 8, "headroom": 1.5}: an "ActRewire" pass on every sparse optimised connection whose rule keeps
         # a co-activity trace (hidden rule coactivity_decay), planned on the host (examples/eprop/activity_rewiring.py)
@@ -558,6 +569,10 @@ class EPropCompiler(Compiler):
                 neuron_logic.add_decorr_tracking(model_copy, local.decorr_tau, self.dt)
             if local is not None and local.cancel != 0:
                 neuron_logic.add_cancel_tracking(model_copy, local.cancel_tau, self.dt)
+        if self.intrinsic_plasticity is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+            if type(pop.neuron) is not AdaptiveLeakyIntegrateFire:
+                raise NotImplementedError("intrinsic_plasticity supports the plain ALIF neuron only")
+            neuron_logic.add_intrinsic_plasticity(model_copy, **self.intrinsic_plasticity)
         if pop in self.inhibition_scaling and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             tau, warmup = self.inhibition_scaling[pop]
             neuron_logic.add_inhibition_tracking(model_copy, tau, warmup, self.dt,

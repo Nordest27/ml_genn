@@ -411,6 +411,44 @@ def add_inhibitory_reversal(model_copy, e_inh):
     model_copy.replace_sim_code(source, f"V = Alpha * V + Isyn + ({e_inh!r} - V) * (1.0 - exp(-fmax(0.0, ISynInh / ({e_inh!r}))))")
 
 
+def add_intrinsic_plasticity(model_copy, eta=1e-5, psi_target=0.07, decay=0.999, max_bias=1.0, mode="target"):
+    """Intrinsic plasticity: a slow per-neuron bias current IPBias in the membrane update, homeostatic on the
+    neuron's own closeness to threshold. psi (the pseudo-derivative, as the hidden rule computes it) is averaged
+    into IPPsiBar, the voltage relative to the adaptive threshold (outside refractoriness) into IPVBar; every step
+    IPBias += eta * (psi_target - IPPsiBar) * (IPVBar < 0 ? +1 : -1), clipped to +-max_bias. A neuron that spends
+    too little time near threshold is moved towards it: up when it sits below (silent), down when it sits above
+    (saturated); one that spends too much time there is moved away. No synapse changes, so the learned weights (and
+    their ratios) are untouched; only the neuron's operating point moves (cf. intrinsic plasticity, Turrigiano).
+    mode "floor": psi_target is a floor; the bias moves only while IPPsiBar is below it (towards threshold, by
+    eta * (psi_target - IPPsiBar)) and is left alone otherwise, so neurons are kept from losing all sensitivity
+    but their activity level (silenced, sparse) is not otherwise changed."""
+    if mode not in ("target", "floor"):
+        raise ValueError(f"intrinsic plasticity mode must be 'target' or 'floor', not {mode!r}")
+    model_copy.add_var("IPBias", "scalar", 0.0)
+    model_copy.add_var("IPPsiBar", "scalar", float(psi_target))
+    model_copy.add_var("IPVBar", "scalar", 0.0)
+    sim = model_copy.model.get("sim_code", "")
+    source = "V = Alpha * V + Isyn"
+    if sim.count(source) != 1:
+        raise RuntimeError("intrinsic plasticity: the ALIF membrane update was not found exactly once")
+    model_copy.replace_sim_code(source, "V = Alpha * V + IPBias + Isyn")
+    d, d1 = float(decay), 1.0 - float(decay)
+    refrac = "(RefracTime > 0.0)" if model_copy.has_var("RefracTime") else "false"   # no refractory period: never
+    model_copy.append_sim_code(f"""
+        {{
+        const scalar ipThr = Vthresh + (Beta * A);
+        const scalar ipPsi = {refrac} ? 0.0
+            : (1.0 / Vthresh) * 0.3 * fmax(0.0, 1.0 - fabs((V - ipThr) / Vthresh));
+        IPPsiBar = {d!r} * IPPsiBar + {d1!r} * ipPsi;
+        if (!{refrac}) {{
+            IPVBar = {d!r} * IPVBar + {d1!r} * (V - ipThr);
+        }}
+        IPBias += {float(eta)!r} * {"fmax(0.0, " if mode == "floor" else "("}{float(psi_target)!r} - IPPsiBar) * ((IPVBar < 0.0) ? 1.0 : -1.0);
+        IPBias = fmin(fmax(IPBias, {-float(max_bias)!r}), {float(max_bias)!r});
+        }}
+        """)
+
+
 def add_inhibitory_channel(model_copy):
     """Route inhibitory synapses to their own input ISynInh, added to the membrane like Isyn (current-based, as
     before); used when the neuron needs to know the inhibition it receives (decorrelation reward)."""

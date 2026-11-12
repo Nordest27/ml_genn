@@ -122,7 +122,11 @@ import csv
 #     probes only the connections whose "source->target" name contains one of the strings (all by default; the
 #     aggregate sums take 16 x 2 x synapses floats); "activity": n records, for the first n
 #     moves, every hidden ALIF population's spike count per neuron over each move (counted in SpkCount) with the
-#     candidate type, saved to outputs/<prefix>(<rep>)_activity.npz (separation of states vs. trial-to-trial noise)
+#     candidate type, saved to outputs/<prefix>(<rep>)_activity.npz (separation of states vs. trial-to-trial noise);
+#     "activity_at": [t1, t2, ...] records such a window of n moves starting at each of these timesteps instead (the
+#     counters are cleared at the first decision after t, so the next move is the first recorded one), saved to
+#     outputs/<prefix>(<rep>)_activity_<t>.npz (a window starting at 0 keeps the name _activity.npz); join with
+#     _moves.csv on the timestep for the actions
 # boolean_head: None or {"k": 2, "window": 10, "radius": 1, "seed": 0} - fixed random logic units (BooleanUnit, one per
 #     field neuron, k local field inputs, refractory-rate output) between the fields and the heads: the heads read
 #     only logic outputs, so no gradient path leads from the heads into the network (snake_network.BooleanSpec).
@@ -826,6 +830,10 @@ def build_compiled_network(connectivity_type="fixed"):
                 raise ValueError(f"dale.connections must be 'all', 'i_to_e' or 'inhibitory', not {which!r}")
         if HP["inhibitory_reversal"] is not None:
             rule_kwargs["inhibitory_reversal"] = HP["inhibitory_reversal"]
+        if HP.get("intrinsic_plasticity") is not None:
+            # {"eta": 1e-5, "psi_target": 0.07, "decay": 0.999, "max_bias": 1.0}: a slow per-neuron bias in every
+            # hidden ALIF population, homeostatic on the neuron's own psi (no synapse changes); see the compiler
+            rule_kwargs["intrinsic_plasticity"] = HP["intrinsic_plasticity"]
         if HP["plastic_inhibition"] is not None:
             layers = HP["plastic_inhibition_layers"]            # 1-based layer numbers; None = every layer
             if layers is not None and any(not 1 <= k <= len(built.inhibitory_to_e) for k in layers):
@@ -1093,6 +1101,10 @@ class MoveLog:
         self.act_pops = [(built.labels.get(p, p.name), gp) for p, gp in compiled_net.neuron_populations.items()
                          if "SpkCount" in gp.vars] if self.n_act else []
         self.act = {"ctype": [], "timestep": [], **{k: [] for k, _ in self.act_pops}}
+        self.act_at = sorted(int(x) for x in (cfg.get("activity_at") or [0])) if self.n_act else []
+        # recording: a window is active (counters clean); the window starting at 0 starts clean at the first decision
+        self.act_rec = bool(self.act_at) and self.act_at[0] == 0
+        self.act_start = self.act_at.pop(0) if self.act_rec else None
         self.conns = [(f"{built.labels.get(c.source(), c.source().name)}->"
                        f"{built.labels.get(c.target(), c.target().name)}", sg)
                       for c, sg in compiled_net.connection_populations.items()
@@ -1134,7 +1146,16 @@ class MoveLog:
                        (self.v_sum / self.v_n) if self.v_n else float("nan")]
         self.v_sum, self.v_n = 0.0, 0
         self.env = env
-        if self.act_pops and len(self.act["ctype"]) < self.n_act:
+        if self.act_pops and not self.act_rec and self.act_at and t >= self.act_at[0]:
+            self.act_start = self.act_at.pop(0)      # a new window: clear the counters, record from the next move
+            self.act = {"ctype": [], "timestep": [], **{k: [] for k, _ in self.act_pops}}
+            for k, gp in self.act_pops:
+                if MOTOR and gp is MOTOR["gp"]:
+                    continue
+                gp.vars["SpkCount"].view[:] = 0.0
+                gp.vars["SpkCount"].push_to_device()
+            self.act_rec = True
+        elif self.act_pops and self.act_rec and len(self.act["ctype"]) < self.n_act:
             for k, gp in self.act_pops:
                 if MOTOR and gp is MOTOR["gp"]:      # count decoders read (and zero) the motor counters first
                     self.act[k].append(MOTOR["last"].astype(np.float32))
@@ -1146,8 +1167,10 @@ class MoveLog:
             self.act["ctype"].append(env.ctype)
             self.act["timestep"].append(t)
             if len(self.act["ctype"]) == self.n_act:
-                np.savez_compressed(f"outputs/{CSV_PREFIX}({REPETITION})_activity.npz",
+                suffix = "" if self.act_start == 0 else f"_{self.act_start}"
+                np.savez_compressed(f"outputs/{CSV_PREFIX}({REPETITION})_activity{suffix}.npz",
                                     **{k: np.array(v) for k, v in self.act.items()})
+                self.act_rec = False
         if not self.conns:
             return
         if self.probe is None and t >= self.next_probe:
@@ -1209,7 +1232,7 @@ class MoveLog:
         """After the drain: the last row is complete; the drain's increments are not a move of their own."""
         self._flush()
         self.v_sum, self.v_n = 0.0, 0          # the drain's values belong to no move
-        if self.act_pops and len(self.act["ctype"]) < self.n_act:
+        if self.act_pops and self.act_rec and len(self.act["ctype"]) < self.n_act:
             for _, gp in self.act_pops:     # the drain is not a move: the next episode's first move starts clean
                 gp.vars["SpkCount"].view[:] = 0.0
                 gp.vars["SpkCount"].push_to_device()
@@ -1982,7 +2005,9 @@ def train_snake_agent_with_ipc(episodes=10000,
             monitor = snake_switch.NeuronMonitor(compiled_net, alif, labels,
                                                  f"outputs/{CSV_PREFIX}({REPETITION})_neurons.csv",
                                                  report_every=HP["monitor_every"],
-                                                 score_factors=HP["monitor_score_factors"])
+                                                 score_factors=HP["monitor_score_factors"],
+                                                 ip_max_bias=((HP.get("intrinsic_plasticity") or {}).get("max_bias", 1.0)
+                                                              if HP.get("intrinsic_plasticity") else None))
         normaliser = None
         normalised = {c: cfg for c, cfg in plastic_inhibition_connections(built).items() if cfg.get("normalise")}
         if normalised:

@@ -294,6 +294,24 @@ def test_backprop_activity_wiring_and_signal(request):
     assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
 
 
+def test_sensitivity_reward_is_minus_td_times_the_centred_psi_trace():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(dv=0.0, vreg=0.0, rate=0.0, sensitivity=2.0, sensitivity_route=LocalRoute.GRADIENT_TRACE)
+    model = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    post, syn = model["post_dynamics_code"], model["synapse_dynamics_code"]
+    assert {"SensD", "SensR", "SensMean"} <= {v[0] for v in model["post_vars"]}
+    assert "SensR = -(TdE_post + PRew_post - TdMean) * SensD;" in post
+    assert "SensD = Lambda * SensD + (Psi - PsiBar);" in post
+    assert post.index("SensR = ") < post.index("SensD = ") and post.index("PsiBar = ") < post.index("SensD = ")
+    assert "2.0 * (SensR - SensMean) * RLNoiseGtrace" in syn[syn.index("DeltaG +="):].split(";")[0]
+    shared = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True,
+                                           local=replace(loc, sensitivity_route=None)), **kw)["model"]
+    assert "+ 2.0 * SensR" in shared["post_dynamics_code"][shared["post_dynamics_code"].index("LocR = "):].split(";")[0]
+    r = hidden_rule_from_dict({"preset": "proposed", "local": {"sensitivity": 1.0, "sensitivity_route": "GRADIENT_TRACE"}})
+    assert r.local.sensitivity_route is LocalRoute.GRADIENT_TRACE
+
+
 def test_contrast_with_factor_norm():
     """In LocR it is normalised like the other local objectives; on its own route also by the TD factor."""
     from ml_genn.compilers.eprop.variants import FactorNorm, LocalObjectives, LocalRoute
@@ -356,12 +374,167 @@ def test_contrast_drift_centre_keeps_part_of_the_reinforce_term():
         replace(base, contrast_drift_centre=1.5)
 
 
+def test_contrast_drift_rate_neutral_gate_subtracts_the_rate_share():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], center_drift=True, contrast_drift=1.0, contrast_drift_gate="rate_neutral")
+    m = build_td_hidden_model(cfg, **kw)["model"]
+    assert ("((HebbZ - HebbMean) * (HebbZ - HebbMean) - DevMean / fmax(HebbMean, 1e-4) * HebbZ) * ZFilter * normXi;"
+            in m["synapse_dynamics_code"])
+    assert "DevMean" in {v[0] for v in m["post_vars"]} and "DevMean = " in m["post_dynamics_code"]
+    with pytest.raises(ValueError):
+        replace(cfg, contrast_drift_gate="fano")
+
+
 def test_contrast_drift_alone_changes_the_hidden_weights(request):
     compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
                                             hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
                                                          "contrast_drift": 1.0})
     h = _run(compiled, inp, pol, val, steps=100)
     assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_intrinsic_plasticity_moves_the_bias_towards_the_psi_target(request):
+    """The bias moves (here: neurons below a high psi target are pushed up), stays inside +-max_bias, and the
+    membrane update includes it."""
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0},
+                                            intrinsic_plasticity={"eta": 1e-2, "psi_target": 0.4, "decay": 0.9,
+                                                                  "max_bias": 0.5})
+    seen = {}
+
+    def probe(c, when):
+        p = c.neuron_populations[hid]
+        for v in ("IPBias", "IPPsiBar", "IPVBar"):
+            p.vars[v].pull_from_device()
+            seen[(when, v)] = p.vars[v].values.copy()
+    h = _run(compiled, inp, pol, val, steps=100, probe=probe)
+    assert np.all(np.isfinite(h))
+    b0, b1 = seen[("start", "IPBias")], seen[("end", "IPBias")]
+    assert np.all(b0 == 0.0) and np.all(np.abs(b1) <= 0.5 + 1e-6) and np.any(b1 != 0.0)
+    # silent neurons (no input): psi ~ 0 below threshold, so the bias rises by eta * psi_target per step until it
+    # reaches max_bias (with a little drive they start to approach threshold)
+    cb = CallbackList([*set(compiled.base_train_callbacks)], compiled_network=compiled, num_batches=1, num_epochs=1)
+    with compiled:
+        p = compiled.neuron_populations[hid]
+        for v in ("IPBias", "V", "A"):
+            p.vars[v].view[:] = 0.0; p.vars[v].push_to_device()
+        p.vars["IPVBar"].view[:] = -0.5; p.vars["IPVBar"].push_to_device()
+        cb.on_epoch_begin(0); cb.on_batch_begin(0)
+        compiled.set_input({inp: np.zeros(N_IN, np.float32)})
+        for _ in range(20):
+            compiled.step_time(cb)
+        p.vars["IPBias"].pull_from_device(); p.vars["V"].pull_from_device()
+        bias = p.vars["IPBias"].values.copy()
+    assert np.all(bias > 0.0) and np.all(bias <= 0.5 + 1e-6)
+    assert np.allclose(bias, bias[0], rtol=0.2)               # the same push for every silent neuron
+
+
+def test_td_as_a_local_reward_term_and_ip_floor_mode():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    from ml_genn.compilers.eprop import neuron_logic
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_TRACE, dv=0.0, vreg=0.0, rate=0.0, td=1.0, contrast=1.0,
+                          sensitivity=5.0)
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    locr = m["post_dynamics_code"][m["post_dynamics_code"].index("LocR = "):].split(";")[0]
+    assert "+ 1.0 * ContrR" in locr and "+ 5.0 * SensR" in locr and "+ 1.0 * (TdE_post + PRew_post)" in locr
+    assert "(LocR - LocMean) * RLNoiseGtrace" in m["synapse_dynamics_code"]
+    class Fake:
+        def __init__(self): self.vars, self.model = [], {"sim_code": "V = Alpha * V + Isyn;"}
+        def add_var(self, n, t, v): self.vars.append(n)
+        def has_var(self, n): return False
+        def replace_sim_code(self, a, b): self.model["sim_code"] = self.model["sim_code"].replace(a, b)
+        def append_sim_code(self, c): self.model["sim_code"] += c
+    f = Fake(); neuron_logic.add_intrinsic_plasticity(f, mode="floor")
+    assert "fmax(0.0, 0.07 - IPPsiBar)" in f.model["sim_code"]
+    with pytest.raises(ValueError):
+        neuron_logic.add_intrinsic_plasticity(Fake(), mode="soft")
+
+
+def test_td_route_makes_a_second_reward_channel():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, td=1.0,
+                          contrast=1.0, sensitivity=5.0, td_route=LocalRoute.GRADIENT_TRACE)
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    post, syn = m["post_dynamics_code"], m["synapse_dynamics_code"]
+    locr = post[post.index("LocR = "):].split(";")[0]; locr2 = post[post.index("LocR2 = "):].split(";")[0]
+    assert "ZDec" in locr and "ContrR" not in locr and "SensR" not in locr and "TdE_post" not in locr
+    assert "ContrR" in locr2 and "SensR" in locr2 and "(TdE_post + PRew_post)" in locr2 and "ZDec" not in locr2
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "(LocR - LocMean) * (-PsiBar * ZFilter * normXi)" in dg and "(LocR2 - Loc2Mean) * RLNoiseGtrace" in dg
+    with pytest.raises(ValueError):
+        replace(PRESETS["drift_only"], local=replace(loc, contrast_route=LocalRoute.GRADIENT_TRACE))
+
+
+def test_local_critics_replace_the_td_channel_baseline():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, td=1.0, contrast=1.0,
+                          td_route=LocalRoute.GRADIENT_TRACE, critic_eta=1e-3)
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    syn = m["synapse_dynamics_code"]
+    assert {"CritA", "CritU", "CritC", "CritV"} <= {v[0] for v in m["vars"]}
+    assert "const scalar critD = LocR2 + 0.977 * critVNow - CritV;" in syn
+    assert syn.index("critD = ") < syn.index("DeltaG")
+    assert "critD * RLNoiseGtrace" in syn and "(LocR2 - Loc2Mean) * RLNoiseGtrace" not in syn
+    with pytest.raises(ValueError):
+        replace(PRESETS["drift_only"], local=replace(loc, td_route=None))
+
+
+def test_neuron_level_critic():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, td=1.0,
+                          contrast=1.0, td_route=LocalRoute.GRADIENT_TRACE, critic_eta=1e-3, critic_level="neuron")
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    post, syn = m["post_dynamics_code"], m["synapse_dynamics_code"]
+    pv = {v[0] for v in m["post_vars"]}
+    assert {"NCritFV", "NCritFA", "NCritV", "NCritD", "NCritW0", "NCritE4"} <= pv and "CritA" not in {v[0] for v in m["vars"]}
+    assert "NCritD = LocR2 + 0.977 * ncV - NCritV;" in post and "InhMean_post" in post[post.index("ncV ="):]
+    assert post.index("LocR2 = ") < post.index("NCritD = ")
+    assert "NCritD * RLNoiseGtrace" in syn and "(LocR2 - Loc2Mean) * RLNoiseGtrace" not in syn
+
+
+def test_local_critics_train(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
+                                                         "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0,
+                                                                   "rate": 0.0, "td": 1.0, "contrast": 1.0,
+                                                                   "td_route": "GRADIENT_TRACE", "critic_eta": 1e-2}})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    hid_conns = [p for c, p in compiled.connection_populations.items() if c.target() is hid and not c.is_feedback]
+    with compiled:
+        pass
+    assert all("CritA" in p.vars for p in hid_conns)
+
+
+def test_neuron_critic_trains(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
+                                                         "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0,
+                                                                   "rate": 0.0, "decorr": 1.0, "td": 1.0, "contrast": 1.0,
+                                                                   "td_route": "GRADIENT_TRACE", "critic_eta": 1e-2,
+                                                                   "critic_level": "neuron"}})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
+def test_intrinsic_plasticity_rejects_unknown_keys():
+    with pytest.raises(ValueError):
+        _compile(EPropCompiler, "ip_bad", PolicyType.GENERIC, hidden_rule="proposed",
+                 intrinsic_plasticity={"rate": 1.0})
+
+
+def test_hebb_psi_gate_multiplies_the_trace_by_psi():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    cfg = replace(PRESETS["drift_only"], center_drift=True, hebb=1.0, hebb_gate="psi")
+    syn = build_td_hidden_model(cfg, **kw)["model"]["synapse_dynamics_code"]
+    assert "RLHebbTrace = Lambda * RLHebbTrace + (HebbZ - HebbMean) * Psi * ZFilter;" in syn
+    assert syn.index("Psi = ") < syn.index("RLHebbTrace = ") if "Psi = " in syn else True
+    with pytest.raises(ValueError):
+        replace(cfg, hebb_gate="sigmoid")
 
 
 def test_hebb_alone_changes_the_hidden_weights(request):

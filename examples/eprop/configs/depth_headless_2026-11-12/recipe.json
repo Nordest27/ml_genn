@@ -1,0 +1,4 @@
+{"headless": {"seed": 0}, "lr": 1e-06, "c_reg": false,
+ "hidden_rule": {"preset": "proposed", "gradient": 0.0, "drift": 1.0, "center_drift": false,
+                 "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0, "decorr": 0.001,
+                           "contrast": 1.0, "contrast_route": "GRADIENT_TRACE"}}}

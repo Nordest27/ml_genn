@@ -148,6 +148,45 @@ class LocalObjectives:
                                      # GRADIENT_TRACE: credited on its own (own running-mean baseline) through the
                                      # instantaneous score or the gradient score's lambda-trace, whatever `route` the
                                      # other local rewards use (GRADIENT_TRACE reproduces the runs of 2026-11-11)
+    sensitivity: float = 0.0         # weight of the sensitivity reward, the drift as a TD-gated local reward:
+                                     # r_i = -(delta - mean delta) * trace[psi - psibar] (delta centred with the rule's
+                                     # center_drift): after a better-than-expected outcome a neuron is rewarded for
+                                     # having been decisive (less time near threshold than usual), after a worse one
+                                     # for having been sensitive. In expectation the gradient of the neuron's recent
+                                     # sensitivity, as the drift, credited like the other local rewards (or on its own
+                                     # sensitivity_route); the centred gate keeps its gradient part from pointing
+                                     # against G
+    sensitivity_route: Optional[LocalRoute] = None   # as contrast_route, for the sensitivity reward
+    td: float = 0.0                  # weight of the TD error itself as a term of the local reward (delta, uncentred:
+                                     # the shared baseline removes its mean). Credited through the noise score like
+                                     # the other terms, it is the gradient part G on the local route: with every
+                                     # term shared (no own routes), the neuron's whole update is one reward,
+                                     # td * delta + delta * (contrast - sensitivity terms) + decorr ..., one baseline
+    td_route: Optional[LocalRoute] = None   # two channels: the TD-dependent terms (td, contrast, sensitivity) form
+                                     # a second reward with its own baseline, credited through this route (e.g.
+                                     # GRADIENT_TRACE: the TD error judges the past window), while the terms of the
+                                     # moment (dv, vreg, rate, decorr, cancel) stay on `route` with theirs (e.g.
+                                     # GRADIENT_INSTANT). contrast_route / sensitivity_route must then be None
+    critic_eta: float = 0.0          # > 0 (with td_route): every synapse is an actor-critic agent on the TD channel's
+                                     # reward r_i (LocR2). Its critic V_ij = CritA + CritU * x_j (x_j its presynaptic
+                                     # trace, which the neuron's own noise does not affect, so the estimate stays
+                                     # unbiased) gives a local TD error d_ij = r_i + critic_gamma V_ij(t) - V_ij(t-1),
+                                     # which replaces (LocR2 - Loc2Mean) in the update; the critic learns by TD(lambda)
+                                     # with rate critic_eta (CritA += eta d, CritU += eta d CritC / (1 + CritC^2):
+                                     # normalised so a large input trace cannot make it overshoot; CritC a
+                                     # critic_lambda-trace of x_j). Slow critics predict only the state-level
+                                     # expectation, so the trial-to-trial variation the selection learns from stays
+    critic_level: str = "synapse"    # "synapse": the per-synapse critics above; "neuron": one linear critic per
+                                     # neuron on slowly filtered features of its own state (bias, voltage relative to
+                                     # the threshold, adaptation, the spike-trace mean, the inhibitory input's mean when
+                                     # decorr is on), V_i = sum_f w_f phi_f, local TD error
+                                     # d_i = r_i + critic_gamma V_i(t) - V_i(t-1) for all its synapses; TD(lambda) with
+                                     # a step normalised by 1 + |eligibility|^2. The reward belongs to the neuron, so
+                                     # its baseline does too; the credit stays in each synapse's noise-score trace
+    critic_feature_decay: float = 0.99   # filter of the voltage and adaptation features (~100 ms): they then depend
+                                     # only weakly on the current noise sample (a baseline must not track it)
+    critic_gamma: float = 0.977      # per step (0.5 per 30-step move)
+    critic_lambda: float = 0.977
     decorr_norm: str = "covariance"  # "covariance": the reward above (its size also shrinks when the neuron fires
                                      # less, so going quiet lowers the penalty); "correlation": divided by the
                                      # neuron's spiking spread sqrt(zbar (1 - zbar)) and its inhibition's s.d.:
@@ -266,6 +305,12 @@ class HiddenRuleConfig:
                                      # (the drift only lowers the near-threshold ones); a negative one reverses it.
                                      # Needs no noise. Stays with the drift under split_optimiser
     hebb_decay: float = 0.9999       # decay of the running mean of the postsynaptic spike trace
+    hebb_gate: str = "none"          # "none": the trace of (zpost - mean zpost) * ZFilter; "psi": times the
+                                     # postsynaptic pseudo-derivative psi, trace[(zpost - mean) * psi * ZFilter]: the
+                                     # contrast reward's expected local update computed directly (the derivative of
+                                     # the squared deviation, d(dev^2)/dW ~ 2 dev * psi * pre, with e-prop's
+                                     # eligibility psi * ZFilter in place of the noise-measured sensitivity), with
+                                     # no noise and no gradient part
     contrast_drift: float = 0.0      # c_K: the contrast leg, a drift with the squared deviation as its gate:
                                      # dW = lr * c_K * delta * trace[(dev^2 - mean dev^2) * pre * xi / sigma^2],
                                      # dev = zpost - mean zpost (the postsynaptic spike trace and its running mean,
@@ -283,6 +328,14 @@ class HiddenRuleConfig:
                                      # sign as G (both ascend the return; the drift instead descends its gate, which
                                      # is why its gate needs psi - psibar and G's -psibar has the opposite sign);
                                      # 1: centred, the REINFORCE part cancels on average (the pure local derivative)
+    contrast_drift_gate: str = "covariance"   # "covariance": the gate dev^2 (its derivative has a positive mean: firing
+                                     # more means more variance, so the mean TD error pushes every rate one way);
+                                     # "rate_neutral": dev^2 - F * zpost, F = mean dev^2 / mean zpost (the trace's
+                                     # Fano-like ratio, from the running means): a pure rate change leaves it
+                                     # unchanged (Poisson-like firing), so the mean TD error has no rate to push and
+                                     # the gate is centred by itself (use contrast_drift_centre 0). Expected update:
+                                     # delta * (2 dev - F) * sensitivity * pre, a BCM-like threshold at
+                                     # mean z + F / 2
     homeostat: float = 0.0           # c_H: c_H * mean|delta| * (psibar - psi_target) on the drift trace
     psi_target: float = 0.1
     psi_target_warmup: Optional[float] = None   # per-neuron homeostat target: each neuron captures its own psibar at
@@ -393,13 +446,33 @@ class HiddenRuleConfig:
         if self.backprop_signal not in ("noise", "activity"):
             raise ValueError(f"backprop_signal must be 'noise' or 'activity', not {self.backprop_signal!r}")
         has_contrast = self.local is not None and self.local.contrast != 0
+        if self.hebb_gate not in ("none", "psi"):
+            raise ValueError(f"hebb_gate must be 'none' or 'psi', not {self.hebb_gate!r}")
+        if self.contrast_drift_gate not in ("covariance", "rate_neutral"):
+            raise ValueError(f"contrast_drift_gate must be 'covariance' or 'rate_neutral', not {self.contrast_drift_gate!r}")
         if not 0.0 <= self.contrast_drift_centre <= 1.0:
             raise ValueError("contrast_drift_centre must be in [0, 1]")
         if self.contrast_drift != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
             raise ValueError("contrast_drift needs noise and estimator=TRACE")
         if (self.center_drift and self.drift == 0 and self.hebb == 0 and not has_contrast and self.contrast_drift == 0
+                and not (self.local is not None and self.local.sensitivity != 0)
                 and not (self.backprop != 0 and self.backprop_signal == "activity")):
             raise ValueError("center_drift needs drift != 0 (or hebb / contrast != 0)")
+        if self.local is not None and self.local.critic_level not in ("synapse", "neuron"):
+            raise ValueError("critic_level must be 'synapse' or 'neuron'")
+        if self.local is not None and self.local.critic_eta != 0 and self.local.td_route is None:
+            raise ValueError("critic_eta needs td_route (the critics act on the TD channel)")
+        if self.local is not None and self.local.td_route is not None:
+            if self.local.td_route is LocalRoute.WHOLE_TRACE or self.local.route is LocalRoute.WHOLE_TRACE:
+                raise ValueError("td_route needs GRADIENT_* routes")
+            if self.local.contrast_route is not None or self.local.sensitivity_route is not None:
+                raise ValueError("with td_route, contrast_route and sensitivity_route must be None (one TD channel)")
+        has_sens = self.local is not None and self.local.sensitivity != 0
+        if has_sens and self.estimator is Estimator.EXACT:
+            raise ValueError("the sensitivity reward is credited through the gradient score: it needs estimator=TRACE")
+        if has_sens and (self.local.sensitivity_route is LocalRoute.WHOLE_TRACE or
+                         (self.local.sensitivity_route is None and self.local.route is LocalRoute.WHOLE_TRACE)):
+            raise ValueError("the sensitivity reward needs a GRADIENT_* route (or its own sensitivity_route)")
         if has_contrast and self.estimator is Estimator.EXACT:
             raise ValueError("the contrast reward is credited through the gradient score: it needs estimator=TRACE")
         if has_contrast and self.local.contrast_route is LocalRoute.WHOLE_TRACE:
@@ -495,7 +568,7 @@ def get_hidden_rule(rule) -> HiddenRuleConfig:
         raise ValueError(f"unknown hidden rule preset '{rule}'; available: {sorted(PRESETS)}")
 
 
-_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "contrast_route": LocalRoute,
+_ENUM_FIELDS = {"noise": NoisePlacement, "estimator": Estimator, "route": LocalRoute, "contrast_route": LocalRoute, "sensitivity_route": LocalRoute, "td_route": LocalRoute,
                 "dv_mode": DVMode,
                 "eprop_scope": EpropScope}
 

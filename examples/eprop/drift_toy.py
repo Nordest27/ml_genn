@@ -74,7 +74,8 @@ def gate_shape(x, gate):
 
 
 def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=False, noise2=None, sigma2=None,
-             th_true=None, th_gate=None, gate_table=None, track=False, eif=None, resonator=None, plateau=None):
+             th_true=None, th_gate=None, gate_table=None, track=False, eif=None, resonator=None, plateau=None,
+             parts_k=None):
     """Replay target neuron j in window w (an int, or one window per rollout as an (R,) array) for R rollouts.
     noise: (R, T+1) Noise1 samples (noise[:, t] is drawn in step t and delivered in step t+1); g: (R, n_aff)
     weights (default: the recorded ones). gate: "drift" (psi - psibar with the code's psi), "psi" (psi alone), or
@@ -105,7 +106,10 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
     x = V - H - threshold (H = the neuron's own noise trace) before the
     spike decision, the Stein sensitivity sample w = z H / Var(H), and the spikes, for learning the centre online.
     Returns per step t = 1..T: score s, eligibility e for every afferent (R, T, n_aff) and the voltage after the
-    step (R, T) (and, with track, (x, w, z), each (R, T))."""
+    step (R, T) (and, with track, (x, w, z), each (R, T)).
+    parts_k: afferent indices; also returns a dict of per-step parts for them (to build other estimators offline):
+    "xi" the normalised noise trace kappa * NoiseTrace / SynSig^2 and "pre" the presynaptic trace at the synapse
+    stage (R, T, len(parts_k)), "psi" / "psibar" the gate values used there and "z" the spikes of the step (R, T)."""
     src, pre, g0, sig, _ = rec.afferents(j)
     deliver, trace = rec.inputs(j)
     R = noise.shape[0]
@@ -145,7 +149,13 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
         e1_out, e2_out = [], []
     nt = np.zeros((R, len(g0)))
     s_out, e_out, v_out = [], [], []
+    parts = {k: [] for k in ("xi", "pre", "psi", "psibar", "z")} if parts_k is not None else None
     for t in range(1, T + 1):
+        if parts is not None:   # the synapse stage of step t (before the noise trace decays)
+            pk = np.asarray(parts_k)
+            parts["xi"].append(kappa * nt[:, pk] / (sig[pk] * sig[pk] + 1e-6))
+            parts["pre"].append(np.broadcast_to(trace[w, t - 1][..., pk], (R, len(pk))).copy())
+            parts["psi"].append(st["Psi"].copy()); parts["psibar"].append(st["PsiBar"].copy())
         # 1. synapse dynamics (psi and psibar from the previous neuron update, presynaptic trace after step t-1)
         if stein:
             gt = zlast * H / VarH
@@ -226,6 +236,8 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
             st["PsiT"] = np.where(ref > 0, 0.0, (0.3 / rec.vth) * gate_shape((st["V"] - th) / rec.vth, gate))
             st["PsiTBar"] = 0.99 * st["PsiTBar"] + 0.01 * st["PsiT"]
         spk = (st["V"] >= th) & (ref <= 0)
+        if parts is not None:
+            parts["z"].append(spk.astype(np.float64))
         if (resonator is not None or plateau is not None) and track:
             psi_now = np.where(ref > 0, 0.0, (1.0 / rec.vth) * 0.3 * np.maximum(0.0, 1.0 - np.abs((st["V"] - th) / rec.vth)))
             e1_out.append(psi_now[:, None] * eps1); e2_out.append(psi_now[:, None] * epsV)
@@ -240,6 +252,8 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
         if plateau is not None and track:
             p_out.append(st["P"].copy())
         v_out.append(st["V"].copy())
+    if parts is not None:
+        return np.stack(s_out, 1), np.stack(e_out, 1), np.stack(v_out, 1), {k: np.stack(v, 1) for k, v in parts.items()}
     if return_state:
         return st, nt
     if track:
