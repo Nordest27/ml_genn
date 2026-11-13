@@ -116,7 +116,7 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
         groups.append(dict(name=s.name, source=sources.index(c.source()), pre=np.asarray(s.get_sparse_pre_inds()),
                            post=np.asarray(s.get_sparse_post_inds()), g=np.array(s.vars["g"].values),
                            syn_sig=np.array(s.vars["SynSig"].values) if "SynSig" in s.vars else None))
-    names = ("V", "A", "RefracTime", "Noise1", "Beta")
+    names = tuple(n for n in ("V", "A", "RefracTime", "Noise1", "Beta", "TdE") if n in tpop.vars)
     psi_vars = ("Psi", "PsiBar")
     spikes = [np.zeros((W, T + 1, z.src.num_neurons), dtype=bool) for z in zgroups]
     state = {n: np.zeros((W, T + 1, tpop.num_neurons), dtype=np.float32) for n in names + psi_vars}
@@ -163,6 +163,8 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
                         **{f"state_{n}": v for n, v in state.items()}, target_group=sg.name,
                         trace_lambda=float(cfg.get("trace_lambda", 0.0)), beta1=float(cfg.get("beta1", 0.99)))
     print(f"drift record: saved {out_path}", flush=True)
+    snapshot.restore(compiled_net)       # back to the recorded state: training can continue (cfg "repeat")
+    set_input()
     return "recorded"
 
 

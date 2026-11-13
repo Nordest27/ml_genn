@@ -75,7 +75,7 @@ def gate_shape(x, gate):
 
 def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=False, noise2=None, sigma2=None,
              th_true=None, th_gate=None, gate_table=None, track=False, eif=None, resonator=None, plateau=None,
-             parts_k=None):
+             parts_k=None, soma_sigma=None):
     """Replay target neuron j in window w (an int, or one window per rollout as an (R,) array) for R rollouts.
     noise: (R, T+1) Noise1 samples (noise[:, t] is drawn in step t and delivered in step t+1); g: (R, n_aff)
     weights (default: the recorded ones). gate: "drift" (psi - psibar with the code's psi), "psi" (psi alone), or
@@ -109,7 +109,9 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
     step (R, T) (and, with track, (x, w, z), each (R, T)).
     parts_k: afferent indices; also returns a dict of per-step parts for them (to build other estimators offline):
     "xi" the normalised noise trace kappa * NoiseTrace / SynSig^2 and "pre" the presynaptic trace at the synapse
-    stage (R, T, len(parts_k)), "psi" / "psibar" the gate values used there and "z" the spikes of the step (R, T)."""
+    stage (R, T, len(parts_k)), "psi" / "psibar" the gate values used there and "z" the spikes of the step (R, T).
+    soma_sigma: noise_site "soma" - the membrane receives soma_sigma * noise every step instead of the transmitting
+    synapses' SynSig * noise; the noise traces still record SynSig * noise when a synapse transmits."""
     src, pre, g0, sig, _ = rec.afferents(j)
     deliver, trace = rec.inputs(j)
     R = noise.shape[0]
@@ -173,7 +175,7 @@ def simulate(rec, j, w, noise, g=None, steps=None, gate="drift", return_state=Fa
         # 2. delivery of the spikes emitted in step t-1, with the noise drawn in step t-1
         d = deliver[w, t - 1]
         eps = sig[None, :] * noise[:, t - 1][:, None] * d
-        isyn = (g * d).sum(1) + eps.sum(1)
+        isyn = (g * d).sum(1) + (eps.sum(1) if soma_sigma is None else soma_sigma * noise[:, t - 1])
         nt += eps
         if track or gate_table is not None or th_true is not None or th_gate is not None:
             S_t = (sig[None, :] * d).sum(1)
@@ -286,7 +288,7 @@ def rule_filter(x, lam, beta1):
     return np.einsum("t,...tn->...n", w, np.stack(out, axis=-2))
 
 
-def drift(rec, synapses, h, rollouts=64, fd_rollouts=16, windows=None, seed=0, gate="drift"):
+def drift(rec, synapses, h, rollouts=64, fd_rollouts=16, windows=None, seed=0, gate="drift", soma_sigma=None):
     """synapses: indices into the target group's synapse arrays. For each: the Stein side (mean score) and the
     finite-difference derivative of the mean eligibility (weight +-h, common random numbers), per step and
     rule-averaged, with split halves (alternate windows) for repeatability. Averages over windows (inputs) and
@@ -302,14 +304,14 @@ def drift(rec, synapses, h, rollouts=64, fd_rollouts=16, windows=None, seed=0, g
         _, _, g0, _, ids = rec.afferents(j)
         k = ids.index((rec.target_group, syn))
         wr = np.repeat(windows, rollouts)
-        s, e, _ = simulate(rec, j, wr, rng.standard_normal((len(wr), rec.T1)), gate=gate)
+        s, e, _ = simulate(rec, j, wr, rng.standard_normal((len(wr), rec.T1)), gate=gate, soma_sigma=soma_sigma)
         S = s[:, :, k].reshape(nW, rollouts, -1).mean(1); E = e[:, :, k].reshape(nW, rollouts, -1).mean(1)
         wf = np.repeat(windows, fd_rollouts)
         noise = rng.standard_normal((len(wf), rec.T1))
         gp = np.tile(g0, (len(wf), 1)); gp[:, k] += h
         gm = np.tile(g0, (len(wf), 1)); gm[:, k] -= h
-        _, ep, _ = simulate(rec, j, wf, noise, g=gp, gate=gate)
-        _, em, _ = simulate(rec, j, wf, noise, g=gm, gate=gate)
+        _, ep, _ = simulate(rec, j, wf, noise, g=gp, gate=gate, soma_sigma=soma_sigma)
+        _, em, _ = simulate(rec, j, wf, noise, g=gm, gate=gate, soma_sigma=soma_sigma)
         D = ((ep[:, :, k] - em[:, :, k]) / (2 * h)).reshape(nW, fd_rollouts, -1).mean(1)
         for name, X in (("score", S), ("deriv", D), ("elig", E)):
             res[name].append(X.mean(0))

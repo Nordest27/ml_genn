@@ -2338,8 +2338,12 @@ def train_snake_agent_with_ipc(episodes=10000,
 
                 if monitor is not None and env.wait_count == env.wait_inc:
                     monitor.sample(compiled_net.genn_model.timestep, getattr(env, "switches", 0))
-                if HP["drift_check"] is not None and compiled_net.genn_model.timestep >= HP["drift_check"]["at_timestep"]:
+                if HP["drift_check"] is not None and compiled_net.genn_model.timestep >= HP["drift_check"].get(
+                        "_next", HP["drift_check"]["at_timestep"]):
                     import drift_check
+                    dc_k = HP["drift_check"].get("_done", 0)
+                    dc_rep = int(HP["drift_check"].get("repeat", 1))     # record mode: repeat every `every` steps
+                    dc_t0 = compiled_net.genn_model.timestep              # before recording (which advances it)
                     rates = obs_to_poisson_rate(obs)
                     drift_check.run(compiled_net, built, HP["hidden_rule"], train_callback_list,
                                     lambda: compiled_net.set_input({input_pop: rates}),
@@ -2347,8 +2351,19 @@ def train_snake_agent_with_ipc(episodes=10000,
                                      "beta1": (HP["optimiser_betas"] or [0.99 if HP["optimiser"] != "adam" else 0.9])[0],
                                      **HP["drift_check"]},
                                     f"outputs/{CSV_PREFIX}({REPETITION})_drift_"
-                                    f"{'record' if HP['drift_check'].get('mode') == 'record' else 'check'}.npz")
-                    raise SystemExit(0)
+                                    f"{'record' if HP['drift_check'].get('mode') == 'record' else 'check'}"
+                                    + (f"_{dc_k}" if dc_rep > 1 else "") + ".npz")
+                    if dc_rep > 1 and HP["drift_check"].get("mode") == "record" and dc_k + 1 < dc_rep:
+                        with open(f"outputs/{CSV_PREFIX}({REPETITION})_drift_record_times.txt", "a") as f_:
+                            f_.write(f"{dc_k} {dc_t0}\n")
+                        HP["drift_check"]["_done"] = dc_k + 1
+                        HP["drift_check"]["_next"] = (compiled_net.genn_model.timestep
+                                                      + int(HP["drift_check"].get("every", 5000)))
+                    else:
+                        if dc_rep > 1:
+                            with open(f"outputs/{CSV_PREFIX}({REPETITION})_drift_record_times.txt", "a") as f_:
+                                f_.write(f"{dc_k} {dc_t0}\n")
+                        raise SystemExit(0)
                 if normaliser is not None and env.wait_count == env.wait_inc:
                     normaliser.move()
                 if probe is not None and env.wait_count == env.wait_inc and not done:

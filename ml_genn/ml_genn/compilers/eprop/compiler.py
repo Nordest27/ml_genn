@@ -559,6 +559,11 @@ class EPropCompiler(Compiler):
             if (pop_rule.noise is NoisePlacement.NODE
                     and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire)):
                 neuron_logic.enable_node_noise(model_copy)
+            if pop_rule.noise_site == "soma":
+                if not isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+                    raise NotImplementedError("noise_site 'soma' supports ALIF hidden neurons only")
+                neuron_logic.add_soma_noise(model_copy, float(np.exp(pop_rule.log_syn_sigma - 5.0))
+                                            * pop_rule.soma_noise_gain)
         if self.inhibitory_reversal is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             neuron_logic.add_inhibitory_reversal(model_copy, self.inhibitory_reversal)
         elif self.inhibitory_channel and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):

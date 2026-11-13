@@ -449,6 +449,17 @@ def add_intrinsic_plasticity(model_copy, eta=1e-5, psi_target=0.07, decay=0.999,
         """)
 
 
+def add_soma_noise(model_copy, sigma):
+    """noise_site "soma": the neuron's own noise sample enters the membrane directly, sigma * Noise1 every step
+    (instead of SynSig * Noise1 per transmitting synapse). Noise1 is still the previous step's sample here (it is
+    redrawn by the code appended after the membrane update), the one the synapses would have delivered."""
+    sim = model_copy.model.get("sim_code", "")
+    source = "V = Alpha * V + Isyn"
+    if sim.count(source) != 1:
+        raise RuntimeError("soma noise: the ALIF membrane update was not found exactly once")
+    model_copy.replace_sim_code(source, f"V = Alpha * V + Isyn + {float(sigma)!r} * Noise1")
+
+
 def add_inhibitory_channel(model_copy):
     """Route inhibitory synapses to their own input ISynInh, added to the membrane like Isyn (current-based, as
     before); used when the neuron needs to know the inhibition it receives (decorrelation reward)."""

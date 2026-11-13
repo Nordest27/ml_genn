@@ -275,6 +275,106 @@ def test_contrast_route_credits_it_on_its_own():
         hidden_rule_from_dict({"preset": "proposed", "local": {"contrast": 1.0, "contrast_route": "WHOLE_TRACE"}})
 
 
+def test_gated_contrast_baselines():
+    """contrast_baseline: delta * (ContrD - mean ContrD) or delta * (ContrD - per-synapse critic of ContrD)."""
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, contrast=2.0,
+                          contrast_route=LocalRoute.GRADIENT_TRACE, contrast_baseline="gated_mean")
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True, local=loc), **kw)["model"]
+    syn, post, pv = m["synapse_dynamics_code"], m["post_dynamics_code"], {v[0] for v in m["post_vars"]}
+    assert {"ContrQ", "ContrMod", "ContrQMean"} <= pv
+    # the mean is updated with the previous ContrQ before ContrQ takes this step's ContrD (it excludes the sample)
+    assert post.index("ContrQMean = ") < post.index("ContrQ = ContrD;") < post.index("ContrD = Lambda")
+    assert "ContrMod = (TdE_post + PRew_post - TdMean);" in post
+    dg = syn[syn.index("DeltaG +="):].split(";")[0]
+    assert "2.0 * ContrMod * (ContrQ - ContrQMean) * RLNoiseGtrace" in dg and "ContrR - ContrMean" not in dg
+
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True,
+                                      local=replace(loc, contrast_baseline="gated_synapse", contrast_critic_eta=0.01)),
+                              **kw)["model"]
+    syn, pv = m["synapse_dynamics_code"], {v[0] for v in m["post_vars"]}
+    assert {"CCritA", "CCritU"} <= {v[0] for v in m["vars"]} and "ContrQMean" not in pv
+    assert syn.index("cCritQ = CCritA + CCritU * ZFilter") < syn.index("DeltaG +=") < syn.index("CCritA += 0.01")
+    assert "2.0 * ContrMod * (ContrQ - cCritQ) * RLNoiseGtrace" in syn
+    assert "CCritU += 0.01 * cCritErr * ZFilter / (1.0 + ZFilter * ZFilter);" in syn
+
+    # the default is unchanged, and the gated modes need the contrast reward on its own route
+    m = build_td_hidden_model(replace(PRESETS["drift_only"], drift=0.0, center_drift=True,
+                                      local=replace(loc, contrast_baseline="mean")), **kw)["model"]
+    assert "(ContrR - ContrMean) * RLNoiseGtrace" in m["synapse_dynamics_code"]
+    assert "ContrQ" not in {v[0] for v in m["post_vars"]}
+    with pytest.raises(ValueError):
+        replace(PRESETS["drift_only"], local=replace(loc, contrast_route=None))
+    with pytest.raises(ValueError):
+        replace(PRESETS["drift_only"], local=replace(loc, contrast_baseline="gated"))
+
+
+def test_gated_synapse_contrast_critics_train(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "drift_only", "drift": 0.0, "center_drift": True,
+                                                         "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0,
+                                                                   "rate": 0.0, "contrast": 1.0,
+                                                                   "contrast_route": "GRADIENT_TRACE",
+                                                                   "contrast_baseline": "gated_synapse",
+                                                                   "contrast_critic_eta": 1e-2}})
+    crit = {}
+
+    def probe(c, stage):
+        if stage == "end":
+            for conn, p in c.connection_populations.items():
+                if conn.target() is hid and not conn.is_feedback:
+                    for v in ("CCritA", "CCritU"):
+                        p.vars[v].pull_from_device(); crit.setdefault(v, []).append(np.array(p.vars[v].values))
+
+    h = _run(compiled, inp, pol, val, steps=100, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    a, u = np.concatenate(crit["CCritA"]), np.concatenate(crit["CCritU"])
+    assert np.all(np.isfinite(a)) and np.all(np.isfinite(u)) and np.any(a != 0.0) and np.any(u != 0.0)
+    assert np.all(a >= 0.0) or np.mean(a) > 0     # they learn to predict ContrD, which is never negative
+
+
+def test_soma_noise_site_keeps_the_synaptic_bookkeeping():
+    """noise_site "soma": synapses deliver g only but still add SynSig * Noise1 to their noise trace; SynSig is the
+    somatic amplitude exp(log_syn_sigma - 5) * soma_noise_gain."""
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    syn = build_td_hidden_model(PRESETS["proposed"], **kw)
+    soma = build_td_hidden_model(replace(PRESETS["proposed"], noise_site="soma", soma_noise_gain=4.0), **kw)
+    assert "addToPost(g + eps);" in syn["model"]["pre_spike_syn_code"]
+    code = soma["model"]["pre_spike_syn_code"]
+    assert "addToPost(g);" in code and "addToPost(g + eps)" not in code and "NoiseTrace += eps;" in code
+    assert soma["var_vals"]["LogSynSig"] == pytest.approx(syn["var_vals"]["LogSynSig"] + np.log(4.0))
+    # the scores are unchanged (same per-synapse trace, same normalisation)
+    assert soma["model"]["synapse_dynamics_code"] == syn["model"]["synapse_dynamics_code"]
+    for bad in (dict(noise_site="dendrite"), dict(noise_site="soma", soma_noise_gain=0.0),
+                dict(noise_site="soma", noise_proxy=True)):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], **bad)
+
+
+def test_soma_noise_adds_the_sample_to_the_membrane():
+    from ml_genn.compilers.eprop import neuron_logic
+
+    class _Copy:
+        def __init__(self):
+            self.model = {"sim_code": "V = Alpha * V + Isyn + 0.0 * PertEps;\nA *= Rho;"}
+
+        def replace_sim_code(self, a, b):
+            self.model["sim_code"] = self.model["sim_code"].replace(a, b)
+
+    m = _Copy()
+    neuron_logic.add_soma_noise(m, 0.02)
+    assert m.model["sim_code"].startswith("V = Alpha * V + Isyn + 0.02 * Noise1 + 0.0 * PertEps;")
+
+
+def test_soma_noise_trains(request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed", "noise_site": "soma",
+                                                         "soma_noise_gain": 2.0})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+
+
 def test_backprop_activity_sends_the_spike_deviation_and_raises_drive_after_positive_td():
     kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
     cfg = replace(PRESETS["proposed_backprop"], backprop_signal="activity", center_drift=True)

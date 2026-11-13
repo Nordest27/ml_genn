@@ -148,6 +148,17 @@ class LocalObjectives:
                                      # GRADIENT_TRACE: credited on its own (own running-mean baseline) through the
                                      # instantaneous score or the gradient score's lambda-trace, whatever `route` the
                                      # other local rewards use (GRADIENT_TRACE reproduces the runs of 2026-11-11)
+    contrast_baseline: str = "mean"  # baseline of the contrast reward on its own route (contrast_route), whose reward
+                                     # is delta * ContrD: "mean": its running mean (ContrR - ContrMean);
+                                     # "gated_mean": delta * (ContrD - running mean of ContrD); "gated_synapse":
+                                     # delta * (ContrD - (CCritA + CCritU * ZFilter)), every synapse a linear critic of
+                                     # the neuron's ContrD on its own presynaptic trace, learned by the reward-free
+                                     # rule u += contrast_critic_eta * (ContrD - prediction) * x / (1 + x^2). The gated
+                                     # baselines cut the variance of the drift-like part delta * dContrD/dW (6-8x in
+                                     # the open-loop replay of 2026-11-13) but weight the task-gradient part
+                                     # d delta/dW by the residual (ContrD - prediction) instead of ContrD: the
+                                     # direction is then left to G / local.td
+    contrast_critic_eta: float = 1e-3   # learning rate of the "gated_synapse" critics
     sensitivity: float = 0.0         # weight of the sensitivity reward, the drift as a TD-gated local reward:
                                      # r_i = -(delta - mean delta) * trace[psi - psibar] (delta centred with the rule's
                                      # center_drift): after a better-than-expected outcome a neuron is rewarded for
@@ -404,6 +415,16 @@ class HiddenRuleConfig:
                                      # ~10-15 Hz without a clear purpose (the regularisers keep epsA)
     kappa: bool = True               # multiply the score by 1 - Alpha^2
     log_syn_sigma: float = 0.0       # initial LogSynSig; SynSig = exp(LogSynSig - 5) (weight noise)
+    noise_site: str = "synapse"      # WEIGHT_SHARED: where the neuron's noise sample Noise1 enters the membrane.
+                                     # "synapse": every transmitting synapse delivers SynSig * Noise1 (the injected
+                                     # noise grows with the number of inputs firing in a step). "soma": the neuron adds
+                                     # sigma * Noise1 every step (uniform with activity; sigma = exp(log_syn_sigma - 5)
+                                     # * soma_noise_gain), and the synapses only keep the bookkeeping: a synapse adds
+                                     # sigma * Noise1 to its noise trace when it transmits (the steps at which its
+                                     # weight enters the membrane, where Stein's identity needs the noise), so the
+                                     # scores keep their per-synapse form. Same sample and step as the synapse path
+    soma_noise_gain: float = 1.0     # "soma": the somatic amplitude in units of exp(log_syn_sigma - 5) (e.g. the mean
+                                     # number of inputs firing per step, to match the synapse path's total noise)
     psibar_decay: float = 0.99
     coactivity_decay: Optional[float] = None   # per-synapse co-activity trace CoAct = d CoAct + (1 - d) ZFilter Psi
                                      # (presynaptic activity while the postsynaptic neuron is eligible) and an age
@@ -438,6 +459,14 @@ class HiddenRuleConfig:
             raise ValueError("eprop_broadcast needs eprop != 0 and no eprop_center_value (there is no critic part)")
         if self.score_adaptation not in (True, False, "drift", "gradient"):
             raise ValueError("score_adaptation must be true, false, 'drift' or 'gradient'")
+        if self.noise_site not in ("synapse", "soma"):
+            raise ValueError(f"noise_site must be 'synapse' or 'soma', not {self.noise_site!r}")
+        if self.noise_site == "soma" and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.noise_proxy
+                                          or not self.inject_noise or self.estimator is Estimator.EXACT):
+            raise ValueError("noise_site 'soma' needs WEIGHT_SHARED noise, the trace estimator, no noise_proxy and "
+                             "inject_noise")
+        if self.soma_noise_gain <= 0:
+            raise ValueError("soma_noise_gain must be > 0")
         if not self.inject_noise and not self.noise_proxy:
             raise ValueError("inject_noise=False needs noise_proxy (the score would read noise that is never injected)")
         if self.backprop != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):
@@ -467,6 +496,14 @@ class HiddenRuleConfig:
                 raise ValueError("td_route needs GRADIENT_* routes")
             if self.local.contrast_route is not None or self.local.sensitivity_route is not None:
                 raise ValueError("with td_route, contrast_route and sensitivity_route must be None (one TD channel)")
+        if self.local is not None and self.local.contrast_baseline not in ("mean", "gated_mean", "gated_synapse"):
+            raise ValueError("contrast_baseline must be 'mean', 'gated_mean' or 'gated_synapse', not "
+                             f"{self.local.contrast_baseline!r}")
+        if self.local is not None and self.local.contrast_baseline != "mean" and not (
+                has_contrast and self.local.contrast_route is not None
+                and self.local.contrast_route is not self.local.route):
+            raise ValueError("a gated contrast_baseline needs the contrast reward on its own route (contrast != 0 and "
+                             "contrast_route set, different from route)")
         has_sens = self.local is not None and self.local.sensitivity != 0
         if has_sens and self.estimator is Estimator.EXACT:
             raise ValueError("the sensitivity reward is credited through the gradient score: it needs estimator=TRACE")

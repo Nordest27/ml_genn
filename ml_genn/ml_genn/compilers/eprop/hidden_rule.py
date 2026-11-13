@@ -111,6 +111,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     # the contrast reward's credit: inside the shared local reward (LocR, its route), or on its own route
     contrast_route = (local.contrast_route or local.route) if use_contrast else None
     contrast_own = use_contrast and local.contrast_route is not None and local.contrast_route is not local.route
+    c_gate = contrast_own and local.contrast_baseline != "mean"        # delta-gated contrast baseline
+    c_syn = c_gate and local.contrast_baseline == "gated_synapse"      # ... from per-synapse critics of ContrD
     use_sens = local is not None and local.sensitivity != 0
     td_route = local.td_route if local is not None else None      # the second (TD) channel, if any
     use_critic = td_route is not None and local.critic_eta != 0      # actor-critics on that channel
@@ -207,7 +209,9 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         vars_.append(("eFiltered", "scalar")); var_vals["eFiltered"] = 0.0
     if weight_noise:
         vars_ += [("LogSynSig", "scalar"), ("SynSig", "scalar")]
-        var_vals.update({"LogSynSig": cfg.log_syn_sigma, "SynSig": 0.0})
+        # soma noise: SynSig is the bookkeeping amplitude, equal to the soma's (exact Stein scaling of the score)
+        var_vals.update({"LogSynSig": cfg.log_syn_sigma + (float(np.log(cfg.soma_noise_gain))
+                                                           if cfg.noise_site == "soma" else 0.0), "SynSig": 0.0})
         if not exact:
             vars_.append(("NoiseTrace", "scalar")); var_vals["NoiseTrace"] = 0.0
         if proxy:
@@ -223,6 +227,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("EligMean", use_P and cfg.center_eligibility is not None),
                        ("RLHebbTrace", use_hebb), ("RLContrTrace", use_cdrift),
                        ("CritA", use_critic), ("CritU", use_critic), ("CritC", use_critic), ("CritV", use_critic),
+                       ("CCritA", c_syn), ("CCritU", c_syn),
                        ("XiSq", fn_noise), ("ReviveTrace", use_revive),
                        ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None)):
         if used:
@@ -237,6 +242,7 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("AbsTd", use_abs_td), ("HebbZ", use_ztrace), ("HebbMean", use_ztrace),
                        ("DevMean", use_dev_mean),
                        ("ContrD", use_contrast), ("ContrR", use_contrast), ("ContrMean", contrast_own),
+                       ("ContrQ", c_gate), ("ContrMod", c_gate), ("ContrQMean", c_gate and not c_syn),
                        ("SensD", use_sens), ("SensR", use_sens), ("SensMean", sens_own),
                        ("LocR", use_local_post), ("LocMean", use_local_post),
                        ("LocR2", td_route is not None), ("Loc2Mean", td_route is not None),
@@ -281,6 +287,11 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         post_dyn.append("FAvg *= AlphaFAv;")
     if use_contrast:   # the neuron's reward: the TD error times the trace of its squared deviation from its mean
         mod_c = "(TdE_post + PRew_post - TdMean)" if cfg.center_drift else "(TdE_post + PRew_post)"
+        if c_gate:   # the factors of ContrR for a delta-gated baseline (the mean of past ContrD, excluding this one)
+            if not c_syn:
+                post_dyn.append(f"ContrQMean = {_f(cfg.td_stats_decay)} * ContrQMean + "
+                                f"{_f(1 - cfg.td_stats_decay)} * ContrQ;")
+            post_dyn.append(f"ContrQ = ContrD;\nContrMod = {mod_c};")
         post_dyn.append(f"ContrR = {mod_c} * ContrD;")
         if contrast_own:
             post_dyn.append(f"ContrMean = {_f(cfg.td_stats_decay)} * ContrMean + {_f(1 - cfg.td_stats_decay)} * ContrR;")
@@ -397,7 +408,8 @@ else {
     accumulate = "FreshEps += eps;" if exact else "NoiseTrace += eps;"
     if cfg.noise is NoisePlacement.WEIGHT_SHARED:
         pre_spike_syn = ("SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = SynSig * Noise1;\n"
-                         + ("addToPost(g + eps);\n" if cfg.inject_noise else "addToPost(g);\n")
+                         + ("addToPost(g + eps);\n" if cfg.inject_noise and cfg.noise_site == "synapse"
+                            else "addToPost(g);\n")       # soma: the neuron injects it; the trace still records it
                          + ("ProxyFlag1 = 1.0;" if proxy else accumulate))
     elif cfg.noise is NoisePlacement.WEIGHT_INDEPENDENT:
         pre_spike_syn = (_HASH_NOISE + "SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = SynSig * synNoise;\n"
@@ -509,7 +521,14 @@ else {
         g_terms.add(len(dg) - 1)
     if contrast_own:   # the contrast reward on its own route (factor_norm: a local objective plus the TD factor)
         score_c = "RLNoiseGtrace" if contrast_route is LocalRoute.GRADIENT_TRACE else f"({g_score})"
-        dg.append(("FnTd * " if fn is not None else "") + f"{_f(local.contrast)} * (ContrR - ContrMean) * {score_c}")
+        if c_syn:    # every synapse a linear critic of the neuron's ContrD on its own presynaptic trace
+            syn.append("const scalar cCritQ = CCritA + CCritU * ZFilter;")
+            adv_c = "ContrMod * (ContrQ - cCritQ)"
+        elif c_gate:
+            adv_c = "ContrMod * (ContrQ - ContrQMean)"
+        else:
+            adv_c = "(ContrR - ContrMean)"
+        dg.append(("FnTd * " if fn is not None else "") + f"{_f(local.contrast)} * {adv_c} * {score_c}")
         g_terms.add(len(dg) - 1)
     if fn is not None:
         # each factor divided by its running RMS (bias-corrected: the means start at t = 0, dt = 1 ms) plus the floor
@@ -527,6 +546,10 @@ else {
             syn.append("DeltaGG += " + "\n    + ".join(dgg) + ";")
     if dg:
         syn.append("DeltaG += " + "\n    + ".join(dg) + ";")
+    if c_syn:   # the critics learn after their prediction was used (reward-free: the target is the neuron's ContrD)
+        ce = _f(local.contrast_critic_eta)
+        syn.append(f"{{\nconst scalar cCritErr = ContrQ - cCritQ;\nCCritA += {ce} * cCritErr;\n"
+                   f"CCritU += {ce} * cCritErr * ZFilter / (1.0 + ZFilter * ZFilter);\n}}")
     if send_back:
         # the postsynaptic neuron's gradient score (the gradient part without the presynaptic factor), sent back
         # through this synapse's own weight: the presynaptic neuron receives sum_post g * score_post
