@@ -787,19 +787,21 @@ class ReachEnv:
     channel 2 (with `walls`): everything outside the square. Each move the agent's velocity is the action (a 2D vector,
     clipped to unit length) times `speed`; the reward is `progress` x (distance before - distance after), plus
     `reach_reward` when the target is within `radius` (the episode ends; `snake` grows by one), and the episode
-    ends without a bonus after `max_moves`. The optimal action in every state is the unit vector to the target, so
+    ends without a bonus after `max_moves`. `wall_penalty`: a move that would leave the square (the position is
+    clipped to it) costs this much; with `wall_end` the episode also ends there (like Snake's walls). The optimal action in every state is the unit vector to the target, so
     `last_cos` (the cosine between the action taken and that direction) measures per-state correctness. `ctype`
     bins the state into 16 types for the move log: 8 direction sectors x 2 distance bins (near: < `near`).
     Exposes the Snake interface the training loop uses (wait_count / wait_inc, snake, img)."""
 
     def __init__(self, wait_inc, inp_shape, speed=0.08, radius=0.08, progress=10.0, reach_reward=1.0, max_moves=40,
-                 near=0.3, noise=0.0, blob=1, walls=False, seed=None):
+                 near=0.3, noise=0.0, blob=1, walls=False, seed=None, wall_penalty=0.0, wall_end=False):
         self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
         self.inp_shape = tuple(inp_shape)
         self.speed, self.radius, self.progress, self.reach_reward = float(speed), float(radius), float(progress), \
             float(reach_reward)
         self.max_moves, self.near, self.noise, self.blob = int(max_moves), float(near), float(noise), int(blob)
         self.walls = bool(walls)
+        self.wall_penalty, self.wall_end = float(wall_penalty), bool(wall_end)
         self.rng = np.random.default_rng(seed)
         self.switches = 0
         self.snake, self.done, self.moves = [None], False, 0
@@ -874,11 +876,17 @@ class ReachEnv:
         d0 = np.linalg.norm(self.offset)
         self.last_cos = float(a @ self.offset / (np.linalg.norm(a) * d0)) if np.linalg.norm(a) > 0 else 0.0
         self.last_speed = float(np.linalg.norm(a))
-        self.pos = np.clip(self.pos + self.speed * a, 0.0, 1.0)
+        new = self.pos + self.speed * a
+        hit = bool(np.any(new < 0.0) or np.any(new > 1.0))
+        self.pos = np.clip(new, 0.0, 1.0)
         self.moves += 1
         d1 = np.linalg.norm(self.offset)
         reward = self.progress * (d0 - d1)
-        if d1 < self.radius:
+        if hit and self.wall_penalty != 0.0:
+            reward -= self.wall_penalty
+        if hit and self.wall_end:
+            self.done = True
+        elif d1 < self.radius:
             self.snake.append(None)
             self.done = True
             reward += self.reach_reward

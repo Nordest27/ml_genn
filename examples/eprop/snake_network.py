@@ -89,6 +89,42 @@ class SlowSpec:
 
 
 @dataclass
+class VolumeSpec:
+    """A layer as a 3D volume (a randomly connected 3D graph): the layer's E and I populations are read as (x, y, z)
+    blocks, the third shape axis being depth (`depth` slabs) instead of channels. Both populations cover the same
+    volume (an I grid coarser in x, y is spread over the E sheet). Every pair of neurons is connected with probability
+    p_max * exp(-d^2 / 2 sigma^2) + p_global, d the 3D distance in E-sheet cells (toroidal in x, y; open in z, slabs
+    `z_spacing` cells apart). The input reaches only the first `input_depth` slabs and the fields read only the last
+    `output_depth` slabs, so information must cross (depth - input_depth - output_depth) slabs, through local
+    connections or the sparse random long-range ones, to reach the motor output. Weights as the toroidal p_max
+    connections: mean = sign * mean_scale (x inh_scale for I sources) / sqrt(expected fan-in), from the layer's
+    `internal` (E sources) / `internal_i` (I sources) ConnSpecs, the network's `input` ConnSpec (input -> front slabs)
+    and the fields' `conn` / `conn_i` (back slabs -> fields), so the rate calibration of the input and the field
+    connections works unchanged. Only for a network with a single hidden layer and no slow sub-population."""
+    depth: int = 8
+    z_spacing: float = 1.0           # distance between slabs, in E-sheet cells
+    sigma_cells: float = 1.0         # local kernel width (E-sheet cells), connections from E sources
+    inh_sigma_ratio: float = 1.0     # ... from I sources: sigma_cells * this
+    z_shift: float = 0.0             # E sources: the kernel is centred z_shift slabs deeper than the source (a net
+                                     # front -> back flow on top of the recurrence; 0: isotropic)
+    p_max: float = 0.8
+    p_global: float = 0.01           # every pair, whatever the distance (random long-range connections)
+    k_global: Optional[float] = None  # instead of p_global (which is then ignored): long-range connections as a count,
+                                     # placed on top of the local ones (never duplicating one, no self-connections);
+                                     # a fractional part is a per-neuron Bernoulli, so k_global is the exact mean
+    k_global_mode: str = "in"        # "in": every target neuron receives k_global from E sources drawn uniformly over
+                                     # the volume; "out": every E source sends k_global to uniform random targets
+    k_global_i: Optional[float] = None  # the same for I sources; None: as p_global would give, i.e. "in": k_global *
+                                     # n_I / n_E per target, "out": k_global per I source
+    input_depth: int = 1             # input -> slabs z < input_depth
+    input_sigma_cells: float = 1.0   # input -> front slabs: 2D kernel width in E-sheet cells
+    input_p_max: float = 0.8
+    output_depth: int = 1            # slabs z >= depth - output_depth -> fields
+    field_sigma_cells: float = 1.0   # back slabs -> fields: 2D kernel width in E-sheet cells
+    field_p_max: float = 0.8
+
+
+@dataclass
 class LayerSpec:
     e_shape: Shape = (20, 20, 3)
     i_shape: Shape = (15, 15, 3)
@@ -121,6 +157,7 @@ class LayerSpec:
                                                                # its I population only (top-down signals then regulate
                                                                # the previous layer through its inhibition, never drive it)
     slow: Optional[SlowSpec] = None                            # a slow excitatory sub-population (None: none)
+    volume: Optional[VolumeSpec] = None                        # the layer as a 3D volume (see VolumeSpec)
 
 
 @dataclass
@@ -139,6 +176,13 @@ class FieldSpec:
     internal_i: Optional[ConnSpec] = None  # ... the connections from the field's I population (None: internal)
     i_shape: Optional[Shape] = None        # ... the field I population's shape (None: the field's)
     fan_in: Optional[float] = None         # ... their fan-in (toroidal connectivity without p_max; None: the last layer's)
+    skip_from: Optional[list] = None       # skip connections: earlier layers (1-based, not the last) that also project
+                                           # to the fields, E (and slow) and I populations, as the last layer does. With
+                                           # [1] the fields read L1 exactly as in the 1-layer network (same conn), so a
+                                           # deep network with the skip contains the shallow one
+    skip_conn: Optional[ConnSpec] = None   # ... their E connection (None: conn)
+    skip_conn_i: Optional[ConnSpec] = None  # ... their I connection (None: conn_i, else the skip E connection)
+                                            # (set skip_conn_i too when skip_conn changes the E weights)
 
 
 @dataclass
@@ -358,6 +402,93 @@ def connectivity(conn: ConnSpec, src_shape, sign, fan_in=None, sigma=None, tgt_s
                               exact=exact)
 
 
+def volume_positions(shape, sheet_side, depth_axis, z_spacing=1.0):
+    """(N, 3) positions of a population's neurons in E-sheet cells, flat C order: x, y from the first two axes (scaled
+    to the sheet), z = index * z_spacing along the third axis if it is depth, else 0 (channels share a location)."""
+    a, b, c = shape
+    i, j, k = np.meshgrid(np.arange(a), np.arange(b), np.arange(c), indexing="ij")
+    pos = np.stack([(i + 0.5) * sheet_side / a, (j + 0.5) * sheet_side / b,
+                    k * z_spacing if depth_axis else np.zeros_like(k, dtype=float)], -1).reshape(-1, 3)
+    return pos.astype(float)
+
+
+def _global_pairs(rng, n_from, pool, k, exclude_keys, key_of, same_idx=None, max_rounds=50):
+    """Exactly k (fractional part: Bernoulli) distinct partners per element of n_from (an index array), drawn
+    uniformly from `pool`, avoiding keys in exclude_keys (existing pairs) and self (same_idx: the element's own index
+    in pool space). key_of(a, b) -> int64 pair key. Returns (from, to) index arrays."""
+    if k is None or k <= 0 or len(n_from) == 0 or len(pool) == 0:
+        return np.zeros(0, int), np.zeros(0, int)
+    base = int(np.floor(k))
+    counts = base + (rng.random_sample(len(n_from)) < (k - base)).astype(int)
+    counts = np.minimum(counts, len(pool) - (1 if same_idx is not None else 0))
+    a = np.repeat(n_from, counts)
+    b = pool[rng.randint(0, len(pool), len(a))]
+    excl = np.unique(np.asarray(exclude_keys, np.int64))
+    for _ in range(max_rounds):
+        keys = key_of(a, b)
+        bad = np.isin(keys, excl)
+        if same_idx is not None:
+            bad |= a == b
+        order = np.argsort(keys, kind="stable")      # duplicates within the draw: keep the first
+        dup = np.zeros(len(keys), bool)
+        ks = keys[order]
+        dup[order[1:]] = ks[1:] == ks[:-1]
+        bad |= dup
+        if not bad.any():
+            break
+        b[bad] = pool[rng.randint(0, len(pool), int(bad.sum()))]
+    keep = ~bad
+    return a[keep], b[keep]
+
+
+def volume_connectivity(src_pos, tgt_pos, period, sigma, p_max, p_global, sign, mean_scale, sd_scale, inh_scale,
+                        src_mask=None, tgt_mask=None, same=False, rng=None, chunk=512, z_shift=0.0,
+                        k_global=None, k_global_mode="in"):
+    """Explicit 3D distance-dependent connectivity (toroidal in x, y with `period`, open in z), p = p_max exp(-d^2 /
+    2 sigma^2) + p_global (at most 1), no self-connections when `same`; only sources in src_mask and targets in
+    tgt_mask. Weights Normal(sign * m / sqrt(K), sd_scale / sqrt(K)), m = mean_scale (x inh_scale for sign -1), K the
+    expected fan-in of a connected target (at least 1). With k_global (p_global must then be 0): long-range
+    connections as a count on top of the local ones, k_global per target ("in") or per source ("out"), see
+    VolumeSpec.k_global."""
+    rng = np.random if rng is None else rng
+    ns, nt = len(src_pos), len(tgt_pos)
+    src_ok = np.ones(ns, bool) if src_mask is None else np.asarray(src_mask, bool)
+    tgt_idx = np.flatnonzero(np.ones(nt, bool) if tgt_mask is None else np.asarray(tgt_mask, bool))
+    pre, post, k_sum = [], [], 0.0
+    for c0 in range(0, len(tgt_idx), chunk):
+        t = tgt_idx[c0:c0 + chunk]
+        d = tgt_pos[t, None, :] - src_pos[None, :, :]
+        d[..., 2] -= z_shift                    # the kernel's centre: z_shift deeper than the source
+        d = np.abs(d)
+        d[..., :2] = np.minimum(d[..., :2], period - d[..., :2])
+        p = np.minimum(p_max * np.exp(-(d ** 2).sum(-1) / (2.0 * sigma ** 2)) + p_global, 1.0) * src_ok[None, :]
+        if same:
+            p[np.arange(len(t)), t] = 0.0
+        k_sum += p.sum()
+        ti, si = np.nonzero(rng.random_sample(p.shape) < p)
+        pre.append(si); post.append(t[ti])
+    pre, post = np.concatenate(pre) if pre else np.zeros(0, int), np.concatenate(post) if post else np.zeros(0, int)
+    if k_global is not None and k_global > 0:
+        if p_global:
+            raise ValueError("volume_connectivity: give p_global or k_global, not both")
+        src_idx = np.flatnonzero(src_ok)
+        key = lambda s_, t_: np.asarray(t_, np.int64) * ns + np.asarray(s_, np.int64)
+        existing = key(pre, post)
+        if k_global_mode == "in":
+            gt, gs = _global_pairs(rng, tgt_idx, src_idx, k_global, existing, lambda t_, s_: key(s_, t_),
+                                   same_idx=True if same else None)
+        elif k_global_mode == "out":
+            gs, gt = _global_pairs(rng, src_idx, tgt_idx, k_global, existing, key, same_idx=True if same else None)
+        else:
+            raise ValueError(f"k_global_mode: 'in' or 'out', not {k_global_mode!r}")
+        pre, post = np.concatenate([pre, gs]), np.concatenate([post, gt])
+        k_sum += len(gs)
+    k = max(1.0, k_sum / max(1, len(tgt_idx)))
+    m = mean_scale * (inh_scale if sign == -1 else 1.0)
+    w = rng.normal((sign or 0) * m / np.sqrt(k), sd_scale / np.sqrt(k), len(pre))
+    return Explicit(pre_ind=pre, post_ind=post, weight=w)
+
+
 def _alif(neuron: NeuronSpec, node_sigma, black_box=None, integrate_during_refrac=True, resonator=None,
          plateau=None):
     kw = dict(v_thresh=neuron.v_thresh, tau_mem=neuron.tau_mem, tau_refrac=neuron.tau_refrac,
@@ -371,6 +502,17 @@ def _alif(neuron: NeuronSpec, node_sigma, black_box=None, integrate_during_refra
         return BlackBoxALIF(heterogeneity=float(black_box.get("h", 0.0)), black_box_seed=int(black_box.get("seed", 0)),
                             **kw)
     return AdaptiveLeakyIntegrateFire(**kw)
+
+
+def _volume_k_global(vs, sign, n_e, n_i):
+    """The long-range count of a volume projection from E (sign > 0) or I sources (see VolumeSpec.k_global_i)."""
+    if vs.k_global is None:
+        return None
+    if sign > 0:
+        return float(vs.k_global)
+    if vs.k_global_i is not None:
+        return float(vs.k_global_i)
+    return float(vs.k_global) * (n_i / n_e if vs.k_global_mode == "in" else 1.0)
 
 
 def _gain(conn: ConnSpec, g: float) -> ConnSpec:
@@ -393,6 +535,12 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
             s = slows[k] if k < len(slows) else None
             return _gain(conn, spec.layers[k].slow.in_gain) if (s is not None and target is s and sign > 0) else conn
         for k, ls in enumerate(spec.layers):
+            if ls.volume is not None:
+                if len(spec.layers) != 1 or ls.slow is not None:
+                    raise ValueError("volume: only for a network with a single hidden layer and no slow population")
+                vs = ls.volume
+                ls = replace(ls, e_shape=tuple(ls.e_shape[:2]) + (vs.depth,), i_shape=tuple(ls.i_shape[:2]) + (vs.depth,))
+                spec = replace(spec, layers=[ls])
             e = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
                          spec.plateau), ls.e_shape)
             i = Population(_alif(ls.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac, spec.resonator,
@@ -401,6 +549,22 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                                                     (i, e, ls.i_shape, ls.fan_in_i, -1), (i, i, ls.i_shape, ls.fan_in_i, -1)):
                 spec_c = ls.internal_i if (sign < 0 and ls.internal_i is not None) else ls.internal
                 if spec_c.type == "none":                # no recurrent connection (e.g. a frozen input copy)
+                    continue
+                if ls.volume is not None:
+                    vs, side = ls.volume, ls.e_shape[0]
+                    c = Connection(pre, post, volume_connectivity(
+                        volume_positions(pre.shape, side, True, vs.z_spacing),
+                        volume_positions(post.shape, side, True, vs.z_spacing), side,
+                        vs.sigma_cells * (vs.inh_sigma_ratio if sign < 0 else 1.0), vs.p_max,
+                        vs.p_global if vs.k_global is None else 0.0, sign,
+                        spec_c.mean_scale, spec_c.sd_scale, spec_c.inh_scale, same=pre is post,
+                        z_shift=vs.z_shift * vs.z_spacing if sign > 0 else 0.0,
+                        k_global=_volume_k_global(vs, sign, int(np.prod(ls.e_shape)), int(np.prod(ls.i_shape))),
+                        k_global_mode=vs.k_global_mode), exc_inh_sign=sign)
+                    if pre is i and post is e:
+                        i_to_e.append(c)
+                    elif pre is i and post is i:
+                        i_to_i.append(c)
                     continue
                 c = Connection(pre, post, connectivity(spec_c, src_shape, sign, fan, ls.sigma, tgt_shape=post.shape,
                                                        same=pre is post, src_sheet=ls.e_shape, tgt_sheet=ls.e_shape),
@@ -508,10 +672,19 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                          slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, code=code)
         # input -> first layer (excitatory)
         first = spec.layers[0]
-        for target in lpops(0):
+        for target in (lpops(0) if first.volume is None else []):
             Connection(inp, target, connectivity(into(target, spec.input, 0, +1), spec.input_shape, +1, first.fan_in_e,
                                                  first.sigma, tgt_shape=target.shape, tgt_sheet=first.e_shape),
                        exc_inh_sign=+1)
+        if first.volume is not None:          # input -> the volume's front slabs (2D kernel on the sheet)
+            vs, side = first.volume, first.e_shape[0]
+            for target in layers[0]:
+                tp = volume_positions(target.shape, side, True, vs.z_spacing)
+                Connection(inp, target, volume_connectivity(
+                    volume_positions(spec.input_shape, side, False), tp * np.array([1.0, 1.0, 0.0]), side,
+                    vs.input_sigma_cells, vs.input_p_max, 0.0, +1, spec.input.mean_scale, spec.input.sd_scale,
+                    spec.input.inh_scale, tgt_mask=tp[:, 2] < vs.input_depth * vs.z_spacing - 1e-9),
+                    exc_inh_sign=+1)
         # reward relay -> first layer (its own connections; excitatory, plastic like the input)
         relay = None
         if spec.reward_relay is not None:
@@ -602,9 +775,35 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                 for src, src_shape, fan, sign, conn in field_sources:
                     if conn.type == "none":
                         continue
+                    if last_spec.volume is not None and not logic_first:     # the volume's back slabs -> fields
+                        vs, side = last_spec.volume, last_spec.e_shape[0]
+                        sp = volume_positions(src.shape, side, True, vs.z_spacing)
+                        Connection(src, fld, volume_connectivity(
+                            sp * np.array([1.0, 1.0, 0.0]), volume_positions(fld.shape, side, False), side,
+                            vs.field_sigma_cells, vs.field_p_max, 0.0, sign, conn.mean_scale, conn.sd_scale,
+                            conn.inh_scale, src_mask=sp[:, 2] >= (vs.depth - vs.output_depth) * vs.z_spacing - 1e-9),
+                                   exc_inh_sign=sign)
+                        continue
                     Connection(src, fld, connectivity(conn, src_shape, sign, fan, last_spec.sigma, tgt_shape=fld.shape,
                                                       src_sheet=last_spec.e_shape, tgt_sheet=fs.shape),
                                exc_inh_sign=sign)
+            for kk in (fs.skip_from or ()):                      # skip connections: earlier layers -> fields
+                if not 1 <= kk < len(layers):
+                    raise ValueError(f"fields skip_from {kk}: needs a layer before the last (1..{len(layers) - 1})")
+                if logic_first:
+                    raise ValueError("fields skip_from cannot be combined with a boolean_head before the fields")
+                ks = spec.layers[kk - 1]
+                se = fs.skip_conn or fs.conn
+                si = fs.skip_conn_i or fs.conn_i or se
+                srcs = ([(p_, sh, f, sg, se) for p_, sh, f, sg in src_pops(kk - 1)]
+                        + [(layers[kk - 1][1], ks.i_shape, ks.fan_in_i, -1, si)])
+                for fld in fields:
+                    for src, src_shape, fan, sign, conn in srcs:
+                        if conn.type == "none":
+                            continue
+                        Connection(src, fld, connectivity(conn, src_shape, sign, fan, ks.sigma, tgt_shape=fld.shape,
+                                                          src_sheet=ks.e_shape, tgt_sheet=fs.shape),
+                                   exc_inh_sign=sign)
             for fld, head, name in ((fields[0], policy, "policy_feedback"), (fields[1], value, "value_feedback")):
                 if (spec.boolean_head is not None and not logic_first
                         and (spec.boolean_head.heads == "both" or head is policy)):
@@ -687,7 +886,8 @@ def _merge(obj, d):
         return obj
     kw = {}
     names = {f.name for f in dc_fields(obj)}
-    for k, v in d.items():
+    late = ("skip_conn", "skip_conn_i")             # merged after the connections they start from
+    for k, v in sorted(d.items(), key=lambda kv: kv[0] in late):
         if k not in names:
             raise KeyError(f"{type(obj).__name__} has no field '{k}' (fields: {sorted(names)})")
         cur = getattr(obj, k)
@@ -698,10 +898,16 @@ def _merge(obj, d):
             cur = obj.to_prev if getattr(obj.to_prev, "type", "none") != "none" else obj.to_next
         if off and k == "conn_i" and isinstance(v, dict):
             cur = obj.conn
+        if off and k == "skip_conn" and isinstance(v, dict):
+            cur = kw.get("conn", obj.conn)
+        if off and k == "skip_conn_i" and isinstance(v, dict):
+            cur = kw.get("skip_conn", obj.skip_conn) or kw.get("conn_i", obj.conn_i) or kw.get("conn", obj.conn)
         if off and k == "internal_i" and isinstance(v, dict):
             cur = obj.internal
         if cur is None and k == "slow" and isinstance(v, dict):
             cur = SlowSpec()
+        if cur is None and k == "volume" and isinstance(v, dict):
+            cur = VolumeSpec()
         kw[k] = _merge(cur, v) if hasattr(cur, "__dataclass_fields__") and isinstance(v, dict) else v
     return replace(obj, **kw)
 
