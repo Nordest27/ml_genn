@@ -99,7 +99,9 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
     W, T = int(cfg.get("windows", 256)), int(cfg.get("window", 200))
     alpha = float(np.exp(-1.0 / tgt.neuron.tau_mem))
     incoming = [(c, s) for c, s in compiled_net.connection_populations.items()
-                if c.target() is tgt and not c.is_feedback]
+                if c.target() is tgt and not c.is_feedback and not getattr(c, "is_relay", False)
+                and not getattr(c, "is_credit", False) and not getattr(c, "is_reward", False)
+                and not getattr(c, "is_signal", False) and not getattr(c, "is_route", False)]
     sources, zgroups = [], []
     for c, s in incoming:
         if c.source() in sources:
@@ -116,7 +118,8 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
         groups.append(dict(name=s.name, source=sources.index(c.source()), pre=np.asarray(s.get_sparse_pre_inds()),
                            post=np.asarray(s.get_sparse_post_inds()), g=np.array(s.vars["g"].values),
                            syn_sig=np.array(s.vars["SynSig"].values) if "SynSig" in s.vars else None))
-    names = tuple(n for n in ("V", "A", "RefracTime", "Noise1", "Beta", "TdE") if n in tpop.vars)
+    names = tuple(n for n in ("V", "A", "RefracTime", "Noise1", "Beta", "TdE", "ShadowV", "ShadowA", "ShadowRef",
+                              "CreditH", "CreditY", "CreditL") if n in tpop.vars)
     psi_vars = ("Psi", "PsiBar")
     spikes = [np.zeros((W, T + 1, z.src.num_neurons), dtype=bool) for z in zgroups]
     state = {n: np.zeros((W, T + 1, tpop.num_neurons), dtype=np.float32) for n in names + psi_vars}
@@ -155,7 +158,21 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
         if (w + 1) % 32 == 0:
             print(f"drift record: {w + 1}/{W} windows", flush=True)
     neuron = tgt.neuron
-    np.savez_compressed(out_path, alpha=alpha, rho=float(np.exp(-1.0 / neuron.tau_adapt)), v_thresh=neuron.v_thresh,
+    # reward / learning-signal links into the target (not part of the replay): their weights, for structure analysis
+    link_arrays = {}
+    lk = [(c, sgl) for c, sgl in compiled_net.connection_populations.items()
+          if c.target() is tgt and (getattr(c, "is_signal", False) or getattr(c, "is_reward", False))]
+    for i, (c, sgl) in enumerate(lk):
+        sgl.vars["g"].pull_from_device()
+        link_arrays[f"link_{i}_pre"] = np.asarray(sgl.get_sparse_pre_inds())
+        link_arrays[f"link_{i}_post"] = np.asarray(sgl.get_sparse_post_inds())
+        link_arrays[f"link_{i}_g"] = np.array(sgl.vars["g"].values)
+    link_arrays["link_sources"] = np.array([c.source().name for c, _ in lk])
+    # GeNN population names: of every link's sender and of every recorded spike source (exact matching offline)
+    link_arrays["link_source_pops"] = np.array([sgl.src.name for _, sgl in lk])
+    link_arrays["spike_source_pops"] = np.array([z.src.name for z in zgroups])
+    link_arrays["link_names"] = np.array([c.name for c, _ in lk])
+    np.savez_compressed(out_path, **link_arrays, alpha=alpha, rho=float(np.exp(-1.0 / neuron.tau_adapt)), v_thresh=neuron.v_thresh,
                         tau_refrac=neuron.tau_refrac, groups=np.array(groups, dtype=object),
                         source_names=np.array([z.name for z in zgroups]),
                         **{f"spikes_{k}": z for k, z in enumerate(spikes)},

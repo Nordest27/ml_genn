@@ -121,6 +121,11 @@ class LocalObjectives:
     rate: Optional[float] = None     # weight of the firing-rate reward (None: the compiler's c_reg)
     dv_mode: DVMode = DVMode.CORRECT
     baseline_decay: float = 0.999    # per-neuron running mean subtracted (GRADIENT_* routes only)
+    learned_reward: float = 0.0      # weight of the reward the neuron RECEIVES from reward neurons (network.reward_pool):
+                                     # RewIn, its reward synapses' input filtered like a presynaptic trace, is added to
+                                     # the shared local reward (credited through the neuron's noise score like the other
+                                     # terms, with the same baseline). The reward neurons are ordinary hidden neurons
+                                     # under the same rule: nothing defines what they reward (needs a GRADIENT_* route)
     decorr: float = 0.0              # weight of the decorrelation reward -(z - zbar)(I_inh - Ibar_inh) / Ibar_inh:
                                      # penalises spiking in step with the inhibition the neuron receives (redundancy
                                      # with the cells that drive that inhibition). Neuron-local: its own spikes and
@@ -425,6 +430,77 @@ class HiddenRuleConfig:
                                      # scores keep their per-synapse form. Same sample and step as the synapse path
     soma_noise_gain: float = 1.0     # "soma": the somatic amplitude in units of exp(log_syn_sigma - 5) (e.g. the mean
                                      # number of inputs firing per step, to match the synapse path's total noise)
+    soma_noise_scaling: str = "constant"   # "soma": "constant" (sigma * Noise1); "input": the amplitude follows a slow,
+                                     # noise-free estimate of the neuron's input activity (like the ALIF threshold):
+                                     # NoiseAct = d NoiseAct + (1 - d) (|Isyn| + |ISynInh|), amplitude sigma_unit *
+                                     # soma_noise_gain * NoiseAct (sigma_unit = exp(log_syn_sigma - 5); NoiseAct starts
+                                     # at 1 / soma_noise_gain, one synapse's worth), so busy neurons explore more, as with
+                                     # synapse noise. The bookkeeping then adds SynSig^2 * Noise1 / amplitude (each
+                                     # step's noise over its own variance: Stein's identity stays exact)
+    soma_noise_tau: float = 1000.0   # "input": time constant (ms) of NoiseAct
+    drift_centre: str = "psibar"     # centre of the drift gate psi - c: "psibar" (its running mean, which carries the
+                                     # neuron's recent noise, so it also centres the drift in expectation) or "shadow":
+                                     # psi of the neuron's noise-free shadow (same inputs and dynamics, no injected
+                                     # noise). The shadow term is independent of the noise, so it drops out of the
+                                     # drift's expectation (Stein): the drift estimates d E[psi pi] / dW with much less
+                                     # variance (~10x SNR in the open-loop replay of 2026-11-13)
+    shadow_align_rate: float = 0.0   # kappa: per step, the shadow's adaptation is pulled towards a slow average of the
+                                     # real neuron's (ShadowA += kappa (Abar - ShadowA)), so the shadow keeps the real
+                                     # neuron's slow state while its fast state runs noise-free (it would otherwise drift
+                                     # away: every spike one has and the other not leaves a ~tau_adapt difference in A).
+                                     # Abar holds the recent noise with weight ~ (trace memory) / shadow_align_tau, so the
+                                     # noise reaching the shadow (the gate's bias) scales like kappa * that. 0: free-running
+    shadow_align_tau: float = 1000.0 # time constant (ms) of Abar
+                                     # "shadow_cv": the current gate minus its noise-free counterpart,
+                                     # (psi - psibar) - (psiS - psibarS): the subtracted term is independent of the
+                                     # noise, so the drift keeps exactly its current expectation (centring included)
+                                     # with less variance (a control variate)
+    trace_lambda: Optional[float] = None   # per-step lambda of this rule's eligibility / score traces (None: the
+                                     # compiler's td_lambda). E.g. a population rule with a much longer horizon for
+                                     # neurons whose effect on the task is slow (the reward neurons)
+    credit: float = 0.0              # weight c of a learned learning signal (the e-prop form with learned feedback):
+                                     # every hidden neuron keeps a trace of its own noise samples, H = lambda H + Noise1,
+                                     # and the perturbation estimate of its credit Y = delta * H (unbiased, noisy). Its
+                                     # credit connections (network.credit: plastic weights u from other populations,
+                                     # into ISynCredit) give a prediction L = alpha L + sum u z; u learns to predict Y
+                                     # (normalised LMS, rate credit_eta, reward-free). Each synapse then adds
+                                     # Delta w = c * L * ZFilter: a dense, denoised, state-dependent version of the
+                                     # gradient part, biased where the prediction is wrong. 0: off
+    credit_eta: float = 1e-3         # learning rate of the credit connections
+    link_eta: float = 0.0            # reward / learning-signal links INTO this rule's neurons (network.reward_links,
+                                     # network.reward_pool) learn when > 0: u += link_eta * (ZF_sender * C_receiver -
+                                     # link_decay * u), C = delta * H the receiver's perturbation credit (first-order
+                                     # meta-gradient: a link grows where its sender's activity coincides with the
+                                     # receiver's credit, i.e. it becomes a learned local feedback pathway). 0: fixed
+    link_decay: float = 0.0          # per-step weight decay of the trained links
+    credit_lambda: Optional[float] = None   # decay of the noise trace H per step (None: the compiler's td_lambda)
+    # routed credit (computation sensitivities): every neuron learns, reward-free, how its own noise moves the input
+    # of the neurons it projects to (route links, network.route_links: reversed along the forward wiring, weight S
+    # regresses the target's input deviation on the sender's noise score psi * filtered noise, normalised LMS at
+    # rate route_eta). Each step a neuron sends back Msg = its noise + RtW * psi * Route (recursive) and receives
+    # Route = sum_k S_kj Msg_k. Each synapse adds route * RtW * delta * trace(psi * Route * ZFilter), RtW the
+    # neuron's trust in its routed credit: the regression of its own perturbation credit on the routed one, starting
+    # from the equal-scale weight (prior of route_prior steps) and taken over by its own evidence (stats rate
+    # route_stats_rate). 0: off.
+    route: float = 0.0
+    route_eta: float = 1e-3          # learning rate of the route links (normalised LMS)
+    route_prior: float = 1e5         # steps of prior trust (equal-scale weight) before the neuron's own evidence dominates
+    route_stats_rate: float = 1e-4   # per-step rate of the trust statistics and of the score's mean square
+    route_in_decay: float = 0.99     # per-step decay of the running mean of a neuron's input (its deviation is regressed)
+    route_recursive: bool = True     # forward the routed credit upstream (whole computation) or only the own noise
+    route_link_signal: str = "noise" # what the links regress their sender's input on: "noise" (the receiver's noise
+                                     # score psi * filtered noise: unbiased, very low signal in spiking networks) or
+                                     # "spike" (the receiver's centred spike of the previous step: the transport per
+                                     # spike, high signal, biased where inputs are correlated)
+    route_score_decay: float = 0.0   # links regress on the sender's noise score filtered with this per-step decay (0: the
+                                     # previous step's score only, direct influences; > 0 also slower, indirect ones, e.g.
+                                     # links between neurons that are not directly connected)
+    gradient_gate: str = "psibar"    # weight of the gradient score -c * pi * xi: "psibar" or "shadow" (the shadow's
+                                     # instantaneous psi: a time-resolved, noise-independent pseudo-derivative)
+    # shadow (drift_centre or gradient_gate "shadow"): every hidden neuron also integrates its input without the
+    # injected noise. With synapse noise the compiler adds a static relay connection per plastic hidden connection
+    # (same indices, weight 1, into ISynCount) so the neuron can subtract SynSig * Noise1 * (inputs transmitting);
+    # with soma noise the input carries no noise. The shadow's psi (PsiS) is computed like Psi.
     psibar_decay: float = 0.99
     coactivity_decay: Optional[float] = None   # per-synapse co-activity trace CoAct = d CoAct + (1 - d) ZFilter Psi
                                      # (presynaptic activity while the postsynaptic neuron is eligible) and an age
@@ -434,6 +510,11 @@ class HiddenRuleConfig:
                                      # X = lambda X + score: the same geometric weighting of past steps (the same credit),
                                      # but a step size independent of lambda, so the learning rate and the balance with
                                      # the instantaneous local rewards do not change when lambda does
+
+    @property
+    def uses_shadow(self) -> bool:
+        """Whether the hidden neurons need the noise-free shadow membrane."""
+        return self.drift_centre in ("shadow", "shadow_cv") or self.gradient_gate == "shadow"
 
     def __post_init__(self):
         if self.split_optimiser and self.estimator is Estimator.EXACT:
@@ -467,6 +548,43 @@ class HiddenRuleConfig:
                              "inject_noise")
         if self.soma_noise_gain <= 0:
             raise ValueError("soma_noise_gain must be > 0")
+        if self.soma_noise_scaling not in ("constant", "input"):
+            raise ValueError(f"soma_noise_scaling must be 'constant' or 'input', not {self.soma_noise_scaling!r}")
+        if self.soma_noise_tau <= 0:
+            raise ValueError("soma_noise_tau must be > 0")
+        if self.drift_centre not in ("psibar", "shadow", "shadow_cv"):
+            raise ValueError(f"drift_centre must be 'psibar', 'shadow' or 'shadow_cv', not {self.drift_centre!r}")
+        if self.gradient_gate not in ("psibar", "shadow"):
+            raise ValueError(f"gradient_gate must be 'psibar' or 'shadow', not {self.gradient_gate!r}")
+        if (self.local is not None and self.local.learned_reward != 0
+                and self.local.route not in (LocalRoute.GRADIENT_INSTANT, LocalRoute.GRADIENT_TRACE)):
+            raise ValueError("learned_reward needs a GRADIENT_* local route (it is part of the shared local reward)")
+        if self.trace_lambda is not None and not 0.0 < self.trace_lambda < 1.0:
+            raise ValueError("trace_lambda must be in (0, 1)")
+        if self.link_eta < 0 or self.link_decay < 0:
+            raise ValueError("link_eta and link_decay must be >= 0")
+        if self.link_eta != 0 and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT):
+            raise ValueError("link_eta needs WEIGHT_SHARED noise (the receiver's credit) and the trace estimator")
+        if self.credit < 0 or self.credit_eta < 0:
+            raise ValueError("credit and credit_eta must be >= 0")
+        if self.credit != 0 and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT):
+            raise ValueError("credit needs WEIGHT_SHARED noise (the neuron's Noise1) and the trace estimator")
+        if self.route < 0 or self.route_eta < 0 or self.route_prior < 0 or not 0.0 < self.route_stats_rate <= 1.0:
+            raise ValueError("route, route_eta, route_prior must be >= 0 and route_stats_rate in (0, 1]")
+        if self.route_link_signal not in ("noise", "spike"):
+            raise ValueError("route_link_signal must be 'noise' or 'spike'")
+        if not 0.0 <= self.route_score_decay < 1.0:
+            raise ValueError("route_score_decay must be in [0, 1)")
+        if not 0.0 <= self.route_in_decay < 1.0:
+            raise ValueError("route_in_decay must be in [0, 1)")
+        if self.route != 0 and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT):
+            raise ValueError("route needs WEIGHT_SHARED noise (the neuron's Noise1) and the trace estimator")
+        if not 0.0 <= self.shadow_align_rate <= 1.0 or self.shadow_align_tau <= 0:
+            raise ValueError("shadow_align_rate must be in [0, 1] and shadow_align_tau > 0")
+        if self.uses_shadow and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.noise_proxy
+                                 or not self.inject_noise or self.estimator is Estimator.EXACT):
+            raise ValueError("the shadow (drift_centre / gradient_gate 'shadow') needs WEIGHT_SHARED noise, the "
+                             "trace estimator, no noise_proxy and inject_noise")
         if not self.inject_noise and not self.noise_proxy:
             raise ValueError("inject_noise=False needs noise_proxy (the score would read noise that is never injected)")
         if self.backprop != 0 and (self.noise is NoisePlacement.NONE or self.estimator is Estimator.EXACT):

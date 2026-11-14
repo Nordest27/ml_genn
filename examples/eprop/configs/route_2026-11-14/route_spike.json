@@ -1,0 +1,2 @@
+{"hidden_rule": {"route": 1.0, "route_link_signal": "spike", "route_eta": 0.001},
+ "network": {"reward_links": {"channel": "route", "topology": "reverse", "init": "zero"}}}

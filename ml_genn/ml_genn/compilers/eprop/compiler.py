@@ -439,7 +439,73 @@ class EPropCompiler(Compiler):
     def pre_compile(self, network: Network, genn_model, **kwargs) -> CompileState:
         readouts = [p for p in network.populations
                     if p.neuron.readout is not None]
-        return CompileState(self.losses, readouts)
+        self._add_shadow_relays(network)
+        compile_state = CompileState(self.losses, readouts)
+        compile_state.relay_connections = []
+        compile_state.credit_connections = []
+        compile_state.reward_connections = []
+        compile_state.signal_connections = []
+        compile_state.route_connections = []
+        return compile_state
+
+    @staticmethod
+    def _link_wum(rule, alpha, connect_snippet):
+        """Reward / learning-signal link: fixed (link_eta 0) or trained by the first-order alignment rule
+        u += link_eta (ZF_sender * C_receiver - link_decay * u), C = the receiver's credit (CreditY)."""
+        if rule.link_eta == 0:
+            return WeightUpdateModel(model={"vars": [("g", "scalar", VarAccess.READ_ONLY)],
+                                            "pre_spike_syn_code": "addToPost(g);"},
+                                     var_vals={"g": connect_snippet.weight})
+        return WeightUpdateModel(
+            model={"params": [("Alpha", "scalar"), ("Eta", "scalar"), ("Decay", "scalar")],
+                   "vars": [("g", "scalar")],
+                   "pre_vars": [("ZFilter", "scalar")],
+                   "post_neuron_var_refs": [("CreditY_post", "scalar")],
+                   "pre_spike_code": "ZFilter += 1.0;",
+                   "pre_dynamics_code": "ZFilter *= Alpha;",
+                   "pre_spike_syn_code": "addToPost(g);",
+                   "synapse_dynamics_code": "g += Eta * (ZFilter * CreditY_post - Decay * g);"},
+            param_vals={"Alpha": alpha, "Eta": rule.link_eta, "Decay": rule.link_decay},
+            var_vals={"g": connect_snippet.weight}, pre_var_vals={"ZFilter": 0.0},
+            post_neuron_var_refs={"CreditY_post": "CreditY"})
+
+    def _add_shadow_relays(self, network: Network):
+        """Shadow with synapse noise: one static relay connection per plastic hidden connection into a population whose
+        rule uses the shadow (same pre/post indices, weight 1, into the target's ISynCount), so every hidden neuron
+        knows how many of its inputs transmitted in a step (each delivered SynSig * Noise1). Added once per network
+        (marked is_relay; other code that walks the connections should skip them)."""
+        from ...connectivity import Explicit
+        made = {c.name for c in network.connections if getattr(c, "is_relay", False)}
+        new = []
+        for c in list(network.connections):
+            tgt = c.target()
+            if (getattr(c, "is_relay", False) or getattr(c, "is_credit", False)
+                    or getattr(c, "is_reward", False) or getattr(c, "is_signal", False)
+                    or getattr(c, "is_route", False) or c.is_feedback
+                    or c in self.plastic_inhibition
+                    or type(tgt.neuron) is not AdaptiveLeakyIntegrateFire or tgt.neuron.readout is not None
+                    or isinstance(c.source().neuron, BooleanUnit)):
+                continue
+            rule = self.rule_for(tgt)
+            if not (rule.uses_shadow and rule.noise_site == "synapse"):
+                continue
+            name = f"{c.name}_relay"
+            if name in made:
+                continue
+            conn = c.connectivity
+            pre, post = getattr(conn, "pre_ind", None), getattr(conn, "post_ind", None)
+            if pre is None and type(conn).__name__ == "Dense":     # all-to-all: every source onto every target
+                n_src, n_tgt = int(np.prod(c.source().shape)), int(np.prod(tgt.shape))
+                pre, post = np.repeat(np.arange(n_src), n_tgt), np.tile(np.arange(n_tgt), n_src)
+            if pre is None or post is None:
+                raise NotImplementedError(f"shadow relay: connectivity {type(conn).__name__} of {c.name} has no "
+                                          "explicit indices (pre_ind / post_ind)")
+            new.append((c, name, np.asarray(pre), np.asarray(post)))
+        if new:
+            with network:
+                for c, name, pre, post in new:
+                    r = Connection(c.source(), c.target(), Explicit(pre, post, 1.0), name=name)
+                    r.is_relay = True
 
     def build_neuron_model(self, pop: Population, model: NeuronModel,
                            compile_state: CompileState) -> NeuronModel:
@@ -478,6 +544,69 @@ class EPropCompiler(Compiler):
         target_pop = conn.target()
         target_neuron = target_pop.neuron
 
+        if getattr(conn, "is_route", False):   # route link k -> j: carries S * Msg_k back to j, learns S reward-free
+            rule = self.rule_for(target_pop) if self.gamma_lambda is not None else None
+            src_rule = self.rule_for(conn.source()) if self.gamma_lambda is not None else None
+            if rule is None or rule.route == 0 or src_rule is None or src_rule.route == 0:
+                raise ValueError(f"{conn.name}: route links need the RL rule with hidden_rule.route != 0 for both "
+                                 "their source and their target")
+            compile_state.route_connections.append(conn)
+            compile_state.checkpoint_connection_vars.append((conn, "g"))
+            # S regresses the source's input deviation on the target's previous-step noise score (normalised LMS)
+            return WeightUpdateModel(
+                model={"params": [("Eta", "scalar")],
+                       "vars": [("g", "scalar")],
+                       "pre_neuron_var_refs": [("RtMsg_pre", "scalar"), ("RtIn_pre", "scalar"),
+                                               ("RtInBar_pre", "scalar")],
+                       "post_neuron_var_refs": [("RtScoreP_post", "scalar"), ("RtScSq_post", "scalar")],
+                       "synapse_dynamics_code": (
+                           "addToPost(g * RtMsg_pre);\n"
+                           "g += Eta * ((RtIn_pre - RtInBar_pre) - g * RtScoreP_post) * RtScoreP_post"
+                           " / (RtScSq_post + RtScoreP_post * RtScoreP_post + 1e-9);")},
+                param_vals={"Eta": rule.route_eta}, var_vals={"g": connect_snippet.weight},
+                pre_neuron_var_refs={"RtMsg_pre": "RtMsg", "RtIn_pre": "RtIn", "RtInBar_pre": "RtInBar"},
+                post_neuron_var_refs={"RtScoreP_post": "RtScoreP", "RtScSq_post": "RtScSq"})
+        if getattr(conn, "is_signal", False):  # learning-signal synapse: fixed, into the target's ISynCredit (L)
+            rule = self.rule_for(target_pop) if self.gamma_lambda is not None else None
+            if rule is None or (rule.credit == 0 and rule.link_eta == 0):
+                raise ValueError(f"{conn.name}: learning-signal synapses need the RL rule with credit != 0 (the credit "
+                                 "term uses the signal) or link_eta != 0 (trained but unused: observation only)")
+            compile_state.signal_connections.append(conn)
+            if rule.link_eta != 0:          # trained links are saved with the checkpoints (structure analysis)
+                compile_state.checkpoint_connection_vars.append((conn, "g"))
+            return self._link_wum(rule, alpha, connect_snippet)
+        if getattr(conn, "is_reward", False):  # reward synapse: fixed, delivers the reward neurons' spikes as reward
+            rule = self.rule_for(target_pop) if self.gamma_lambda is not None else None
+            if rule is None or rule.local is None or rule.local.learned_reward == 0:
+                raise ValueError(f"{conn.name}: reward synapses need the RL rule with local.learned_reward != 0 "
+                                 "for their target")
+            compile_state.reward_connections.append(conn)
+            if rule.link_eta != 0:          # trained links are saved with the checkpoints (structure analysis)
+                compile_state.checkpoint_connection_vars.append((conn, "g"))
+            return self._link_wum(rule, alpha, connect_snippet)
+        if getattr(conn, "is_credit", False):  # credit connection: u learns to predict the target's credit Y
+            if self.gamma_lambda is None or self.rule_for(target_pop).credit == 0:
+                raise ValueError(f"{conn.name}: credit connections need the RL rule with hidden_rule.credit != 0 "
+                                 "for their target")
+            compile_state.credit_connections.append(conn)
+            return WeightUpdateModel(
+                model={"params": [("Alpha", "scalar"), ("Eta", "scalar")],
+                       "vars": [("g", "scalar")],
+                       "pre_vars": [("ZFilter", "scalar")],
+                       "post_neuron_var_refs": [("CreditY_post", "scalar"), ("CreditL_post", "scalar")],
+                       "pre_spike_code": "ZFilter += 1.0;",
+                       "pre_dynamics_code": "ZFilter *= Alpha;",
+                       "pre_spike_syn_code": "addToPost(g);",
+                       "synapse_dynamics_code": "g += Eta * (CreditY_post - CreditL_post) * ZFilter"
+                                                " / (1.0 + ZFilter * ZFilter);"},
+                param_vals={"Alpha": alpha, "Eta": self.rule_for(target_pop).credit_eta},
+                var_vals={"g": connect_snippet.weight}, pre_var_vals={"ZFilter": 0.0},
+                post_neuron_var_refs={"CreditY_post": "CreditY", "CreditL_post": "CreditL"})
+        if getattr(conn, "is_relay", False):   # shadow relay: one count per transmitting input, nothing learned
+            compile_state.relay_connections.append(conn)
+            return WeightUpdateModel(model={"vars": [("g", "scalar", VarAccess.READ_ONLY)],
+                                            "pre_spike_syn_code": "addToPost(g);"},
+                                     var_vals={"g": connect_snippet.weight})
         if isinstance(target_neuron, BooleanUnit):
             # the inputs of a logic unit are static: fixed weights (1, 2, 4, ... = the unit's input bits), no learning
             return WeightUpdateModel(model={"vars": [("g", "scalar", VarAccess.READ_ONLY)],
@@ -562,8 +691,11 @@ class EPropCompiler(Compiler):
             if pop_rule.noise_site == "soma":
                 if not isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
                     raise NotImplementedError("noise_site 'soma' supports ALIF hidden neurons only")
-                neuron_logic.add_soma_noise(model_copy, float(np.exp(pop_rule.log_syn_sigma - 5.0))
-                                            * pop_rule.soma_noise_gain)
+                unit = float(np.exp(pop_rule.log_syn_sigma - 5.0))
+                neuron_logic.add_soma_noise(model_copy, unit * pop_rule.soma_noise_gain,
+                                            scaling=pop_rule.soma_noise_scaling, sigma_unit=unit,
+                                            gain=pop_rule.soma_noise_gain, tau=pop_rule.soma_noise_tau, dt=self.dt,
+                                            inhibitory_channel=self.inhibitory_channel)
         if self.inhibitory_reversal is not None and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             neuron_logic.add_inhibitory_reversal(model_copy, self.inhibitory_reversal)
         elif self.inhibitory_channel and isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
@@ -598,6 +730,39 @@ class EPropCompiler(Compiler):
         compile_state.tau_mem = pop.neuron.tau_mem
         if isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
             compile_state.tau_adapt = pop.neuron.tau_adapt
+        if (self.gamma_lambda is not None and self.rule_for(pop).local is not None
+                and self.rule_for(pop).local.learned_reward != 0):
+            neuron_logic.add_reward_input(model_copy)
+        if self.gamma_lambda is not None and (self.rule_for(pop).credit != 0 or self.rule_for(pop).link_eta != 0):
+            rule = self.rule_for(pop)   # the credit trace (CreditH, CreditY) serves both the credit term and links
+            if not isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+                raise NotImplementedError("the learned learning signal (credit) supports ALIF hidden neurons only")
+            neuron_logic.add_credit(model_copy, rule.credit_lambda if rule.credit_lambda is not None
+                                    else self.td_lambda)
+        if self.gamma_lambda is not None and self.rule_for(pop).route != 0:
+            rule = self.rule_for(pop)
+            if not isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
+                raise NotImplementedError("routed credit (route) supports ALIF hidden neurons only")
+            neuron_logic.add_route(model_copy, rule.trace_lambda if rule.trace_lambda is not None else self.td_lambda,
+                                   prior=rule.route_prior, stats_rate=rule.route_stats_rate,
+                                   in_decay=rule.route_in_decay, recursive=rule.route_recursive,
+                                   own_scale=1.0 / float(np.exp(rule.log_syn_sigma - 5.0)),
+                                   score_decay=rule.route_score_decay, link_signal=rule.route_link_signal)
+        if self.gamma_lambda is not None and self.rule_for(pop).uses_shadow:
+            rule = self.rule_for(pop)
+            if type(pop.neuron) is not AdaptiveLeakyIntegrateFire:
+                raise NotImplementedError("the shadow supports the plain ALIF neuron only")
+            if self.inhibitory_reversal is not None:
+                raise NotImplementedError("the shadow does not support inhibition through a reversal potential")
+            neuron_logic.add_shadow(model_copy,
+                                    relay_sigma=(float(np.exp(rule.log_syn_sigma - 5.0))
+                                                 if rule.noise_site == "synapse" else None),
+                                    refrac=pop.neuron.tau_refrac is not None,
+                                    integrate_during_refrac=pop.neuron.integrate_during_refrac,
+                                    relative_reset=pop.neuron.relative_reset,
+                                    inhibitory_channel=self.inhibitory_channel,
+                                    intrinsic_plasticity=self.intrinsic_plasticity is not None,
+                                    align_rate=rule.shadow_align_rate, align_tau=rule.shadow_align_tau, dt=self.dt)
         if isinstance(pop.neuron, BlackBoxALIF):   # last: it rewrites the final integration line
             neuron_logic.apply_black_box(model_copy, pop.neuron.coefficients(pop, self.dt))
         elif isinstance(pop.neuron, ResonatorALIF):
@@ -693,6 +858,16 @@ class EPropCompiler(Compiler):
             connection_populations[c].pre_target_var = "ISynFeedback"
         for c in compile_state.inhibitory_connections:
             connection_populations[c].post_target_var = "ISynInh"
+        for c in getattr(compile_state, "relay_connections", []):
+            connection_populations[c].post_target_var = "ISynCount"
+        for c in getattr(compile_state, "credit_connections", []):
+            connection_populations[c].post_target_var = "ISynCredit"
+        for c in getattr(compile_state, "reward_connections", []):
+            connection_populations[c].post_target_var = "ISynReward"
+        for c in getattr(compile_state, "signal_connections", []):
+            connection_populations[c].post_target_var = "ISynCredit"
+        for c in getattr(compile_state, "route_connections", []):
+            connection_populations[c].post_target_var = "ISynRoute"
         for c in compile_state.pi_scaled_connections:
             connection_populations[c].post_target_var = "ISynPI"
 
@@ -783,7 +958,7 @@ class EPropCompiler(Compiler):
 
     # the lambda-traces that carry credit over time (hidden rule and readout); short filters such as ZFilter,
     # epsilonA, NoiseTrace and eFiltered follow the neuron's own state and are not reset
-    TRACE_RESET_VARS = ("RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLHebbTrace", "RLContrTrace",
+    TRACE_RESET_VARS = ("RLRouteTrace", "RLTrace", "RLValueTrace", "RLBackTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLHebbTrace", "RLContrTrace",
                         "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
     def _add_trace_reset(self, genn_model, connection_populations):

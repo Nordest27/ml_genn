@@ -60,7 +60,7 @@ const scalar synNoise = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265359 * u2);
 """
 
 
-_LAMBDA_TRACES = ("RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLTrace", "RLValueTrace", "RLBackTrace", "RLHebbTrace",
+_LAMBDA_TRACES = ("RLRouteTrace", "RLNoiseTrace", "RLNoisePtrace", "RLNoiseGtrace", "RLTrace", "RLValueTrace", "RLBackTrace", "RLHebbTrace",
                   "RLContrTrace",
                   "ReviveTrace", "DiagGtrace", "DiagG1trace", "PartPtrace", "PartGtrace")
 
@@ -182,13 +182,18 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     pre_P = adapt if cfg.score_adaptation in (True, "drift") else "ZFilter"
     pre_G = adapt if cfg.score_adaptation in (True, "gradient") else "ZFilter"
     pre = pre_G
+    # centres of the drift gate and weight of the gradient score: the running mean psibar or the shadow's psi
+    c_drift = "PsiS" if cfg.drift_centre == "shadow" else "PsiBar"
+    c_grad = "PsiS" if cfg.gradient_gate == "shadow" else "PsiBar"
+    d_gate = ("(Psi - PsiBar - PsiS + PsiBarS)" if cfg.drift_centre == "shadow_cv"   # gate minus its noise-free twin
+              else f"(Psi - {c_drift})")
     if exact:
         g_score = "-freshEps / (SynSig * SynSig + 1e-6)"            # REINFORCE sign, no gate, no filter
     elif norm_xi is not None:
-        g_score = f"-PsiBar * {pre} * normXi"
+        g_score = f"-{c_grad} * {pre} * normXi"
     else:
         g_score = None
-    p_score = f"(Psi - PsiBar) * {pre_P} * normXi" if norm_xi is not None else None
+    p_score = f"{d_gate} * {pre_P} * normXi" if norm_xi is not None else None
     fn_noise = fn is not None and fn.noise and norm_xi is not None
 
     # --- model pieces ----------------------------------------------------------------------------
@@ -229,12 +234,17 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                        ("CritA", use_critic), ("CritU", use_critic), ("CritC", use_critic), ("CritV", use_critic),
                        ("CCritA", c_syn), ("CCritU", c_syn),
                        ("XiSq", fn_noise), ("ReviveTrace", use_revive),
-                       ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None)):
+                       ("CoAct", cfg.coactivity_decay is not None), ("Age", cfg.coactivity_decay is not None),
+                       ("RLRouteTrace", cfg.route != 0)):
         if used:
             vars_.append((name, "scalar")); var_vals[name] = 0.0
 
     post_vars = [("Psi", "scalar")]
     post_var_vals = {"Psi": 0.0}
+    if cfg.uses_shadow:
+        post_vars.append(("PsiS", "scalar")); post_var_vals["PsiS"] = 0.0
+    if cfg.drift_centre == "shadow_cv":
+        post_vars.append(("PsiBarS", "scalar")); post_var_vals["PsiBarS"] = 0.0
     for name, used in (("FAvg", use_favg), ("FAvgTrace", use_rate_local), ("Z", use_dvc),
                        ("PrevV", use_prevv), ("DVc", use_dvc), ("PsiBar", uses_psibar),
                        ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
@@ -258,6 +268,16 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
                  "Beta_post": "Beta", "TdE_post": "TdE", "PRew_post": "PRew"}
     if weight_noise:
         post_refs["Noise1"] = "Noise1"
+    if cfg.noise_site == "soma":
+        post_refs["NoiseAmp_post"] = "NoiseAmp"
+    if cfg.uses_shadow:
+        post_refs.update({"ShadowV_post": "ShadowV", "ShadowA_post": "ShadowA", "ShadowRef_post": "ShadowRef"})
+    if cfg.route != 0:
+        post_refs["RtW_post"] = "RtW"; post_refs["RtRoute_post"] = "RtRoute"
+    if cfg.credit != 0:
+        post_refs["CreditL_post"] = "CreditL"
+    if local is not None and local.learned_reward != 0 and use_local_post:
+        post_refs["RewIn_post"] = "RewIn"
     if node_noise:
         post_refs.update({"PertEpsTrace_post": "PertEpsTrace", "Sigma_post": "Sigma"})
     if use_eprop:
@@ -310,6 +330,13 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
 else {
     Psi = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((V_post - (Vthresh_post + (Beta_post * A_post))) / Vthresh_post));
 }""")
+    if cfg.uses_shadow:   # the same for the neuron's noise-free shadow (read at the same point of the step)
+        post_dyn.append("""if (ShadowRef_post > 0.0) {
+    PsiS = 0.0;
+}
+else {
+    PsiS = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((ShadowV_post - (Vthresh_post + (Beta_post * ShadowA_post))) / Vthresh_post));
+}""")
     if proxy:   # noise estimate: the voltage change not explained by the leak (reset undone), standardised
         d = _f(cfg.noise_proxy_decay); d1 = _f(1 - cfg.noise_proxy_decay)
         post_dyn.append(f"""{{
@@ -333,6 +360,8 @@ else {
         post_dyn.append(f"TdSq = {_f(fn.decay)} * TdSq + {_f(1 - fn.decay)} * (TdE_post + PRew_post) * (TdE_post + PRew_post);")
     if uses_psibar:
         post_dyn.append(f"PsiBar = {_f(cfg.psibar_decay)} * PsiBar + {_f(1 - cfg.psibar_decay)} * Psi;")
+        if cfg.drift_centre == "shadow_cv":   # the shadow's psibar, updated exactly like psibar
+            post_dyn.append(f"PsiBarS = {_f(cfg.psibar_decay)} * PsiBarS + {_f(1 - cfg.psibar_decay)} * PsiS;")
         if cfg.homeostat != 0 and cfg.psi_target_warmup is not None:
             # the neuron's own psibar at the warm-up time becomes its homeostat target (identical in every synapse
             # group of the neuron: they all compute the same PsiBar from the same postsynaptic state)
@@ -362,6 +391,8 @@ else {
             # the membrane change left over from the change of the excitatory drive: small when it is cancelled in time
             post_refs.update({"DExc_post": "DExc", "DExcMean_post": "DExcMean"})
             terms.append(f"- {_f(local.cancel)} * DVc / (DExc_post + {_f(local.cancel_eps)} * DExcMean_post + 1e-6)")
+        if local.learned_reward != 0:   # the reward this neuron receives from the reward neurons
+            terms.append(f"+ {_f(local.learned_reward)} * RewIn_post")
         if use_decorr:
             # spiking in step with the received inhibition = redundancy with the cells that drive it
             if local.decorr_norm == "correlation":
@@ -407,7 +438,9 @@ else {
     # presynaptic spike: noise delivery
     accumulate = "FreshEps += eps;" if exact else "NoiseTrace += eps;"
     if cfg.noise is NoisePlacement.WEIGHT_SHARED:
-        pre_spike_syn = ("SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = SynSig * Noise1;\n"
+        eps_expr = ("SynSig * SynSig * Noise1 / (NoiseAmp_post + 1e-12)" if cfg.noise_site == "soma"
+                    else "SynSig * Noise1")   # soma: the step's noise over its own variance (Stein), x SynSig^2
+        pre_spike_syn = (f"SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = {eps_expr};\n"
                          + ("addToPost(g + eps);\n" if cfg.inject_noise and cfg.noise_site == "synapse"
                             else "addToPost(g);\n")       # soma: the neuron injects it; the trace still records it
                          + ("ProxyFlag1 = 1.0;" if proxy else accumulate))
@@ -445,6 +478,8 @@ else {
             mod = f"{mod} + {surprise}" if mod else surprise
         mod = f"({mod})" if mod else "0.0"
         dg.append(_scaled(cfg.drift, f"{mod} * RLNoisePtrace"))
+    if cfg.route != 0:   # routed credit through the learned computation sensitivities, weighted by the neuron's trust
+        dg.append(f"{_f(cfg.route)} * RtW_post * reward * RLRouteTrace")
     if use_G and cfg.gradient != 0:
         dg.append(_scaled(cfg.gradient, "reward * RLNoiseGtrace"))
         g_terms.add(len(dg) - 1)
@@ -530,6 +565,9 @@ else {
             adv_c = "(ContrR - ContrMean)"
         dg.append(("FnTd * " if fn is not None else "") + f"{_f(local.contrast)} * {adv_c} * {score_c}")
         g_terms.add(len(dg) - 1)
+    if cfg.credit != 0:   # learned learning signal: Delta w = credit * L * ZFilter (w -= lr DeltaG)
+        dg.append(f"- {_f(cfg.credit)} * CreditL_post * ZFilter")
+        g_terms.add(len(dg) - 1)
     if fn is not None:
         # each factor divided by its running RMS (bias-corrected: the means start at t = 0, dt = 1 ms) plus the floor
         syn.append(f"const scalar fnBias = 1.0 - pow({_f(fn.decay)}, t + 1.0);")
@@ -568,12 +606,26 @@ else {
         syn.append("DeltaG += " + ("FnPre * " if fn is not None else "")
                    + f"{_f(cfg.vreg_gradient)} * ((vregP - vregN) * ZFilter - (vregP + vregN) * Beta_post * epsA);")
     if use_combined:
-        # gate = drift * (Psi - PsiBar) - gradient * PsiBar = drift * Psi - (drift + gradient) * PsiBar
+        # gate = drift * (Psi - c_drift) - gradient * c_grad (both centres psibar: drift * Psi - (drift + gradient) *
+        # PsiBar, the original form)
         terms = []
-        if cfg.drift != 0:
+        if cfg.drift_centre == "shadow_cv":
+            if cfg.drift != 0:
+                terms.append(_scaled(cfg.drift, d_gate))
+            if cfg.gradient != 0:
+                terms.append(f"- {_f(cfg.gradient)} * {c_grad}")
+        elif cfg.drift != 0:
             terms.append(_scaled(cfg.drift, "Psi"))
-        if cfg.drift + cfg.gradient != 0:
-            terms.append(f"- {_f(cfg.drift + cfg.gradient)} * PsiBar")
+        if cfg.drift_centre == "shadow_cv":
+            pass
+        elif c_drift == c_grad:
+            if cfg.drift + cfg.gradient != 0:
+                terms.append(f"- {_f(cfg.drift + cfg.gradient)} * {c_drift}")
+        else:
+            if cfg.drift != 0:
+                terms.append(f"- {_f(cfg.drift)} * {c_drift}")
+            if cfg.gradient != 0:
+                terms.append(f"- {_f(cfg.gradient)} * {c_grad}")
         gate = " ".join(terms)
         if pre_P == pre_G:
             syn.append(f"RLNoiseTrace = Lambda * RLNoiseTrace + ({gate}) * {pre} * normXi;")
@@ -594,6 +646,8 @@ else {
             syn.append(f"EligMean = {_f(d)} * EligMean + {_f(1 - d)} * pInc;")
         else:
             syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
+    if cfg.route != 0:
+        syn.append(f"RLRouteTrace = Lambda * RLRouteTrace + Psi * RtRoute_post * {pre_P};")
     if use_hebb:
         gate_h = " * Psi" if cfg.hebb_gate == "psi" else ""
         syn.append(f"RLHebbTrace = Lambda * RLHebbTrace + (HebbZ - HebbMean){gate_h} * ZFilter;")

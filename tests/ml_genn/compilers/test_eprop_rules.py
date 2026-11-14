@@ -52,8 +52,8 @@ def _network(seed=0):
     return net, inp, hid, pol, val
 
 
-def _compile(compiler_cls, name, policy_type, **kw):
-    net, inp, hid, pol, val = _network()
+def _compile(compiler_cls, name, policy_type, net_tuple=None, **kw):
+    net, inp, hid, pol, val = net_tuple if net_tuple is not None else _network()
     if "population_optimisers" in kw and callable(kw["population_optimisers"]):
         kw["population_optimisers"] = kw["population_optimisers"](hid)   # needs the hidden population itself
     gamma, lam = 0.5 ** (1 / K), 0.8 ** (1 / K)
@@ -343,36 +343,372 @@ def test_soma_noise_site_keeps_the_synaptic_bookkeeping():
     assert "addToPost(g + eps);" in syn["model"]["pre_spike_syn_code"]
     code = soma["model"]["pre_spike_syn_code"]
     assert "addToPost(g);" in code and "addToPost(g + eps)" not in code and "NoiseTrace += eps;" in code
+    # the step's noise over its own variance (with a constant amplitude NoiseAmp = SynSig: SynSig * Noise1)
+    assert "const scalar eps = SynSig * SynSig * Noise1 / (NoiseAmp_post + 1e-12);" in code
+    assert "NoiseAmp_post" in [r[0] for r in soma["model"]["post_neuron_var_refs"]]
     assert soma["var_vals"]["LogSynSig"] == pytest.approx(syn["var_vals"]["LogSynSig"] + np.log(4.0))
     # the scores are unchanged (same per-synapse trace, same normalisation)
     assert soma["model"]["synapse_dynamics_code"] == syn["model"]["synapse_dynamics_code"]
     for bad in (dict(noise_site="dendrite"), dict(noise_site="soma", soma_noise_gain=0.0),
-                dict(noise_site="soma", noise_proxy=True)):
+                dict(noise_site="soma", noise_proxy=True), dict(noise_site="soma", soma_noise_scaling="rate"),
+                dict(noise_site="soma", soma_noise_tau=0.0)):
         with pytest.raises(ValueError):
             replace(PRESETS["proposed"], **bad)
 
 
+class _ModelCopy:
+    """The parts of a neuron model copy that add_soma_noise uses."""
+
+    def __init__(self):
+        self.model = {"sim_code": "V = Alpha * V + Isyn + 0.0 * PertEps;\nA *= Rho;"}
+        self.vars = {}
+
+    def replace_sim_code(self, a, b):
+        self.model["sim_code"] = self.model["sim_code"].replace(a, b)
+
+    def append_sim_code(self, code):
+        self.model["sim_code"] += code
+
+    def add_var(self, name, typ, value):
+        self.vars[name] = value
+
+
 def test_soma_noise_adds_the_sample_to_the_membrane():
     from ml_genn.compilers.eprop import neuron_logic
-
-    class _Copy:
-        def __init__(self):
-            self.model = {"sim_code": "V = Alpha * V + Isyn + 0.0 * PertEps;\nA *= Rho;"}
-
-        def replace_sim_code(self, a, b):
-            self.model["sim_code"] = self.model["sim_code"].replace(a, b)
-
-    m = _Copy()
+    m = _ModelCopy()
     neuron_logic.add_soma_noise(m, 0.02)
-    assert m.model["sim_code"].startswith("V = Alpha * V + Isyn + 0.02 * Noise1 + 0.0 * PertEps;")
+    assert m.model["sim_code"].startswith("V = Alpha * V + Isyn + NoiseAmp * Noise1 + 0.0 * PertEps;")
+    assert m.vars == {"NoiseAmp": 0.02} and "NoiseAct" not in m.model["sim_code"]
 
 
-def test_soma_noise_trains(request):
-    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+def test_soma_noise_scaled_by_input_activity():
+    """soma_noise_scaling "input": the amplitude follows a slow, noise-free average of the input magnitude."""
+    from ml_genn.compilers.eprop import neuron_logic
+    m = _ModelCopy()
+    neuron_logic.add_soma_noise(m, 0.04, scaling="input", sigma_unit=0.01, gain=4.0, tau=1000.0, dt=1.0,
+                                inhibitory_channel=True)
+    sim = m.model["sim_code"]
+    assert m.vars["NoiseAmp"] == 0.01 and m.vars["NoiseAct"] == pytest.approx(0.25)   # one synapse's worth at start
+    assert sim.index("NoiseAmp * Noise1") < sim.index("NoiseAct = ") < sim.index("NoiseAmp = fmax(")
+    assert "(fabs(Isyn) + fabs(ISynInh))" in sim and "0.04 * NoiseAct" in sim
+    d = float(np.exp(-1 / 1000.0))
+    assert f"{d!r} * NoiseAct" in sim
+    m2 = _ModelCopy()
+    neuron_logic.add_soma_noise(m2, 0.04, scaling="input", sigma_unit=0.01, gain=4.0)
+    assert "ISynInh" not in m2.model["sim_code"]
+
+
+@pytest.mark.parametrize("scaling", ["constant", "input"])
+def test_soma_noise_trains(scaling, request):
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name + scaling, PolicyType.GENERIC,
                                             hidden_rule={"preset": "proposed", "noise_site": "soma",
-                                                         "soma_noise_gain": 2.0})
-    h = _run(compiled, inp, pol, val, steps=100)
+                                                         "soma_noise_gain": 2.0, "soma_noise_scaling": scaling})
+    amp = {}
+
+    def probe(c, stage):
+        p = c.neuron_populations[hid]
+        p.vars["NoiseAmp"].pull_from_device(); amp[stage] = np.array(p.vars["NoiseAmp"].view, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=100, probe=probe)
     assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.all(np.isfinite(amp["end"])) and np.all(amp["end"] > 0)
+    if scaling == "constant":
+        assert np.allclose(amp["end"], amp["start"])
+    else:
+        assert not np.allclose(amp["end"], amp["start"])      # it follows the input
+
+
+def test_shadow_centres_the_drift_and_weights_the_gradient():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    base = build_td_hidden_model(PRESETS["proposed"], **kw)["model"]
+    assert "PsiS" not in {v[0] for v in base["post_vars"]} and "PsiS" not in base["synapse_dynamics_code"]
+    # combined trace (drift and gradient share one trace): drift * (Psi - PsiS) - gradient * PsiBar
+    m = build_td_hidden_model(replace(PRESETS["proposed"], drift_centre="shadow"), **kw)["model"]
+    assert "PsiS" in {v[0] for v in m["post_vars"]}
+    assert "ShadowV_post" in [r[0] for r in m["post_neuron_var_refs"]]
+    assert "PsiS = (1.0 / Vthresh_post) * 0.3 * fmax(0.0, 1.0 - fabs((ShadowV_post - (Vthresh_post + (Beta_post * " \
+           "ShadowA_post))) / Vthresh_post));" in m["post_dynamics_code"]
+    assert "(1.0 * Psi - 1.0 * PsiS - 1.0 * PsiBar) * ZFilter * normXi" in m["synapse_dynamics_code"].replace("  ", " ")\
+        or "- 1.0 * PsiS - 1.0 * PsiBar" in m["synapse_dynamics_code"]
+    # split traces: the drift score and the gradient score separately
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0)
+    m = build_td_hidden_model(replace(PRESETS["proposed"], drift_centre="shadow", gradient_gate="shadow",
+                                      center_drift=True, local=loc), **kw)["model"]
+    syn = m["synapse_dynamics_code"]
+    assert "(Psi - PsiS) * ZFilter * normXi" in syn and "-PsiS * ZFilter * normXi" in syn
+    assert "(Psi - PsiBar) * ZFilter" not in syn
+    for bad in (dict(drift_centre="psi"), dict(gradient_gate="shadow", noise_proxy=True),
+                dict(gradient_gate="shadow_cv")):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], **bad)
+
+
+def test_shadow_control_variate_keeps_the_drift_gate_and_subtracts_its_noise_free_twin():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0)
+    m = build_td_hidden_model(replace(PRESETS["proposed"], drift_centre="shadow_cv", center_drift=True, local=loc),
+                              **kw)["model"]
+    syn, post = m["synapse_dynamics_code"], m["post_dynamics_code"]
+    assert {"PsiS", "PsiBarS"} <= {v[0] for v in m["post_vars"]}
+    assert "(Psi - PsiBar - PsiS + PsiBarS) * ZFilter * normXi" in syn      # split traces: the drift score
+    assert "-PsiBar * ZFilter * normXi" in syn                              # the gradient score is unchanged
+    # psibarS is updated exactly like psibar, after psiS
+    assert "PsiBarS = 0.99 * PsiBarS + 0.01 * PsiS;" in post
+    assert post.index("PsiS = ") < post.index("PsiBar = ") < post.index("PsiBarS = ")
+    # combined trace: drift * gate - gradient * psibar
+    m = build_td_hidden_model(replace(PRESETS["proposed"], drift_centre="shadow_cv"), **kw)["model"]
+    assert "(Psi - PsiBar - PsiS + PsiBarS)" in m["synapse_dynamics_code"]
+    assert "- 1.0 * PsiBar" in m["synapse_dynamics_code"]
+
+
+def test_shadow_neuron_code():
+    from ml_genn.compilers.eprop import neuron_logic
+
+    class _C(_ModelCopy):
+        def prepend_sim_code(self, code):
+            self.model["sim_code"] = code + self.model["sim_code"]
+
+        def add_additional_input_var(self, name, typ, value):
+            self.vars["input:" + name] = value
+
+    m = _C()
+    neuron_logic.add_shadow(m, relay_sigma=0.0067, inhibitory_channel=True, intrinsic_plasticity=True)
+    sim = m.model["sim_code"]
+    assert sim.index("ShadowV = Alpha * ShadowV + shIn;") < sim.index("V = Alpha * V + Isyn")     # before the real step
+    assert "const scalar shIn = Isyn + ISynInh + IPBias - 0.0067 * Noise1 * ISynCount;" in sim
+    assert "ShadowV >= (Vthresh + (Beta * ShadowA)) && ShadowRef <= 0.0" in sim
+    assert "ShadowV -= (Vthresh - Vreset);" in sim and "ShadowRef = TauRefrac;" in sim
+    assert {"ShadowV", "ShadowA", "ShadowRef", "input:ISynCount"} <= set(m.vars)
+    m2 = _C()
+    neuron_logic.add_shadow(m2, relay_sigma=None, integrate_during_refrac=False, relative_reset=False)
+    sim2 = m2.model["sim_code"]
+    assert "ISynCount" not in sim2 and "const scalar shIn = Isyn;" in sim2
+    assert "ShadowV = Alpha * ShadowV;" in sim2 and "ShadowV = Vreset;" in sim2
+    assert "ShadowABar" not in sim2 and "ShadowABar" not in m2.vars
+    # slow alignment of the shadow's adaptation to the real neuron's slow average, before the shadow's update
+    m3 = _C()
+    neuron_logic.add_shadow(m3, relay_sigma=0.0067, align_rate=0.01, align_tau=1000.0, dt=1.0)
+    sim3 = m3.model["sim_code"]
+    d = float(np.exp(-1.0 / 1000.0))
+    assert f"ShadowABar = {d!r} * ShadowABar + {1.0 - d!r} * A;" in sim3
+    assert "ShadowA += 0.01 * (ShadowABar - ShadowA);" in sim3 and "ShadowABar" in m3.vars
+    assert sim3.index("ShadowABar = ") < sim3.index("ShadowA += 0.01") < sim3.index("const scalar shIn")
+    with pytest.raises(ValueError):
+        replace(PRESETS["proposed"], drift_centre="shadow", shadow_align_rate=2.0)
+
+
+@pytest.mark.parametrize("site", ["synapse", "soma"])
+def test_shadow_trains_and_tracks_the_noise_free_membrane(site, request):
+    """With negligible noise the shadow is the real membrane; with noise it differs but stays finite."""
+    rules = {"tiny": {"preset": "proposed", "drift_centre": "shadow", "gradient_gate": "shadow",
+                      "noise_site": site, "log_syn_sigma": -30.0},
+             "noisy": {"preset": "proposed", "drift_centre": "shadow", "gradient_gate": "shadow", "noise_site": site,
+                       "log_syn_sigma": 3.0, "shadow_align_rate": 0.01}}
+    for tag, rule in rules.items():
+        compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name + tag, PolicyType.GENERIC,
+                                                hidden_rule=rule)
+        relays = [c for c in compiled.connection_populations if getattr(c, "is_relay", False)]
+        assert (len(relays) > 0) == (site == "synapse")
+        st = {}
+
+        def probe(c, stage):
+            p = c.neuron_populations[hid]
+            for v in ("V", "ShadowV", "A", "ShadowA"):
+                p.vars[v].pull_from_device(); st[(stage, v)] = np.array(p.vars[v].view, copy=True)
+
+        h = _run(compiled, inp, pol, val, steps=100, probe=probe)
+        assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+        if tag == "tiny":
+            assert np.allclose(st[("end", "ShadowV")], st[("end", "V")], atol=1e-5)
+            assert np.allclose(st[("end", "ShadowA")], st[("end", "A")], atol=1e-5)
+        else:
+            assert np.all(np.isfinite(st[("end", "ShadowV")]))
+            assert not np.allclose(st[("end", "ShadowV")], st[("end", "V")], atol=1e-5)
+
+
+def test_credit_rule_code_and_validation():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    m = build_td_hidden_model(replace(PRESETS["proposed"], credit=2.0), **kw)
+    assert "- 2.0 * CreditL_post * ZFilter" in m["model"]["synapse_dynamics_code"]
+    assert m["post_neuron_var_refs"]["CreditL_post"] == "CreditL"
+    assert "CreditL" not in build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["synapse_dynamics_code"]
+    from ml_genn.compilers.eprop.variants import NoisePlacement
+    for bad in (dict(credit=-1.0), dict(credit=1.0, credit_eta=-1.0), dict(credit=1.0, noise=NoisePlacement.NODE)):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], **bad)
+
+
+def test_credit_neuron_code():
+    from ml_genn.compilers.eprop import neuron_logic
+
+    class _C(_ModelCopy):
+        def prepend_sim_code(self, code):
+            self.model["sim_code"] = code + self.model["sim_code"]
+
+        def add_additional_input_var(self, name, typ, value):
+            self.vars["input:" + name] = value
+
+    m = _C()
+    neuron_logic.add_credit(m, 0.977)
+    sim = m.model["sim_code"]
+    assert "CreditH = 0.977 * CreditH + Noise1;" in sim and "CreditY = TdE * CreditH;" in sim
+    assert "CreditL = Alpha * CreditL + ISynCredit;" in sim
+    assert sim.index("CreditH = ") < sim.index("V = Alpha * V + Isyn")      # before Noise1 is redrawn
+    assert {"CreditH", "CreditY", "CreditL", "input:ISynCredit"} <= set(m.vars)
+
+
+def test_credit_connections_learn_to_predict_and_feed_the_update(request):
+    """A hidden -> hidden credit connection (weights 0) learns (LMS towards Y = TdE * H) and the hidden weights train."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    n = N_HID
+    pre = np.concatenate([np.roll(np.arange(n), s) for s in (1, 2, 3)])
+    post = np.tile(np.arange(n), 3)
+    with net:
+        c = Connection(hid, hid, Explicit(pre, post, 0.0), name="credit_self")
+        c.is_credit = True
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val),
+                                            hidden_rule={"preset": "proposed", "credit": 1.0, "credit_eta": 1e-2})
+    got = {}
+
+    def probe(cn, stage):
+        for conn, p in cn.connection_populations.items():
+            if getattr(conn, "is_credit", False):
+                p.vars["g"].pull_from_device(); got[stage] = np.array(p.vars["g"].values, copy=True)
+        q = cn.neuron_populations[hid]
+        for v in ("CreditH", "CreditY", "CreditL"):
+            q.vars[v].pull_from_device(); got[(stage, v)] = np.array(q.vars[v].view, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=200, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.all(got["start"] == 0.0) and np.all(np.isfinite(got["end"])) and np.any(got["end"] != 0.0)
+    assert np.any(got[("end", "CreditH")] != 0.0) and np.all(np.isfinite(got[("end", "CreditL")]))
+
+
+def test_credit_connections_need_the_rule(request):
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    with net:
+        c = Connection(hid, hid, Explicit(np.arange(N_HID), np.roll(np.arange(N_HID), 1), 0.0), name="credit_self")
+        c.is_credit = True
+    with pytest.raises(ValueError):
+        _compile(EPropCompiler, request.node.name, PolicyType.GENERIC, net_tuple=(net, inp, hid, pol, val),
+                 hidden_rule={"preset": "proposed"})
+
+
+def test_learned_reward_term_and_validation():
+    from ml_genn.compilers.eprop.variants import LocalObjectives, LocalRoute
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    loc = LocalObjectives(route=LocalRoute.GRADIENT_INSTANT, dv=0.0, vreg=0.0, rate=0.0, decorr=1.0, learned_reward=0.5)
+    m = build_td_hidden_model(replace(PRESETS["proposed"], local=loc), **kw)
+    post = m["model"]["post_dynamics_code"]
+    loc_line = post[post.index("LocR = "):].split(";")[0]
+    assert "+ 0.5 * RewIn_post" in loc_line and m["post_neuron_var_refs"]["RewIn_post"] == "RewIn"
+    plain = build_td_hidden_model(replace(PRESETS["proposed"], local=replace(loc, learned_reward=0.0)), **kw)
+    assert "RewIn" not in plain["model"]["post_dynamics_code"]
+    with pytest.raises(ValueError):
+        replace(PRESETS["proposed"], local=replace(loc, route=LocalRoute.WHOLE_TRACE))
+
+
+def test_reward_neurons_drive_the_local_reward_and_learn(request):
+    """A reward population (ordinary hidden ALIF, plastic input) sends fixed reward synapses into the hidden neurons'
+    reward input; everything trains and the received reward is non-zero."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    rng = np.random.default_rng(3)
+    with net:
+        pool = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0), 6)
+        Connection(inp, pool, Dense((0.2 + 0.05 * rng.standard_normal((N_IN, 6))).astype(np.float32)))
+        pre = np.tile(np.arange(6), N_HID); post = np.repeat(np.arange(N_HID), 6)
+        c = Connection(pool, hid, Explicit(pre, post, rng.normal(0, 0.5, len(pre))), name="reward_to_hid")
+        c.is_reward = True
+    rule = {"preset": "proposed", "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0,
+                                            "learned_reward": 1.0}}
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val), hidden_rule=rule)
+    got = {}
+
+    def probe(cn, stage):
+        q = cn.neuron_populations[hid]
+        q.vars["RewIn"].pull_from_device(); got[stage] = np.array(q.vars["RewIn"].view, copy=True)
+        for conn, p in cn.connection_populations.items():
+            if conn.target() is pool:
+                p.vars["g"].pull_from_device(); got[(stage, "pool_in")] = np.array(p.vars["g"].values, copy=True)
+            if getattr(conn, "is_reward", False):
+                p.vars["g"].pull_from_device(); got[(stage, "reward")] = np.array(p.vars["g"].values, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=200, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.any(got["end"] != 0.0) and np.all(np.isfinite(got["end"]))           # reward received
+    assert np.any(got[("end", "pool_in")] != got[("start", "pool_in")])           # the reward neurons learn
+    assert np.array_equal(got[("end", "reward")], got[("start", "reward")])        # their reward synapses are fixed
+
+
+def test_learning_signal_neurons_feed_the_credit_term(request):
+    """Signal neurons (ordinary hidden ALIF, plastic input) send fixed synapses into the hidden neurons' learning-signal
+    input (ISynCredit -> CreditL), used by the credit term; everything trains."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    rng = np.random.default_rng(4)
+    with net:
+        pool = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0), 6)
+        Connection(inp, pool, Dense((0.2 + 0.05 * rng.standard_normal((N_IN, 6))).astype(np.float32)))
+        pre = np.tile(np.arange(6), N_HID); post = np.repeat(np.arange(N_HID), 6)
+        c = Connection(pool, hid, Explicit(pre, post, rng.normal(0, 0.5, len(pre))), name="signal_to_hid")
+        c.is_signal = True
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val),
+                                            hidden_rule={"preset": "proposed", "credit": 1.0})
+    got = {}
+
+    def probe(cn, stage):
+        q = cn.neuron_populations[hid]
+        q.vars["CreditL"].pull_from_device(); got[stage] = np.array(q.vars["CreditL"].view, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=200, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0]) and np.any(got["end"] != 0.0)
+    net2, inp2, hid2, pol2, val2 = _network()
+    with net2:
+        pool2 = Population(AdaptiveLeakyIntegrateFire(v_thresh=0.61, tau_mem=10.0, tau_refrac=3.0, tau_adapt=300.0), 2)
+        c2 = Connection(pool2, hid2, Explicit(np.zeros(N_HID, int), np.arange(N_HID), 0.1), name="signal_to_hid")
+        c2.is_signal = True
+    with pytest.raises(ValueError):
+        _compile(EPropCompiler, request.node.name + "x", PolicyType.GENERIC, net_tuple=(net2, inp2, hid2, pol2, val2),
+                 hidden_rule={"preset": "proposed"})
+
+
+@pytest.mark.parametrize("channel", ["reward", "signal"])
+def test_trained_links_grow_from_zero(channel, request):
+    """Reward / learning-signal links between hidden neurons, starting at 0, trained by the alignment rule
+    (link_eta): they become non-zero and stay finite; the network trains."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    pre = np.concatenate([np.roll(np.arange(N_HID), s) for s in (1, 2)]); post = np.tile(np.arange(N_HID), 2)
+    with net:
+        c = Connection(hid, hid, Explicit(pre, post, 0.0), name=f"{channel}link")
+        setattr(c, "is_reward" if channel == "reward" else "is_signal", True)
+    rule = {"preset": "proposed", "link_eta": 1e-2, "link_decay": 1e-3}
+    if channel == "reward":
+        rule["local"] = {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0, "learned_reward": 1.0}
+    else:
+        rule["credit"] = 1.0
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val), hidden_rule=rule)
+    got = {}
+
+    def probe(cn, stage):
+        for conn, p in cn.connection_populations.items():
+            if getattr(conn, "is_reward", False) or getattr(conn, "is_signal", False):
+                p.vars["g"].pull_from_device(); got[stage] = np.array(p.vars["g"].values, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=200, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.all(got["start"] == 0.0) and np.any(got["end"] != 0.0) and np.all(np.isfinite(got["end"]))
+    with pytest.raises(ValueError):
+        replace(PRESETS["proposed"], link_eta=-1.0)
 
 
 def test_backprop_activity_sends_the_spike_deviation_and_raises_drive_after_positive_td():
@@ -2375,3 +2711,54 @@ def test_diagnose_parts_splits_the_combined_trace_into_drift_and_gradient(reques
     assert np.abs(cat["RLNoiseTrace"]).max() > 0
     assert np.allclose(cat["PartPtrace"] + cat["PartGtrace"], cat["RLNoiseTrace"], rtol=1e-4, atol=1e-6)
     assert np.abs(cat["AccP"]).max() > 0 and np.abs(cat["AccGp"]).max() > 0
+
+
+def test_route_term_in_the_synapse_rule():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = build_td_hidden_model(replace(PRESETS["proposed"], route=0.5), **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "0.5 * RtW_post * reward * RLRouteTrace" in syn[syn.index("DeltaG +="):]
+    assert "RLRouteTrace = Lambda * RLRouteTrace + Psi * RtRoute_post * ZFilter;" in syn
+    assert "RLRouteTrace" in {v[0] for v in model["vars"]}
+    off = build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["synapse_dynamics_code"]
+    assert "RLRouteTrace" not in off and "RtW_post" not in off
+    for bad in (dict(route=-1.0), dict(route_stats_rate=0.0), dict(route_in_decay=1.0)):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], **bad)
+
+
+def test_route_links_learn_sensitivities_and_route_credit(request):
+    """Route links between hidden neurons (is_route, start at 0): they learn reward-free (non-zero, finite), the
+    neurons receive a routed signal and build trust in it, and the network trains."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    pre = np.concatenate([np.roll(np.arange(N_HID), s) for s in (1, 2)]); post = np.tile(np.arange(N_HID), 2)
+    with net:
+        c = Connection(hid, hid, Explicit(pre, post, 0.0), name="routelink")
+        c.is_route = True
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val),
+                                            hidden_rule={"preset": "proposed", "route": 1.0, "route_eta": 1e-2,
+                                                         "route_prior": 50.0, "route_stats_rate": 1e-2})
+    got = {}
+
+    def probe(cn, stage):
+        for conn, p in cn.connection_populations.items():
+            if getattr(conn, "is_route", False):
+                p.vars["g"].pull_from_device(); got[stage] = np.array(p.vars["g"].values, copy=True)
+        q = cn.neuron_populations[hid]
+        for v in ("RtW", "RtRoute", "RtScSq"):
+            q.vars[v].pull_from_device(); got[(stage, v)] = np.array(q.vars[v].view, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=300, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.all(got["start"] == 0.0) and np.any(got["end"] != 0.0) and np.all(np.isfinite(got["end"]))
+    assert np.any(got[("end", "RtScSq")] > 0) and np.all(np.isfinite(got[("end", "RtW")]))
+    assert np.any(got[("end", "RtRoute")] != 0.0) and np.any(got[("end", "RtW")] > 0.0)
+    net2, inp2, hid2, pol2, val2 = _network()
+    with net2:
+        c2 = Connection(hid2, hid2, Explicit(pre, post, 0.0), name="routelink")
+        c2.is_route = True
+    with pytest.raises(ValueError):                      # route links need hidden_rule.route != 0
+        _compile(EPropCompiler, request.node.name + "x", PolicyType.GENERIC, net_tuple=(net2, inp2, hid2, pol2, val2),
+                 hidden_rule={"preset": "proposed"})

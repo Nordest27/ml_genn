@@ -269,6 +269,25 @@ class NetworkSpec:
     black_box: Optional[dict] = None  # {"h": heterogeneity, "seed": s}: every hidden ALIF population (fields too) is a
                                       # BlackBoxALIF with per-neuron dynamics the learning rules are not told about
     reward_relay: Optional[RelaySpec] = None   # None: no relay of the value head's reward to the network
+    reward_links: Optional[dict] = None   # the network's own neurons send reward or learning signals: {"channel":
+                                     # "reward" | "signal", "topology": "random" | "mirror" (one link per existing
+                                     # synapse between hidden populations: the network's own wiring) | "reverse" (the
+                                     # same, backwards: each synapse i -> j gets a link j -> i), "sources":
+                                     # "all" | [labels], "targets": "all" | [labels],
+                                     # "k": 8, "scale": 1.0, "seed": 0} - every target neuron receives k fixed random
+                                     # links (weights N(0, scale / sqrt(k)), both signs, never from itself) from the
+                                     # source populations' neurons, into ISynReward (local.learned_reward) or
+                                     # ISynCredit (hidden_rule.credit)
+    reward_pool: Optional[dict] = None   # reward neurons (local.learned_reward) or, "channel": "signal", learning-
+                                     # signal neurons (hidden_rule.credit: Delta w = c * L * ZFilter): {"n": 64, "in_from": ["L1_E"],
+                                     # "k_in": 16, "in_mean": 1.0, "in_sd": 0.1, "targets": "all" | [labels], "k_out": 8,
+                                     # "out_scale": 1.0, "seed": 0} - a population of ordinary hidden ALIF neurons (the
+                                     # same rule as the others) reading the network through plastic excitatory synapses
+                                     # and sending fixed random reward synapses (both signs) into the targets' ISynReward
+    credit: Optional[dict] = None    # learned learning signal (hidden_rule.credit): {"sources": ["policy_field",
+                                     # "value_field"], "k": 16, "self_k": 16, "seed": 0} - every hidden ALIF neuron gets
+                                     # k credit connections from each source population (labels) and self_k from its
+                                     # own population (random, no self-connection), weights 0, into ISynCredit
     cue: Optional[CueSpec] = None    # None: no context-cue input (set by cued_foraging)
     boolean_head: Optional[BooleanSpec] = None   # None: the heads read the fields; else Boolean units in between
     headless: Optional[int] = None   # None: the policy head reads its field through random weights; an int (seed): the
@@ -302,6 +321,7 @@ class Built:
     code: Optional[Population] = None                      # the code population the heads read (ei_layers 0) or None
     boolean: list = field(default_factory=list)            # Boolean head populations (policy, value), if any
     population_optimisers: dict = field(default_factory=dict)   # Population -> (owner, settings), e.g. ("L2", {...})
+    extra_hidden: list = field(default_factory=list)       # further hidden populations (e.g. the reward pool)
 
     @property
     def hidden(self):
@@ -310,7 +330,7 @@ class Built:
             pops += list(layer)
             if k < len(self.slow) and self.slow[k] is not None:
                 pops.append(self.slow[k])
-        return pops + list(self.fields or ())
+        return pops + list(self.fields or ()) + list(self.extra_hidden)
 
     def layer_pops(self, k):
         """Every population of layer k: E, I and the slow sub-population if any."""
@@ -869,8 +889,253 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                         Connection(pop, head, FixedProbability(spec.feedback_p,
                                                                Normal(sd=1.0 / np.sqrt(spec.num_actions))),
                                    feedback_name=name, exc_inh_sign=None)
-    return Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay,
-                 slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, boolean=booleans)
+    built = Built(network, inp, layers, fields, policy, value, labels, rules, i_to_e, i_to_i, reward_relay=relay,
+                  slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, boolean=booleans)
+    if spec.reward_pool is not None:
+        add_reward_pool(built, spec, spec.reward_pool)
+    if spec.reward_links is not None:
+        add_reward_links(built, spec.reward_links, spec)
+    if spec.credit is not None:
+        add_credit_connections(built, spec.credit)
+    return built
+
+
+def _hidden_positions(built, spec, pops):
+    """Positions (E-sheet cells) of the given hidden populations for the 'local' link topology: per layer, each
+    population on the layer's E sheet; a volume layer adds its depth axis (z_spacing). Returns ({pop: (N, 3)}, side,
+    open-z flag)."""
+    pos, side = {}, None
+    for k, layer in enumerate(built.layers):
+        ls = spec.layers[k] if spec is not None and k < len(spec.layers) else None
+        vol = ls.volume if ls is not None else None
+        side_k = int(layer[0].shape[0])
+        side = side_k if side is None else side
+        for p in layer:
+            if p is None or p not in pops:
+                continue
+            shape = tuple(p.shape) + (1,) * (3 - len(p.shape))
+            q = volume_positions(shape, side_k, vol is not None, vol.z_spacing if vol is not None else 1.0)
+            if vol is None:                     # stacked 2D layers: a layer's own plane, one cell per layer apart
+                q[:, 2] = float(k)
+            pos[p] = q
+    top = max((float(q[:, 2].max()) for q in pos.values()), default=0.0)
+    for p in (built.fields or ()):          # the fields read the top of the network: on the sheet, at the top
+        if p is not None and p in pops and p not in pos:
+            shape = tuple(p.shape) + (1,) * (3 - len(p.shape))
+            q = volume_positions(shape, side, False); q[:, 2] = top
+            pos[p] = q
+    missing = [p for p in pops if p not in pos]
+    if missing:
+        raise NotImplementedError("reward_links local: populations without a position (" +
+                                  ", ".join(built.labels.get(p, str(p)) for p in missing) + ")")
+    return pos, side
+
+
+def add_reward_links(built, cfg, spec=None):
+    """Reward / learning-signal / route links between the network's own neurons (see NetworkSpec.reward_links).
+    topology: "random" (k senders per target from all sources), "mirror" / "reverse" (along / back along the network's
+    own wiring) or "local" (k senders per target drawn without replacement with probability ~ exp(-d^2 / 2 sigma^2),
+    d the distance in E-sheet cells, toroidal in x, y; sigma = cfg["sigma"], default 1.5)."""
+    unknown = set(cfg) - {"channel", "sources", "targets", "k", "scale", "seed", "topology", "init", "sigma"}
+    if cfg.get("init", "random") not in ("random", "zero"):
+        raise ValueError("network.reward_links.init must be 'random' or 'zero'")
+    zero = cfg.get("init", "random") == "zero"     # trained links (hidden_rule.link_eta) start harmless
+    topology = cfg.get("topology", "random")
+    if topology not in ("random", "mirror", "reverse", "local"):
+        raise ValueError("network.reward_links.topology must be 'random', 'mirror', 'reverse' or 'local', "
+                         f"not {topology!r}")
+    if unknown:
+        raise KeyError(f"network.reward_links: unknown keys {sorted(unknown)}")
+    channel = cfg.get("channel", "reward")
+    if channel not in ("reward", "signal", "route"):
+        raise ValueError(f"network.reward_links.channel must be 'reward', 'signal' or 'route', not {channel!r}")
+    by_label = {lab: pop for pop, lab in built.labels.items()}
+    alif = [p for p in built.hidden if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
+    pick = lambda v: alif if v == "all" else [by_label[lab] for lab in v]
+    for key in ("sources", "targets"):
+        v = cfg.get(key, "all")
+        if v != "all":
+            missing = [lab for lab in v if lab not in by_label]
+            if missing:
+                raise KeyError(f"network.reward_links.{key}: unknown populations {missing} (have {sorted(by_label)})")
+    sources, targets = pick(cfg.get("sources", "all")), pick(cfg.get("targets", "all"))
+    k, scale = int(cfg.get("k", 8)), float(cfg.get("scale", 1.0))
+    rng = np.random.default_rng(int(cfg.get("seed", 0)))
+
+    def link(src, tgt, pre, post, indeg):
+        w = (np.zeros(len(pre)) if zero else
+             rng.normal(0.0, 1.0, len(pre)) * scale / np.sqrt(np.maximum(indeg[post], 1)))
+        c = Connection(src, tgt, Explicit(pre, post, w), name=f"{channel}link_{built.labels[src]}_to_{built.labels[tgt]}")
+        if channel == "reward":
+            c.is_reward = True
+        elif channel == "route":      # routed credit: learned computation sensitivities (hidden_rule.route)
+            c.is_route = True
+        else:
+            c.is_signal = True
+
+    if topology in ("mirror", "reverse"):   # along the network's own wiring (reverse: back along each synapse)
+        special = ("is_relay", "is_credit", "is_reward", "is_signal", "is_route")
+        plan = []
+        for c in list(built.network.connections):
+            src_, tgt_ = (c.source(), c.target()) if topology == "mirror" else (c.target(), c.source())
+            if (c.is_feedback or any(getattr(c, a, False) for a in special) or src_ not in sources
+                    or tgt_ not in targets):
+                continue
+            pre, post = getattr(c.connectivity, "pre_ind", None), getattr(c.connectivity, "post_ind", None)
+            if (pre is None or post is None) and type(c.connectivity).__name__ == "Dense":   # all-to-all
+                n_s, n_t = int(np.prod(c.source().shape)), int(np.prod(c.target().shape))
+                pre, post = np.repeat(np.arange(n_s), n_t), np.tile(np.arange(n_t), n_s)
+            if pre is None or post is None:
+                raise NotImplementedError(f"reward_links {topology}: {c.name} ({type(c.connectivity).__name__}) has "
+                                          "no explicit indices")
+            pre, post = np.asarray(pre), np.asarray(post)
+            plan.append((src_, tgt_, pre, post) if topology == "mirror" else (src_, tgt_, post, pre))
+        indeg = {}
+        for src, tgt, pre, post in plan:      # in-degree over all mirrored links into each target neuron
+            indeg[tgt] = indeg.get(tgt, 0) + np.bincount(post, minlength=int(np.prod(tgt.shape)))
+        with built.network:
+            for src, tgt, pre, post in plan:
+                link(src, tgt, pre, post, indeg[tgt])
+        return
+    sizes = [int(np.prod(p.shape)) for p in sources]
+    offs = np.concatenate([[0], np.cumsum(sizes)])
+    if topology == "local":
+        pos, side = _hidden_positions(built, spec, set(sources) | set(targets))
+        src_pos = np.concatenate([pos[p] for p in sources])
+        sig = float(cfg.get("sigma", 1.5))
+        with built.network:
+            for tgt in targets:
+                tp = pos[tgt]; n_t = len(tp)
+                own = sources.index(tgt) if tgt in sources else None
+                kk = min(k, int(offs[-1]) - (1 if own is not None else 0))
+                order = np.empty((n_t, kk), dtype=np.int64)
+                for j in range(n_t):
+                    d = np.abs(src_pos - tp[j])
+                    d[:, :2] = np.minimum(d[:, :2], side - d[:, :2])           # toroidal sheet
+                    logp = -(d * d).sum(1) / (2.0 * sig * sig)
+                    if own is not None:
+                        logp[offs[own] + j] = -np.inf                           # never the target itself
+                    g = logp - np.log(-np.log(rng.random(len(logp))))         # Gumbel top-k: sampling w/o replacement
+                    order[j] = np.argpartition(-g, kk - 1)[:kk]
+                for si, src in enumerate(sources):
+                    sel = (order >= offs[si]) & (order < offs[si + 1])
+                    if not sel.any():
+                        continue
+                    post = np.nonzero(sel)[0]
+                    pre = order[sel] - offs[si]
+                    link(src, tgt, pre, post, np.full(n_t, kk))
+        return
+    with built.network:
+        for tgt in targets:
+            n_t = int(np.prod(tgt.shape))
+            own = sources.index(tgt) if tgt in sources else None
+            n_all = int(offs[-1])
+            # k distinct sources per target over the concatenated source neurons, never the target itself
+            kk = min(k, n_all - (1 if own is not None else 0))
+            order = np.empty((n_t, kk), dtype=np.int64)
+            for j in range(n_t):
+                if own is None:
+                    order[j] = rng.choice(n_all, kk, replace=False)
+                else:                       # draw from n_all - 1 and skip the target's own index
+                    me = offs[own] + j
+                    x = rng.choice(n_all - 1, kk, replace=False)
+                    order[j] = x + (x >= me)
+            for si, src in enumerate(sources):
+                sel = (order >= offs[si]) & (order < offs[si + 1])
+                if not sel.any():
+                    continue
+                post = np.nonzero(sel)[0]
+                pre = order[sel] - offs[si]
+                link(src, tgt, pre, post, np.full(n_t, kk))
+
+
+def add_reward_pool(built, spec, cfg):
+    """Reward neurons (see NetworkSpec.reward_pool): added to built.extra_hidden with the label "reward_pool"; their
+    reward synapses are marked is_reward (the compiler routes them to ISynReward and keeps them fixed)."""
+    unknown = set(cfg) - {"n", "in_from", "k_in", "in_mean", "in_sd", "targets", "k_out", "out_scale", "seed", "rule",
+                          "channel"}
+    channel = cfg.get("channel", "reward")
+    if channel not in ("reward", "signal"):
+        raise ValueError(f"network.reward_pool.channel must be 'reward' or 'signal', not {channel!r}")
+    if unknown:
+        raise KeyError(f"network.reward_pool: unknown keys {sorted(unknown)}")
+    by_label = {lab: pop for pop, lab in built.labels.items()}
+    rng = np.random.default_rng(int(cfg.get("seed", 0)))
+    n = int(cfg.get("n", 64))
+    in_from = list(cfg.get("in_from", ["L1_E"]))
+    targets_cfg = cfg.get("targets", "all")
+    missing = [lab for lab in in_from + ([] if targets_cfg == "all" else list(targets_cfg)) if lab not in by_label]
+    if missing:
+        raise KeyError(f"network.reward_pool: unknown populations {missing} (have {sorted(by_label)})")
+    targets = ([p for p in built.hidden if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)] if targets_cfg == "all"
+               else [by_label[lab] for lab in targets_cfg])
+    k_in, k_out = int(cfg.get("k_in", 16)), int(cfg.get("k_out", 8))
+    m, sd, out_scale = float(cfg.get("in_mean", 1.0)), float(cfg.get("in_sd", 0.1)), float(cfg.get("out_scale", 1.0))
+    layer = spec.layers[0]
+    with built.network:
+        pool = Population(_alif(layer.neuron, spec.node_sigma, spec.black_box, spec.integrate_during_refrac,
+                                spec.resonator, spec.plateau), (n, 1, 1))
+        built.labels[pool] = "reward_pool"
+        for lab in in_from:                 # the network -> the reward neurons: plastic, excitatory
+            src = by_label[lab]
+            n_s = int(np.prod(src.shape)); kk = min(k_in, n_s)
+            pre = rng.random((n, n_s)).argsort(1)[:, :kk].ravel()
+            post = np.repeat(np.arange(n), kk)
+            w = rng.normal(m / np.sqrt(kk), sd / np.sqrt(kk), len(pre))
+            Connection(src, pool, Explicit(pre, post, w), name=f"reward_pool_from_{lab}", exc_inh_sign=+1)
+        for tgt in targets:                 # the reward neurons -> every target's reward input: fixed, both signs
+            n_t = int(np.prod(tgt.shape)); kk = min(k_out, n)
+            pre = rng.random((n_t, n)).argsort(1)[:, :kk].ravel()
+            post = np.repeat(np.arange(n_t), kk)
+            w = rng.normal(0.0, out_scale / np.sqrt(kk), len(pre))
+            c = Connection(pool, tgt, Explicit(pre, post, w), name=f"{channel}_to_{built.labels[tgt]}")
+            if channel == "reward":         # a reward the target credits through its noise score (local.learned_reward)
+                c.is_reward = True
+            else:                           # a learning signal the target uses e-prop style (hidden_rule.credit)
+                c.is_signal = True
+        # the TD error reaches the reward neurons like every other hidden population (without it their TD-gated
+        # terms - drift, contrast - are zero and they are never rewarded for what works)
+        if built.value is not None:
+            Connection(pool, built.value, Dense(weight=1.0), feedback_name="tde_transport")
+        built.extra_hidden.append(pool)
+        if cfg.get("rule") is not None:     # the reward neurons' own rule (replaces the global one for them)
+            built.population_rules[pool] = cfg["rule"]
+
+
+def add_credit_connections(built, cfg):
+    """Credit connections for the learned learning signal (see NetworkSpec.credit and HiddenRuleConfig.credit): fixed
+    in-degree, uniformly random sources, weight 0, marked is_credit (the compiler gives them their own learning rule and
+    routes them to ISynCredit)."""
+    unknown = set(cfg) - {"sources", "k", "self_k", "seed"}
+    if unknown:
+        raise KeyError(f"network.credit: unknown keys {sorted(unknown)}")
+    by_label = {lab: pop for pop, lab in built.labels.items()}
+    sources = list(cfg.get("sources", ["policy_field", "value_field"]))
+    missing = [lab for lab in sources if lab not in by_label]
+    if missing:
+        raise KeyError(f"network.credit: unknown source populations {missing} (have {sorted(by_label)})")
+    k, self_k = int(cfg.get("k", 16)), int(cfg.get("self_k", 16))
+    rng = np.random.default_rng(int(cfg.get("seed", 0)))
+    targets = [p for p in built.hidden if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
+    with built.network:
+        for tgt in targets:
+            n_t = int(np.prod(tgt.shape))
+            plan = [(by_label[lab], k, lab) for lab in sources] + ([(tgt, self_k, "self")] if self_k > 0 else [])
+            for src, kk, lab in plan:
+                n_s = int(np.prod(src.shape))
+                same = src is tgt
+                kk = min(kk, n_s - (1 if same else 0))
+                if kk <= 0:
+                    continue
+                order = rng.random((n_t, n_s)).argsort(1)
+                if same:   # drop each target's own index, keep the first kk of the rest
+                    order = np.stack([row[row != j][:kk] for j, row in enumerate(order)])
+                else:
+                    order = order[:, :kk]
+                pre = order.ravel()
+                post = np.repeat(np.arange(n_t), kk)
+                c = Connection(src, tgt, Explicit(pre, post, 0.0), name=f"credit_{lab}_to_{built.labels[tgt]}")
+                c.is_credit = True
 
 
 # --------------------------------------------------------------------------------------------------------------

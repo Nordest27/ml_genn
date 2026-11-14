@@ -449,15 +449,161 @@ def add_intrinsic_plasticity(model_copy, eta=1e-5, psi_target=0.07, decay=0.999,
         """)
 
 
-def add_soma_noise(model_copy, sigma):
-    """noise_site "soma": the neuron's own noise sample enters the membrane directly, sigma * Noise1 every step
+def add_soma_noise(model_copy, sigma, scaling="constant", sigma_unit=None, gain=1.0, tau=1000.0, dt=1.0,
+                   inhibitory_channel=False):
+    """noise_site "soma": the neuron's own noise sample enters the membrane directly, NoiseAmp * Noise1 every step
     (instead of SynSig * Noise1 per transmitting synapse). Noise1 is still the previous step's sample here (it is
-    redrawn by the code appended after the membrane update), the one the synapses would have delivered."""
+    redrawn by the code appended after the membrane update), the one the synapses would have delivered.
+    scaling "constant": NoiseAmp = sigma. "input": NoiseAmp = sigma_unit * gain * NoiseAct, NoiseAct a slow running
+    average (time constant tau) of the noise-free synaptic input magnitude |Isyn| (+ |ISynInh|), updated after the
+    membrane update, so the amplitude used in a step is the one the synapses read for their bookkeeping."""
     sim = model_copy.model.get("sim_code", "")
     source = "V = Alpha * V + Isyn"
     if sim.count(source) != 1:
         raise RuntimeError("soma noise: the ALIF membrane update was not found exactly once")
-    model_copy.replace_sim_code(source, f"V = Alpha * V + Isyn + {float(sigma)!r} * Noise1")
+    model_copy.add_var("NoiseAmp", "scalar", float(sigma) if scaling == "constant" else float(sigma_unit))
+    model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + NoiseAmp * Noise1")
+    if scaling == "input":
+        model_copy.add_var("NoiseAct", "scalar", 1.0 / float(gain))
+        d = float(np.exp(-dt / tau))
+        drive = "fabs(Isyn)" + (" + fabs(ISynInh)" if inhibitory_channel else "")
+        model_copy.append_sim_code(f"""
+        NoiseAct = {d!r} * NoiseAct + {1.0 - d!r} * ({drive});
+        NoiseAmp = fmax({float(sigma_unit) * float(gain)!r} * NoiseAct, 1e-9);
+        """)
+    elif scaling != "constant":
+        raise ValueError(f"unknown soma noise scaling {scaling!r}")
+
+
+def add_shadow(model_copy, *, relay_sigma=None, refrac=True, integrate_during_refrac=True, relative_reset=True,
+               inhibitory_channel=False, intrinsic_plasticity=False, align_rate=0.0, align_tau=1000.0, dt=1.0):
+    """The neuron's noise-free shadow: a second membrane (ShadowV, ShadowA, ShadowRef) with the same input, leak,
+    adaptation, threshold, reset and refractoriness, but without the injected noise. It is prepended to the step, where
+    Noise1 still holds the sample the synapses delivered in this step (it is redrawn later in the step).
+    relay_sigma: synapse noise (SynSig * Noise1 per transmitting synapse): the shadow subtracts relay_sigma * Noise1 *
+    ISynCount, ISynCount the number of inputs transmitting in this step (the relay connections); None: the input
+    carries no noise (soma noise). Inhibition through a reversal potential is not supported."""
+    model_copy.add_var("ShadowV", "scalar", 0.0)
+    model_copy.add_var("ShadowA", "scalar", 0.0)
+    model_copy.add_var("ShadowRef", "scalar", 0.0)
+    drive = "Isyn" + (" + ISynInh" if inhibitory_channel else "") + (" + IPBias" if intrinsic_plasticity else "")
+    if relay_sigma is not None:
+        model_copy.add_additional_input_var("ISynCount", "scalar", 0.0)
+        drive += f" - {float(relay_sigma)!r} * Noise1 * ISynCount"
+    if refrac and not integrate_during_refrac:
+        update = f"""if (ShadowRef > 0.0) {{
+            ShadowRef -= dt;
+            ShadowV = Alpha * ShadowV;
+            ShadowA *= Rho;
+        }}
+        else {{
+            ShadowV = Alpha * ShadowV + shIn;
+            ShadowA *= Rho;
+        }}"""
+    else:
+        update = """ShadowV = Alpha * ShadowV + shIn;
+        ShadowA *= Rho;""" + ("""
+        if (ShadowRef > 0.0) {
+            ShadowRef -= dt;
+        }""" if refrac else "")
+    reset = "ShadowV -= (Vthresh - Vreset);" if relative_reset else "ShadowV = Vreset;"
+    cond = "ShadowV >= (Vthresh + (Beta * ShadowA))" + (" && ShadowRef <= 0.0" if refrac else "")
+    align = ""
+    if align_rate > 0:   # the shadow's slow state follows a slow average of the real one (A of the previous step)
+        model_copy.add_var("ShadowABar", "scalar", 0.0)
+        d = float(np.exp(-dt / align_tau))
+        align = (f"ShadowABar = {d!r} * ShadowABar + {1.0 - d!r} * A;\n        "
+                 f"ShadowA += {float(align_rate)!r} * (ShadowABar - ShadowA);")
+    model_copy.prepend_sim_code(f"""
+        {{   // noise-free shadow of this neuron
+        {align}
+        const scalar shIn = {drive};
+        {update}
+        if ({cond}) {{
+            {reset}
+            ShadowA += 1.0;
+            {"ShadowRef = TauRefrac;" if refrac else ""}
+        }}
+        }}
+        """)
+
+
+def add_credit(model_copy, lam):
+    """Learned learning signal (rule.credit): the neuron's noise trace H (its own samples, the one delivered in this
+    step: prepended, before Noise1 is redrawn), the perturbation estimate of its credit Y = TdE * H (TdE of the
+    previous step) and the prediction L of its credit connections (ISynCredit), filtered like a presynaptic trace."""
+    model_copy.add_additional_input_var("ISynCredit", "scalar", 0.0)
+    for v in ("CreditH", "CreditY", "CreditL"):
+        model_copy.add_var(v, "scalar", 0.0)
+    model_copy.prepend_sim_code(f"""
+        CreditH = {float(lam)!r} * CreditH + Noise1;
+        CreditY = TdE * CreditH;
+        CreditL = Alpha * CreditL + ISynCredit;
+        """)
+
+
+def add_route(model_copy, lam, *, prior, stats_rate, in_decay, recursive, own_scale=1.0, score_decay=0.0,
+              link_signal="noise"):
+    """Routed credit (rule.route): the neuron's state for its route links.
+    RtScore = psi * RtNz (its noise score: pseudo-derivative times its membrane-filtered noise). RtScoreP is what the
+    route links into this neuron regress their sender's input on: link_signal "noise": the previous step's noise score
+    (filtered with score_decay); "spike": its centred spike of the previous step (filtered), RtSpk being set by the
+    reset code. RtScSq: running mean square of that regressor (bias-corrected). RtIn / RtInBar: its input and running
+    mean; RtRoute: the routed signal it receives (ISynRoute); RtOwn / RtRtr: lambda-traces of its own perturbation score
+    ((psi - mean psi) * RtNz * own_scale, the neuron-level counterpart of the drift's (psi - psibar) * normXi) and of its
+    routed score (psi * RtRoute); RtW: its trust in the routed credit (regression of TD * own on TD * routed, prior: the
+    equal-scale weight for `prior` steps); RtMsg = Noise1 (+ RtW * psi * RtRoute if recursive), sent back along its
+    route links. Prepended: Noise1 is the sample delivered in this step (as add_credit), TdE the previous step's."""
+    model_copy.add_additional_input_var("ISynRoute", "scalar", 0.0)
+    for v in ("RtNz", "RtScore", "RtScoreF", "RtScoreP", "RtScSq", "RtScSqRaw", "RtIn", "RtInBar", "RtRoute", "RtOwn",
+              "RtRtr", "RtCov", "RtVarR", "RtVarO", "RtAge", "RtW", "RtMsg", "RtPsiBar", "RtSpk", "RtSpkBar"):
+        model_copy.add_var(v, "scalar", 0.0)
+    a, lam, di, sd = float(stats_rate), float(lam), float(in_decay), float(score_decay)
+    if link_signal == "spike":
+        score = (f"RtNz = Alpha * RtNz + Noise1;\n"
+                 f"        RtScore = rtPsi * RtNz;\n"
+                 f"        RtSpkBar = {1.0 - a!r} * RtSpkBar + {a!r} * RtSpk;\n"
+                 f"        RtScoreF = {sd!r} * RtScoreF + (RtSpk - RtSpkBar);\n"
+                 f"        RtScoreP = RtScoreF;\n"            # the previous step's spike reaches its targets now
+                 f"        RtSpk = 0.0;")
+        model_copy.append_reset_code("RtSpk = 1.0;")
+    else:
+        score = (f"RtScoreP = RtScoreF;\n"
+                 f"        RtNz = Alpha * RtNz + Noise1;\n"
+                 f"        RtScore = rtPsi * RtNz;\n"
+                 f"        RtScoreF = {sd!r} * RtScoreF + RtScore;")
+    model_copy.prepend_sim_code(f"""
+        {{
+        const scalar rtPsi = (1.0 / Vthresh) * 0.3 * fmax(0.0, 1.0 - fabs((V - (Vthresh + (Beta * A))) / Vthresh));
+        RtPsiBar = {1.0 - a!r} * RtPsiBar + {a!r} * rtPsi;
+        {score}
+        RtScSqRaw = {1.0 - a!r} * RtScSqRaw + {a!r} * RtScoreP * RtScoreP;
+        RtScSq = RtScSqRaw / (1.0 - pow({1.0 - a!r}, RtAge + 1.0));
+        RtRoute = ISynRoute;
+        RtOwn = {lam!r} * RtOwn + (rtPsi - RtPsiBar) * RtNz * {float(own_scale)!r};
+        RtRtr = {lam!r} * RtRtr + rtPsi * RtRoute;
+        const scalar rtTd2 = TdE * TdE;
+        RtCov += {a!r} * (rtTd2 * RtOwn * RtRtr - RtCov);
+        RtVarR += {a!r} * (rtTd2 * RtRtr * RtRtr - RtVarR);
+        RtVarO += {a!r} * (rtTd2 * RtOwn * RtOwn - RtVarO);
+        RtAge += 1.0;
+        RtW = (RtVarR > 1e-30) ? (RtAge * fmax(RtCov, 0.0) / RtVarR + {float(prior)!r} * sqrt(RtVarO / RtVarR))
+                                 / (RtAge + {float(prior)!r}) : 0.0;
+        RtMsg = Noise1{" + RtW * rtPsi * RtRoute" if recursive else ""};
+        RtIn = Isyn;
+        RtInBar = {di!r} * RtInBar + {1.0 - di!r} * Isyn;
+        }}
+        """)
+
+
+def add_reward_input(model_copy):
+    """The reward a neuron receives from reward neurons (local.learned_reward): ISynReward filtered like a presynaptic
+    trace, RewIn = Alpha RewIn + ISynReward (it does not enter the membrane)."""
+    model_copy.add_additional_input_var("ISynReward", "scalar", 0.0)
+    model_copy.add_var("RewIn", "scalar", 0.0)
+    model_copy.append_sim_code("""
+        RewIn = Alpha * RewIn + ISynReward;
+        """)
 
 
 def add_inhibitory_channel(model_copy):
