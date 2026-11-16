@@ -91,6 +91,15 @@ import csv
 #     the move ("gain", 4.0; clipped to unit length by the environment)
 #     "motor_log_syn_sigma": x - the policy field (motor pools) gets its own rule with weight noise exp(x - 5) (the
 #     default is x = 0, i.e. 0.0067): more of the variability that picks the action is noise the rule can credit
+#     "pools": "random" | "contiguous" - the motor pools: a random partition of the motor sheet, or contiguous regions
+#     (quadrants for 4 actions, else stripes); "pool_credit": true - the motor rule's eligibility records its pool's mean
+#     noise sample (relay synapses within each pool; every member credits the pool's perturbation, ~pool-size less
+#     variance); "pool_homeo": rate (e.g. 1e-4) - every pool's bias current moves toward its fair share of the
+#     decisions after each decision (prevents the collapse onto one action)
+#     "motor_rule": {...} - overrides of the motor pools' own rule, on top of the fields' rule or the hidden rule
+#     (shallow: a "local" dict replaces the whole local block), e.g. {"gradient": 1.0} so the pools learn from their
+#     pooled noise while the hidden layers use routed credit; with or without network.fields (without: the motor
+#     pools are the last layer's E neurons)
 #     "motor_local": false - no local objectives in the motor pools (they push the pools toward quiet, stable
 #     activity, i.e. away from the variability the decisions need); "motor_optimiser": {"type", "lr", "betas"} - own
 #     optimiser for the synapses onto the motor pools (fast motor pools, slow hidden layers)
@@ -1319,11 +1328,7 @@ MOTOR = {}
 def headless_counts():
     """Count decoders: each motor pool's statistic of its neurons' spike counts since the last call (the counters of
     the motor population are zeroed; the counts are kept in MOTOR["last"] for the move log)."""
-    if not MOTOR:
-        pop = built.fields[0] if built.fields is not None else built.layers[-1][0]
-        n = int(np.prod(pop.shape))
-        MOTOR.update(gp=compiled_net.neuron_populations[pop], label=built.labels.get(pop, pop.name),
-                     pools=snake_network.motor_pools(n, NUM_OUTPUT, int(HP["headless"]["seed"])))
+    motor_info()
     gp = MOTOR["gp"]
     gp.vars["SpkCount"].pull_from_device()
     c = np.asarray(gp.vars["SpkCount"].view, dtype=np.float64).ravel().copy()
@@ -1349,6 +1354,31 @@ def headless_counts():
     return out
 
 
+def motor_info():
+    """The motor population and its pools (same layout as the network's: headless "pools", random or contiguous)."""
+    if "pools" not in MOTOR:
+        pop = built.fields[0] if built.fields is not None else built.layers[-1][0]
+        n = int(np.prod(pop.shape))
+        MOTOR.update(gp=compiled_net.neuron_populations[pop], label=built.labels.get(pop, pop.name),
+                     pools=snake_network.motor_pools(n, NUM_OUTPUT, int(HP["headless"]["seed"]),
+                                                     HP["headless"].get("pools", "random"), tuple(pop.shape)))
+    return MOTOR
+
+
+def headless_pool_homeo(action):
+    """headless pool_homeo: every motor pool's bias current moves toward its fair share of the decisions,
+    b_k += rate (1 / K - [k won]) (the pool knows whether it won: an efference copy), written to PoolBias."""
+    rate = float(HP["headless"].get("pool_homeo", 0.0))
+    if rate <= 0:
+        return
+    info = motor_info()
+    hb = MOTOR.setdefault("hb", np.zeros(NUM_OUTPUT))
+    hb += rate * (1.0 / NUM_OUTPUT - (np.arange(NUM_OUTPUT) == action))
+    var = info["gp"].vars["PoolBias"]
+    var.view[:] = np.reshape(hb[info["pools"]], var.view.shape)
+    var.push_to_device()
+
+
 def headless_counts_reset():
     """After the drain: the drain's spikes are not part of the next episode's first move."""
     if MOTOR:
@@ -1362,6 +1392,7 @@ def headless_decide(pool_activity):
     a display proxy since no policy is defined, or the surrogate); the decision margin goes to HEADLESS_LAST."""
     best = np.flatnonzero(pool_activity >= pool_activity.max() - 1e-9)
     action = int(np.random.choice(best))
+    headless_pool_homeo(action)
     onehot = np.zeros(NUM_OUTPUT)
     onehot[action] = 1.0
     top = np.sort(np.asarray(pool_activity, dtype=np.float64))

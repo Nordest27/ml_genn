@@ -543,7 +543,7 @@ def add_credit(model_copy, lam):
 
 
 def add_route(model_copy, lam, *, prior, stats_rate, in_decay, recursive, own_scale=1.0, score_decay=0.0,
-              link_signal="noise"):
+              link_signal="noise", msg_base="Noise1", gate="psi", gate_decay=0.9, trust="learned"):
     """Routed credit (rule.route): the neuron's state for its route links.
     RtScore = psi * RtNz (its noise score: pseudo-derivative times its membrane-filtered noise). RtScoreP is what the
     route links into this neuron regress their sender's input on: link_signal "noise": the previous step's noise score
@@ -553,12 +553,33 @@ def add_route(model_copy, lam, *, prior, stats_rate, in_decay, recursive, own_sc
     ((psi - mean psi) * RtNz * own_scale, the neuron-level counterpart of the drift's (psi - psibar) * normXi) and of its
     routed score (psi * RtRoute); RtW: its trust in the routed credit (regression of TD * own on TD * routed, prior: the
     equal-scale weight for `prior` steps); RtMsg = Noise1 (+ RtW * psi * RtRoute if recursive), sent back along its
-    route links. Prepended: Noise1 is the sample delivered in this step (as add_credit), TdE the previous step's."""
+    route links. Prepended: Noise1 is the sample delivered in this step (as add_credit), TdE the previous step's.
+    Headless generalised e-prop: msg_base is what the neuron sends as its own source ("Noise1"; "ISynPool": its motor
+    pool's mean noise sample; "0.0": a pure relay); gate "activity" replaces psi in the relayed message and in RtRtr by
+    RtGate = min(1, RtAct), RtAct = gate_decay * RtAct + (spike of the previous step); trust "scale": RtW is the
+    equal-scale weight sqrt(RtVarO / RtVarR) only."""
     model_copy.add_additional_input_var("ISynRoute", "scalar", 0.0)
     for v in ("RtNz", "RtScore", "RtScoreF", "RtScoreP", "RtScSq", "RtScSqRaw", "RtIn", "RtInBar", "RtRoute", "RtOwn",
-              "RtRtr", "RtCov", "RtVarR", "RtVarO", "RtAge", "RtW", "RtMsg", "RtPsiBar", "RtSpk", "RtSpkBar"):
+              "RtRtr", "RtCov", "RtVarR", "RtVarO", "RtAge", "RtW", "RtMsg", "RtPsiBar", "RtSpk", "RtSpkBar",
+              "RtAct", "RtFired", "RtGate"):
         model_copy.add_var(v, "scalar", 0.0)
     a, lam, di, sd = float(stats_rate), float(lam), float(in_decay), float(score_decay)
+    if gate not in ("psi", "activity") or trust not in ("learned", "scale"):
+        raise ValueError("route gate must be 'psi' or 'activity', trust 'learned' or 'scale'")
+    if gate == "activity":
+        gate_code = (f"RtAct = {float(gate_decay)!r} * RtAct + RtFired;\n"
+                     f"        RtFired = 0.0;\n"
+                     f"        RtGate = fmin(1.0, RtAct);")
+        model_copy.append_reset_code("RtFired = 1.0;")
+        g = "RtGate"
+    else:
+        gate_code = "RtGate = rtPsi;"
+        g = "rtPsi"
+    if trust == "scale":
+        rtw = "RtW = (RtVarR > 1e-30) ? sqrt(RtVarO / RtVarR) : 0.0;"
+    else:
+        rtw = (f"RtW = (RtVarR > 1e-30) ? (RtAge * fmax(RtCov, 0.0) / RtVarR + {float(prior)!r} * sqrt(RtVarO / RtVarR))\n"
+               f"                                 / (RtAge + {float(prior)!r}) : 0.0;")
     if link_signal == "spike":
         score = (f"RtNz = Alpha * RtNz + Noise1;\n"
                  f"        RtScore = rtPsi * RtNz;\n"
@@ -581,19 +602,38 @@ def add_route(model_copy, lam, *, prior, stats_rate, in_decay, recursive, own_sc
         RtScSq = RtScSqRaw / (1.0 - pow({1.0 - a!r}, RtAge + 1.0));
         RtRoute = ISynRoute;
         RtOwn = {lam!r} * RtOwn + (rtPsi - RtPsiBar) * RtNz * {float(own_scale)!r};
-        RtRtr = {lam!r} * RtRtr + rtPsi * RtRoute;
+        {gate_code}
+        RtRtr = {lam!r} * RtRtr + {g} * RtRoute;
         const scalar rtTd2 = TdE * TdE;
         RtCov += {a!r} * (rtTd2 * RtOwn * RtRtr - RtCov);
         RtVarR += {a!r} * (rtTd2 * RtRtr * RtRtr - RtVarR);
         RtVarO += {a!r} * (rtTd2 * RtOwn * RtOwn - RtVarO);
         RtAge += 1.0;
-        RtW = (RtVarR > 1e-30) ? (RtAge * fmax(RtCov, 0.0) / RtVarR + {float(prior)!r} * sqrt(RtVarO / RtVarR))
-                                 / (RtAge + {float(prior)!r}) : 0.0;
-        RtMsg = Noise1{" + RtW * rtPsi * RtRoute" if recursive else ""};
+        {rtw}
+        RtMsg = {msg_base}{f" + RtW * {g} * RtRoute" if recursive else ""};
         RtIn = Isyn;
         RtInBar = {di!r} * RtInBar + {1.0 - di!r} * Isyn;
         }}
         """)
+
+
+def add_pool_noise(model_copy):
+    """headless pool credit: PoolNoise = the pool's mean noise sample this step (ISynPool, from the fixed relay synapses
+    within the motor pool, each carrying 1 / pool size * Noise1 of a member)."""
+    model_copy.add_additional_input_var("ISynPool", "scalar", 0.0)
+    model_copy.add_var("PoolNoise", "scalar", 0.0)
+    model_copy.prepend_sim_code("PoolNoise = ISynPool;")
+
+
+def add_pool_bias(model_copy):
+    """headless pool homeostasis: PoolBias, a current added to the input, set by the training script per motor pool
+    (each pool's bias moves toward its fair share of the decisions)."""
+    model_copy.add_var("PoolBias", "scalar", 0.0)
+    sim = model_copy.model.get("sim_code", "")
+    source = "V = Alpha * V + Isyn"
+    if sim.count(source) != 1:
+        raise RuntimeError("pool bias: the ALIF membrane update was not found exactly once")
+    model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + PoolBias")
 
 
 def add_reward_input(model_copy):

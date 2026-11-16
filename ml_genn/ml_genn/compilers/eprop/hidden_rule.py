@@ -272,8 +272,12 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
         post_refs["NoiseAmp_post"] = "NoiseAmp"
     if cfg.uses_shadow:
         post_refs.update({"ShadowV_post": "ShadowV", "ShadowA_post": "ShadowA", "ShadowRef_post": "ShadowRef"})
+    if cfg.pool_noise:
+        post_refs["PoolNoise_post"] = "PoolNoise"
     if cfg.route != 0:
         post_refs["RtW_post"] = "RtW"; post_refs["RtRoute_post"] = "RtRoute"
+        if cfg.route_gate == "activity":
+            post_refs["RtGate_post"] = "RtGate"
     if cfg.credit != 0:
         post_refs["CreditL_post"] = "CreditL"
     if local is not None and local.learned_reward != 0 and use_local_post:
@@ -440,7 +444,14 @@ else {
     if cfg.noise is NoisePlacement.WEIGHT_SHARED:
         eps_expr = ("SynSig * SynSig * Noise1 / (NoiseAmp_post + 1e-12)" if cfg.noise_site == "soma"
                     else "SynSig * Noise1")   # soma: the step's noise over its own variance (Stein), x SynSig^2
-        pre_spike_syn = (f"SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = {eps_expr};\n"
+        if cfg.pool_noise_inject:   # inject the received (coherent) noise and record exactly that
+            eps_expr = eps_expr.replace("Noise1", "PoolNoise_post"); eps_t = ""
+        elif cfg.pool_noise:   # the trace records the pool's mean noise sample; the injected noise stays the neuron's
+            accumulate = accumulate.replace("eps;", "epsT;")
+            eps_t = "const scalar epsT = " + eps_expr.replace("Noise1", "PoolNoise_post") + ";\n"
+        else:
+            eps_t = ""
+        pre_spike_syn = (f"SynSig = exp(LogSynSig - 5.0);\nconst scalar eps = {eps_expr};\n" + eps_t
                          + ("addToPost(g + eps);\n" if cfg.inject_noise and cfg.noise_site == "synapse"
                             else "addToPost(g);\n")       # soma: the neuron injects it; the trace still records it
                          + ("ProxyFlag1 = 1.0;" if proxy else accumulate))
@@ -647,7 +658,8 @@ else {
         else:
             syn.append(f"RLNoisePtrace = Lambda * RLNoisePtrace + {p_score};")
     if cfg.route != 0:
-        syn.append(f"RLRouteTrace = Lambda * RLRouteTrace + Psi * RtRoute_post * {pre_P};")
+        rgate = "RtGate_post" if cfg.route_gate == "activity" else "Psi"
+        syn.append(f"RLRouteTrace = Lambda * RLRouteTrace + {rgate} * RtRoute_post * {pre_P};")
     if use_hebb:
         gate_h = " * Psi" if cfg.hebb_gate == "psi" else ""
         syn.append(f"RLHebbTrace = Lambda * RLHebbTrace + (HebbZ - HebbMean){gate_h} * ZFilter;")

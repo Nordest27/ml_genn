@@ -482,6 +482,14 @@ class HiddenRuleConfig:
     # neuron's trust in its routed credit: the regression of its own perturbation credit on the routed one, starting
     # from the equal-scale weight (prior of route_prior steps) and taken over by its own evidence (stats rate
     # route_stats_rate). 0: off.
+    pool_noise: bool = False         # headless motor pools: the eligibility records the pool's mean noise sample (received
+                                     # through fixed relay synapses within the pool, network.headless pool_credit) instead
+                                     # of the neuron's own; the injected noise stays the neuron's own. Every member then
+                                     # credits the pool's perturbation (the vote pathway's feedback; ~pool-size less
+                                     # variance than its own noise)
+    pool_noise_inject: bool = False  # with pool_noise: the injected noise is also the received (locally coherent) noise,
+                                     # so the perturbation itself is a multi-neuron pattern and the trace records exactly
+                                     # what was injected (network.local_noise mode "inject"; synapse noise only)
     route: float = 0.0
     route_eta: float = 1e-3          # learning rate of the route links (normalised LMS)
     route_prior: float = 1e5         # steps of prior trust (equal-scale weight) before the neuron's own evidence dominates
@@ -495,6 +503,20 @@ class HiddenRuleConfig:
     route_score_decay: float = 0.0   # links regress on the sender's noise score filtered with this per-step decay (0: the
                                      # previous step's score only, direct influences; > 0 also slower, indirect ones, e.g.
                                      # links between neurons that are not directly connected)
+    # headless generalised e-prop (pooled motor credit routed back through the learned links): the motor neurons send
+    # their pool's mean noise sample when their rule has pool_noise (automatic); the hidden neurons relay only what
+    # they receive (route_msg_own False), gated by their own recent activity (route_gate "activity"), at a fixed
+    # scale (route_trust "scale"). Toy: 2 spiking hidden layers, 0.63 vs 0.50 frozen and 0.525 own-noise credit
+    route_msg_own: bool = True       # the neuron sends its own noise along its route links (plus the relayed credit when
+                                     # route_recursive); False: only the relayed credit (it is a relay, not a source)
+    route_gate: str = "psi"          # gate of the routed credit (in the synapse trace and in the relayed message): "psi"
+                                     # (pseudo-derivative) or "activity" (min(1, a), a = route_gate_decay * a + spike:
+                                     # "fired recently", the toys' count gate; psi gates were worse there)
+    route_gate_decay: float = 0.9    # per-step decay of the activity gate's spike trace
+    route_trust: str = "learned"     # RtW: "learned" (prior equal-scale weight, then the neuron's own regression evidence)
+                                     # or "scale" (the equal-scale weight only, sqrt(var own / var routed): routed credit
+                                     # at the scale of the neuron's own perturbation credit, without the evidence, which
+                                     # is weak where own-noise credit is weak)
     gradient_gate: str = "psibar"    # weight of the gradient score -c * pi * xi: "psibar" or "shadow" (the shadow's
                                      # instantaneous psi: a time-resolved, noise-independent pseudo-derivative)
     # shadow (drift_centre or gradient_gate "shadow"): every hidden neuron also integrates its input without the
@@ -569,12 +591,25 @@ class HiddenRuleConfig:
             raise ValueError("credit and credit_eta must be >= 0")
         if self.credit != 0 and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT):
             raise ValueError("credit needs WEIGHT_SHARED noise (the neuron's Noise1) and the trace estimator")
+        if self.pool_noise and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT
+                                or self.noise_proxy):
+            raise ValueError("pool_noise needs WEIGHT_SHARED noise, the trace estimator and no noise_proxy")
+        if self.pool_noise_inject and (not self.pool_noise or self.noise_site != "synapse"):
+            raise ValueError("pool_noise_inject needs pool_noise and noise_site 'synapse'")
         if self.route < 0 or self.route_eta < 0 or self.route_prior < 0 or not 0.0 < self.route_stats_rate <= 1.0:
             raise ValueError("route, route_eta, route_prior must be >= 0 and route_stats_rate in (0, 1]")
         if self.route_link_signal not in ("noise", "spike"):
             raise ValueError("route_link_signal must be 'noise' or 'spike'")
         if not 0.0 <= self.route_score_decay < 1.0:
             raise ValueError("route_score_decay must be in [0, 1)")
+        if self.route_gate not in ("psi", "activity"):
+            raise ValueError("route_gate must be 'psi' or 'activity'")
+        if not 0.0 <= self.route_gate_decay < 1.0:
+            raise ValueError("route_gate_decay must be in [0, 1)")
+        if self.route_trust not in ("learned", "scale"):
+            raise ValueError("route_trust must be 'learned' or 'scale'")
+        if not self.route_msg_own and not self.route_recursive and not self.pool_noise:
+            raise ValueError("route_msg_own False needs route_recursive (otherwise the neuron sends nothing)")
         if not 0.0 <= self.route_in_decay < 1.0:
             raise ValueError("route_in_decay must be in [0, 1)")
         if self.route != 0 and (self.noise is not NoisePlacement.WEIGHT_SHARED or self.estimator is Estimator.EXACT):

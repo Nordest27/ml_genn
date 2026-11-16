@@ -101,7 +101,8 @@ def record(compiled_net, sg, conn, snapshot, set_input, step_callbacks, cfg, out
     incoming = [(c, s) for c, s in compiled_net.connection_populations.items()
                 if c.target() is tgt and not c.is_feedback and not getattr(c, "is_relay", False)
                 and not getattr(c, "is_credit", False) and not getattr(c, "is_reward", False)
-                and not getattr(c, "is_signal", False) and not getattr(c, "is_route", False)]
+                and not getattr(c, "is_signal", False) and not getattr(c, "is_route", False)
+                and not getattr(c, "is_pool", False)]
     sources, zgroups = [], []
     for c, s in incoming:
         if c.source() in sources:

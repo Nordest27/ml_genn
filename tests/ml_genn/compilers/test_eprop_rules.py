@@ -2762,3 +2762,114 @@ def test_route_links_learn_sensitivities_and_route_credit(request):
     with pytest.raises(ValueError):                      # route links need hidden_rule.route != 0
         _compile(EPropCompiler, request.node.name + "x", PolicyType.GENERIC, net_tuple=(net2, inp2, hid2, pol2, val2),
                  hidden_rule={"preset": "proposed"})
+
+
+def test_pool_noise_trace_records_the_pool_noise():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = build_td_hidden_model(replace(PRESETS["proposed"], pool_noise=True), **kw)["model"]
+    code = model["pre_spike_syn_code"]
+    assert "const scalar epsT = SynSig * PoolNoise_post;" in code and "NoiseTrace += epsT;" in code
+    assert "addToPost(g + eps);" in code                      # the injected noise stays the neuron's own
+    off = build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["pre_spike_syn_code"]
+    assert "PoolNoise" not in off and "NoiseTrace += eps;" in off
+    with pytest.raises(ValueError):
+        replace(PRESETS["proposed"], pool_noise=True, noise_proxy=True)
+
+
+def test_pool_relay_delivers_the_pool_mean_noise_and_pool_bias_shifts_input(request):
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    pools = np.arange(N_HID) % 3
+    size = np.bincount(pools).astype(float)
+    pre = np.concatenate([np.repeat(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+    post = np.concatenate([np.tile(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+    with net:
+        c = Connection(hid, hid, Explicit(pre, post, 1.0 / size[pools[post]]), name="pool_relay")
+        c.is_pool = True
+    hid.pool_bias = True
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val),
+                                            hidden_rule={"preset": "proposed", "pool_noise": True})
+    got = {}
+
+    def probe(cn, stage):
+        q = cn.neuron_populations[hid]
+        if stage == "start":
+            q.vars["PoolBias"].view[:] = 0.05; q.vars["PoolBias"].push_to_device()
+        for v in ("PoolNoise", "Noise1", "PoolBias"):
+            q.vars[v].pull_from_device(); got[(stage, v)] = np.array(q.vars[v].view, copy=True).ravel()
+
+    h = _run(compiled, inp, pol, val, steps=200, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    pn = got[("end", "PoolNoise")]
+    assert np.any(pn != 0.0)
+    for k in range(3):                                        # one value per pool (the members' mean noise sample)
+        assert np.allclose(pn[pools == k], pn[pools == k][0], atol=1e-5)
+    assert np.allclose(got[("end", "PoolBias")], 0.05)
+    net2, inp2, hid2, pol2, val2 = _network()
+    with net2:
+        c2 = Connection(hid2, hid2, Explicit(pre, post, 1.0 / size[pools[post]]), name="pool_relay")
+        c2.is_pool = True
+    with pytest.raises(ValueError):                           # pool relays need hidden_rule.pool_noise
+        _compile(EPropCompiler, request.node.name + "x", PolicyType.GENERIC, net_tuple=(net2, inp2, hid2, pol2, val2),
+                 hidden_rule={"preset": "proposed"})
+
+
+def test_route_activity_gate_in_the_synapse_rule():
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = build_td_hidden_model(replace(PRESETS["proposed"], route=1.0, route_gate="activity"), **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "RLRouteTrace = Lambda * RLRouteTrace + RtGate_post * RtRoute_post * ZFilter;" in syn
+    for bad in (dict(route_gate="spike"), dict(route_gate_decay=1.0), dict(route_trust="fixed"),
+                dict(route_msg_own=False, route_recursive=False)):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], **bad)
+
+
+def test_route_headless_generalised_eprop(request):
+    """Pooled motor credit routed back: a 'motor' population with pool relays (pool_noise) sends its pool's noise along
+    route links into the hidden population, which relays only (route_msg_own False) with the activity gate and the
+    scale trust. The hidden neurons receive a routed signal, gate it by their recent spikes, and the network trains."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    with net:
+        mot = Population(hid.neuron, N_HID)
+        Connection(hid, mot, Dense(weight=0.1), name="hid_mot")
+        Connection(mot, pol, Dense(weight=0.1), name="mot_pol")
+        pools = np.arange(N_HID) % 3; size = np.bincount(pools).astype(float)
+        pre = np.concatenate([np.repeat(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+        post = np.concatenate([np.tile(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+        pr = Connection(mot, mot, Explicit(pre, post, 1.0 / size[pools[post]]), name="pool_relay")
+        pr.is_pool = True
+        rl = Connection(mot, hid, Explicit(np.repeat(np.arange(N_HID), N_HID), np.tile(np.arange(N_HID), N_HID), 0.0),
+                        name="routelink")
+        rl.is_route = True
+    rule = {"preset": "proposed", "route": 1.0, "route_eta": 1e-2, "route_stats_rate": 1e-2,
+            "route_link_signal": "spike", "route_msg_own": False, "route_gate": "activity", "route_trust": "scale"}
+    motor_rule = dict(rule, pool_noise=True)
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val), hidden_rule=rule,
+                                            population_rules={mot: motor_rule})
+    got = {}
+
+    def probe(cn, stage):
+        for p_, name in ((hid, "hid"), (mot, "mot")):
+            q = cn.neuron_populations[p_]
+            for v in ("RtRoute", "RtGate", "RtMsg", "RtW", "PoolNoise") if name == "mot" else ("RtRoute", "RtGate", "RtMsg", "RtW"):
+                if v in q.vars:
+                    q.vars[v].pull_from_device(); got[(stage, name, v)] = np.array(q.vars[v].view, copy=True).ravel()
+        for conn, p in cn.connection_populations.items():
+            if getattr(conn, "is_route", False):
+                p.vars["g"].pull_from_device(); got[(stage, "g")] = np.array(p.vars["g"].values, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=300, probe=probe)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])
+    assert np.any(got[("end", "g")] != 0.0) and np.all(np.isfinite(got[("end", "g")]))
+    gate = got[("end", "hid", "RtGate")]
+    assert np.all((gate >= 0.0) & (gate <= 1.0))
+    assert np.any(got[("end", "hid", "RtRoute")] != 0.0)
+    w = got[("end", "hid", "RtW")]
+    assert np.all(np.isfinite(w)) and np.all(w >= 0.0)
+    m = got[("end", "mot", "RtMsg")]                         # the motor neurons send their pool's noise (shared per pool)
+    for k in range(3):
+        assert np.allclose(m[pools == k], m[pools == k][0], atol=1e-5)

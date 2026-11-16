@@ -174,3 +174,98 @@ def test_route_links_local_topology_prefers_near_neurons():
         for j in np.asarray(c.connectivity.post_ind):
             per_target[(c.target().name, int(j))] = per_target.get((c.target().name, int(j)), 0) + 1
     assert set(per_target.values()) == {6}
+
+
+def test_motor_pools_contiguous_and_pool_relay():
+    import snake_network
+    p = snake_network.motor_pools(4 * 4 * 2, 4, 0, "contiguous", (4, 4, 2))
+    assert np.array_equal(np.bincount(p), [8, 8, 8, 8])
+    q = p.reshape(4, 4, 2)
+    assert np.all(q[:2, :2] == 0) and np.all(q[:2, 2:] == 1) and np.all(q[2:, :2] == 2) and np.all(q[2:, 2:] == 3)
+    s = snake_network.motor_pools(6 * 4, 2, 0, "contiguous", (6, 4))
+    assert np.array_equal(np.bincount(s), [12, 12])
+    r = snake_network.motor_pools(40, 4, 3)
+    assert np.array_equal(np.bincount(r), [10, 10, 10, 10])
+    with pytest.raises(ValueError):
+        snake_network.motor_pools(40, 4, 3, "stripes", (4, 10))
+
+
+def test_headless_pool_credit_builds_relays_and_motor_rule():
+    import snake_hparams
+    import snake_network
+    from ml_genn.compilers.eprop_compiler import default_params
+    np.random.seed(0)
+    hp = dict(snake_hparams.DEFAULTS)
+    hp.update({"toroidal": "local", "ei_layers": 1, "hid_e": 6, "hid_i": 4, "fan_in": 50,
+               "network": {"fields": {"shape": 4}},
+               "headless": {"seed": 0, "pools": "contiguous", "pool_credit": True, "pool_homeo": 1e-4}})
+    spec = snake_network.spec_from_hparams(hp, (20, 20, 3), 4, channels=3)
+    assert spec.motor_pool_layout == "contiguous" and spec.motor_pool_credit and spec.motor_pool_bias
+    assert spec.motor_rule["pool_noise"] is True
+    b = snake_network.build_network(spec, default_params)
+    relays = [c for c in b.network.connections if getattr(c, "is_pool", False)]
+    assert len(relays) == 1
+    fld = b.fields[0]
+    assert relays[0].source() is fld and relays[0].target() is fld and getattr(fld, "pool_bias", False)
+    n = int(np.prod(fld.shape))
+    pools = snake_network.motor_pools(n, 4, 0, "contiguous", tuple(fld.shape))
+    pre, post = np.asarray(relays[0].connectivity.pre_ind), np.asarray(relays[0].connectivity.post_ind)
+    assert np.all(pools[pre] == pools[post]) and len(pre) == sum(np.bincount(pools) ** 2)
+
+
+@pytest.mark.parametrize("mode", ["credit", "inject"])
+def test_local_noise_relays(mode):
+    b = _built(None)
+    import snake_network
+    spec_ln = {"sigma": 1.0, "mode": mode}
+    snake_network.add_local_noise(b, spec_ln, None)
+    relays = [c for c in b.network.connections if getattr(c, "is_pool", False)]
+    alif = [p for p in b.hidden if isinstance(p.neuron, snake_network.AdaptiveLeakyIntegrateFire)]
+    assert len(relays) == len(alif) and all(c.source() is c.target() for c in relays)
+    for c in relays:
+        n = int(np.prod(c.target().shape))
+        post, w = np.asarray(c.connectivity.post_ind), np.asarray(c.connectivity.weight)
+        tot = np.bincount(post, weights=w if mode == "credit" else w * w, minlength=n)
+        assert np.allclose(tot, 1.0)                          # mean (credit) or unit variance (inject)
+        assert np.bincount(post, minlength=n).min() > 1       # every neuron hears its neighbours, not only itself
+
+
+def test_pool_noise_inject_rule():
+    from dataclasses import replace
+    from ml_genn.compilers.eprop import PRESETS, build_td_hidden_model
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    code = build_td_hidden_model(replace(PRESETS["proposed"], pool_noise=True, pool_noise_inject=True),
+                                 **kw)["model"]["pre_spike_syn_code"]
+    assert "const scalar eps = SynSig * PoolNoise_post;" in code and "addToPost(g + eps);" in code
+    assert "NoiseTrace += eps;" in code and "epsT" not in code
+    with pytest.raises(ValueError):
+        replace(PRESETS["proposed"], pool_noise_inject=True)
+
+
+def test_headless_route_pool_overlay_without_fields():
+    """The generalised e-prop overlay on a headless network without fields: the motor pools are the last layer's E
+    neurons, which get the motor rule (pool_noise + overrides), pool relays, and route links back along the wiring."""
+    import json, pathlib
+    import snake_hparams
+    import snake_network
+    from ml_genn.compilers.eprop_compiler import default_params
+    np.random.seed(0)
+    over = json.loads((pathlib.Path(snake_network.__file__).parent / "configs" / "route_pool_2026-11-16" /
+                       "route_pool.json").read_text())
+    hp = dict(snake_hparams.DEFAULTS)
+    hp.update({"toroidal": "local", "ei_layers": 2, "hid_e": 6, "hid_i": 4, "fan_in": 50})
+    for k, v in over.items():
+        hp[k] = {**(hp.get(k) or {}), **v} if isinstance(v, dict) and isinstance(hp.get(k), dict) else v
+    hp["headless"] = {"seed": 0, **over["headless"]}
+    hp["network"] = {**hp["network"], "fields": None}         # no fields: the last layer is the motor population
+    spec = snake_network.spec_from_hparams(hp, (20, 20, 3), 4, channels=3)
+    assert spec.fields is None
+    assert spec.motor_rule["pool_noise"] is True and spec.motor_rule["gradient"] == 1.0
+    assert spec.motor_rule["route_msg_own"] is False          # inherited from the hidden rule (unused: pool noise)
+    b = snake_network.build_network(spec, default_params)
+    last_e = b.layers[-1][0]
+    assert b.population_rules[last_e] is spec.motor_rule
+    relays = [c for c in b.network.connections if getattr(c, "is_pool", False)]
+    assert len(relays) == 1 and relays[0].source() is last_e
+    routes = [c for c in b.network.connections if getattr(c, "is_route", False)]
+    assert any(c.source() is last_e for c in routes)          # credit leaves the motor pools backwards

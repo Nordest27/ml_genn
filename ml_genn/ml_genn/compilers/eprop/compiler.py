@@ -446,6 +446,7 @@ class EPropCompiler(Compiler):
         compile_state.reward_connections = []
         compile_state.signal_connections = []
         compile_state.route_connections = []
+        compile_state.pool_connections = []
         return compile_state
 
     @staticmethod
@@ -481,7 +482,7 @@ class EPropCompiler(Compiler):
             tgt = c.target()
             if (getattr(c, "is_relay", False) or getattr(c, "is_credit", False)
                     or getattr(c, "is_reward", False) or getattr(c, "is_signal", False)
-                    or getattr(c, "is_route", False) or c.is_feedback
+                    or getattr(c, "is_route", False) or getattr(c, "is_pool", False) or c.is_feedback
                     or c in self.plastic_inhibition
                     or type(tgt.neuron) is not AdaptiveLeakyIntegrateFire or tgt.neuron.readout is not None
                     or isinstance(c.source().neuron, BooleanUnit)):
@@ -521,6 +522,8 @@ class EPropCompiler(Compiler):
                 model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
         elif not isinstance(pop.neuron, Input):
             self._build_hidden_neuron_model(pop, model_copy, compile_state)
+            if getattr(pop, "pool_bias", False):     # last: after every other edit of the membrane update
+                neuron_logic.add_pool_bias(model_copy)
         else:
             neuron_logic.add_input_noise_code(model_copy)
 
@@ -544,6 +547,17 @@ class EPropCompiler(Compiler):
         target_pop = conn.target()
         target_neuron = target_pop.neuron
 
+        if getattr(conn, "is_pool", False):    # pool relay: a member's noise sample to every member (1 / pool size)
+            rule = self.rule_for(target_pop) if self.gamma_lambda is not None else None
+            if rule is None or not rule.pool_noise:
+                raise ValueError(f"{conn.name}: pool relay synapses need the RL rule with hidden_rule.pool_noise for "
+                                 "their target (the motor pools)")
+            compile_state.pool_connections.append(conn)
+            return WeightUpdateModel(
+                model={"vars": [("g", "scalar", VarAccess.READ_ONLY)],
+                       "pre_neuron_var_refs": [("Noise1_pre", "scalar")],
+                       "synapse_dynamics_code": "addToPost(g * Noise1_pre);"},
+                var_vals={"g": connect_snippet.weight}, pre_neuron_var_refs={"Noise1_pre": "Noise1"})
         if getattr(conn, "is_route", False):   # route link k -> j: carries S * Msg_k back to j, learns S reward-free
             rule = self.rule_for(target_pop) if self.gamma_lambda is not None else None
             src_rule = self.rule_for(conn.source()) if self.gamma_lambda is not None else None
@@ -739,6 +753,8 @@ class EPropCompiler(Compiler):
                 raise NotImplementedError("the learned learning signal (credit) supports ALIF hidden neurons only")
             neuron_logic.add_credit(model_copy, rule.credit_lambda if rule.credit_lambda is not None
                                     else self.td_lambda)
+        if self.gamma_lambda is not None and self.rule_for(pop).pool_noise:
+            neuron_logic.add_pool_noise(model_copy)
         if self.gamma_lambda is not None and self.rule_for(pop).route != 0:
             rule = self.rule_for(pop)
             if not isinstance(pop.neuron, AdaptiveLeakyIntegrateFire):
@@ -747,7 +763,10 @@ class EPropCompiler(Compiler):
                                    prior=rule.route_prior, stats_rate=rule.route_stats_rate,
                                    in_decay=rule.route_in_decay, recursive=rule.route_recursive,
                                    own_scale=1.0 / float(np.exp(rule.log_syn_sigma - 5.0)),
-                                   score_decay=rule.route_score_decay, link_signal=rule.route_link_signal)
+                                   score_decay=rule.route_score_decay, link_signal=rule.route_link_signal,
+                                   msg_base=("ISynPool" if rule.pool_noise       # motor pools: the pool's noise
+                                             else "Noise1" if rule.route_msg_own else "0.0"),
+                                   gate=rule.route_gate, gate_decay=rule.route_gate_decay, trust=rule.route_trust)
         if self.gamma_lambda is not None and self.rule_for(pop).uses_shadow:
             rule = self.rule_for(pop)
             if type(pop.neuron) is not AdaptiveLeakyIntegrateFire:
@@ -868,6 +887,8 @@ class EPropCompiler(Compiler):
             connection_populations[c].post_target_var = "ISynCredit"
         for c in getattr(compile_state, "route_connections", []):
             connection_populations[c].post_target_var = "ISynRoute"
+        for c in getattr(compile_state, "pool_connections", []):
+            connection_populations[c].post_target_var = "ISynPool"
         for c in compile_state.pi_scaled_connections:
             connection_populations[c].post_target_var = "ISynPI"
 

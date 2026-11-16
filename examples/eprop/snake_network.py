@@ -218,9 +218,39 @@ class BooleanSpec:
     seed: int = 0
 
 
-def motor_pools(n, num_actions, seed):
-    """headless: the motor pool (action) of each of the n policy-field neurons, a balanced random partition."""
-    return np.random.default_rng(seed).permutation(n) % num_actions
+def motor_pools(n, num_actions, seed, layout="random", shape=None):
+    """headless: the motor pool (action) of each of the n motor neurons. "random": a balanced random partition;
+    "contiguous": contiguous regions of the motor sheet (shape (h, w[, c]), flat C order, every channel of a location in
+    the same pool): quadrants for 4 actions on a sheet with even sides, else stripes along the second axis."""
+    if layout == "random":
+        return np.random.default_rng(seed).permutation(n) % num_actions
+    if layout != "contiguous":
+        raise ValueError(f"headless pools must be 'random' or 'contiguous', not {layout!r}")
+    if shape is None or int(np.prod(shape)) != n:
+        raise ValueError("contiguous motor pools need the motor population's shape")
+    sh = tuple(shape) + (1,) * (3 - len(shape))
+    h, w, c = sh
+    y, x = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+    if num_actions == 4 and h % 2 == 0 and w % 2 == 0:
+        cell = (y >= h // 2) * 2 + (x >= w // 2)
+    else:
+        cell = np.minimum(x * num_actions // w, num_actions - 1)
+    return np.repeat(cell.ravel(), c).astype(np.int64)
+
+
+def pool_relay(built, pop, pools):
+    """headless pool credit: fixed relay synapses within every motor pool (all pairs, self included, weight 1 / pool
+    size): each member receives the pool's mean noise sample (marked is_pool; the compiler routes them to ISynPool)."""
+    size = np.bincount(pools).astype(np.float64)
+    pre, post = [], []
+    for k in range(len(size)):
+        idx = np.nonzero(pools == k)[0]
+        pre.append(np.repeat(idx, len(idx))); post.append(np.tile(idx, len(idx)))
+    pre, post = np.concatenate(pre), np.concatenate(post)
+    with built.network:
+        c = Connection(pop, pop, Explicit(pre_ind=pre, post_ind=post, weight=1.0 / size[pools[post]]),
+                       name="pool_relay", exc_inh_sign=None)
+        c.is_pool = True
 
 
 def boolean_inputs(shape, k, radius, rng):
@@ -297,6 +327,14 @@ class NetworkSpec:
     motor_rule: Optional[Union[str, dict]] = None   # headless: own rule for the policy field (the motor pools), e.g.
                                                     # stronger weight noise; None: as the other fields
     motor_optimiser: Optional[dict] = None   # headless: own optimiser for the synapses onto the policy field
+    local_noise: Optional[dict] = None       # locally coherent noise: {"sigma": 1.5 (sheet cells), "radius": 3 sigma,
+                                             # "mode": "credit" | "inject", "populations": "all" or labels}: fixed relay
+                                             # synapses within each population from its spatial neighbours (Gaussian,
+                                             # toroidal in the sheet; weights summing to 1 for "credit", unit sum of
+                                             # squares for "inject"); the rule needs pool_noise (and pool_noise_inject)
+    motor_pool_layout: str = "random"        # headless: "random" or "contiguous" motor pools (motor_pools)
+    motor_pool_credit: bool = False          # headless: relay synapses within each pool (the motor rule's pool_noise)
+    motor_pool_bias: bool = False            # headless: the motor neurons get a PoolBias current (pool homeostasis)
     code: Optional[int] = None       # ei_layers 0 only: the heads read a code population of this size (Poisson, rates
                                      # set by the training script from a non-differentiable transform of the input and
                                      # the cue) instead of the input itself
@@ -545,6 +583,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
     booleans = []
     slows = []
     field_inh = []
+    motor_pop = None
     with network:
         inp = Population(PoissonInput(), spec.input_shape)
         layers = []
@@ -841,7 +880,8 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                     readout_src = fld
                 if spec.headless is not None and head is policy:
                     n_field = int(np.prod(fs.shape))
-                    pools = motor_pools(n_field, spec.num_actions, spec.headless)
+                    pools = motor_pools(n_field, spec.num_actions, spec.headless, spec.motor_pool_layout, fs.shape)
+                    motor_pop = (fld, pools)
                     size = np.bincount(pools, minlength=spec.num_actions).astype(np.float64)
                     Connection(readout_src, head, Explicit(pre_ind=np.arange(n_field), post_ind=pools,
                                                            weight=1.0 / size[pools]), exc_inh_sign=None)
@@ -861,14 +901,16 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                         continue
                     Connection(src, head, connectivity(ConnSpec(type="fixed", p=spec.direct_readout_p), src_shape, None),
                                exc_inh_sign=None)
-            if spec.headless is not None and (spec.motor_rule is not None or spec.motor_optimiser is not None):
-                raise ValueError("headless without fields: motor_log_syn_sigma / motor_local / motor_optimiser act on "
-                                 "the policy field (set network.fields)")
+            if spec.headless is not None and spec.motor_optimiser is not None:
+                raise ValueError("headless without fields: motor_optimiser acts on the policy field (set network.fields)")
+            if spec.headless is not None and spec.motor_rule is not None:
+                rules[last[0]] = spec.motor_rule   # the motor pools are the last layer's E neurons
             if spec.headless is not None:
                 # headless without fields: the motor pools are the last layer's E neurons (the layer is the motor
                 # population); the value head reads the last layer as usual
                 n_e = int(np.prod(last_spec.e_shape))
-                pools = motor_pools(n_e, spec.num_actions, spec.headless)
+                pools = motor_pools(n_e, spec.num_actions, spec.headless, spec.motor_pool_layout, last_spec.e_shape)
+                motor_pop = (last[0], pools)
                 size = np.bincount(pools, minlength=spec.num_actions).astype(np.float64)
                 Connection(last[0], policy, Explicit(pre_ind=np.arange(n_e), post_ind=pools, weight=1.0 / size[pools]),
                            exc_inh_sign=None)          # (e-prop's feedback: the EI layers' random feedback below)
@@ -895,6 +937,15 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
         add_reward_pool(built, spec, spec.reward_pool)
     if spec.reward_links is not None:
         add_reward_links(built, spec.reward_links, spec)
+    if spec.local_noise is not None:
+        add_local_noise(built, spec.local_noise, spec)
+    if spec.motor_pool_credit or spec.motor_pool_bias:
+        if motor_pop is None:
+            raise ValueError("headless pool_credit / pool_homeo need headless motor pools")
+        if spec.motor_pool_credit:
+            pool_relay(built, *motor_pop)
+        if spec.motor_pool_bias:
+            motor_pop[0].pool_bias = True
     if spec.credit is not None:
         add_credit_connections(built, spec.credit)
     return built
@@ -929,6 +980,40 @@ def _hidden_positions(built, spec, pops):
         raise NotImplementedError("reward_links local: populations without a position (" +
                                   ", ".join(built.labels.get(p, str(p)) for p in missing) + ")")
     return pos, side
+
+
+def add_local_noise(built, cfg, spec):
+    """Locally coherent noise (see NetworkSpec.local_noise): per population, fixed relay synapses (is_pool, into
+    ISynPool) from every neuron within `radius` of each neuron (self included), Gaussian weights of width sigma."""
+    unknown = set(cfg) - {"sigma", "radius", "mode", "populations"}
+    if unknown:
+        raise KeyError(f"network.local_noise: unknown keys {sorted(unknown)}")
+    mode = cfg.get("mode", "credit")
+    if mode not in ("credit", "inject"):
+        raise ValueError(f"network.local_noise.mode must be 'credit' or 'inject', not {mode!r}")
+    sig = float(cfg.get("sigma", 1.5)); rad = float(cfg.get("radius", 3.0 * sig))
+    by_label = {lab: pop for pop, lab in built.labels.items()}
+    alif = [p for p in built.hidden if isinstance(p.neuron, AdaptiveLeakyIntegrateFire)]
+    v = cfg.get("populations", "all")
+    pops = alif if v == "all" else [by_label[lab] for lab in v]
+    if spec is not None and spec.motor_pool_credit and built.fields is not None:
+        pops = [p for p in pops if p is not built.fields[0]]       # the motor pools relay within their pools
+    pos, side = _hidden_positions(built, spec, set(pops))
+    with built.network:
+        for p in pops:
+            q = pos[p]; posts, pres, ws = [], [], []
+            for a in range(0, len(q), 512):                   # row chunks (large populations)
+                d = np.abs(q[a:a + 512, None, :] - q[None, :, :])
+                d[:, :, :2] = np.minimum(d[:, :, :2], side - d[:, :, :2])
+                dist2 = (d * d).sum(2)
+                w = np.exp(-dist2 / (2.0 * sig * sig)) * (dist2 <= rad * rad)
+                w = w / (w.sum(1, keepdims=True) if mode == "credit" else np.sqrt((w * w).sum(1, keepdims=True)))
+                r, cidx = np.nonzero(w > 0)                   # w[post, pre]
+                posts.append(r + a); pres.append(cidx); ws.append(w[r, cidx])
+            post, pre, wv = np.concatenate(posts), np.concatenate(pres), np.concatenate(ws)
+            c = Connection(p, p, Explicit(pre_ind=pre, post_ind=post, weight=wv),
+                           name=f"noise_relay_{built.labels[p]}", exc_inh_sign=None)
+            c.is_pool = True
 
 
 def add_reward_links(built, cfg, spec=None):
@@ -974,7 +1059,7 @@ def add_reward_links(built, cfg, spec=None):
             c.is_signal = True
 
     if topology in ("mirror", "reverse"):   # along the network's own wiring (reverse: back along each synapse)
-        special = ("is_relay", "is_credit", "is_reward", "is_signal", "is_route")
+        special = ("is_relay", "is_credit", "is_reward", "is_signal", "is_route", "is_pool")
         plan = []
         for c in list(built.network.connections):
             src_, tgt_ = (c.source(), c.target()) if topology == "mirror" else (c.target(), c.source())
@@ -1317,6 +1402,25 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             spec = replace(spec, motor_rule=base)
         if hl.get("motor_optimiser") is not None:
             spec = replace(spec, motor_optimiser=dict(hl["motor_optimiser"]))
+        spec = replace(spec, motor_pool_layout=hl.get("pools", "random"),
+                       motor_pool_credit=bool(hl.get("pool_credit", False)),
+                       motor_pool_bias=float(hl.get("pool_homeo", 0.0)) > 0)
+        if hl.get("pool_credit"):   # the motor pools' own rule records their pool's noise (needs a separate motor rule)
+            mr = spec.motor_rule
+            if mr is None:
+                base = (hp.get("network") or {}).get("fields", {}) or {}
+                mr = base.get("rule") or hp.get("hidden_rule") or {"preset": "proposed"}
+            mr = {"preset": mr} if isinstance(mr, str) else dict(mr)
+            mr["pool_noise"] = True
+            spec = replace(spec, motor_rule=mr)
+        if hl.get("motor_rule"):    # overrides of the motor pools' own rule (on top of the fields' / hidden rule)
+            mr = spec.motor_rule
+            if mr is None:
+                base = (hp.get("network") or {}).get("fields", {}) or {}
+                mr = base.get("rule") or hp.get("hidden_rule") or {"preset": "proposed"}
+            mr = {"preset": mr} if isinstance(mr, str) else dict(mr)
+            mr.update(dict(hl["motor_rule"]))
+            spec = replace(spec, motor_rule=mr)
     if hp.get("code"):
         if hp["ei_layers"] != 0:
             raise ValueError("code: only with ei_layers 0 (the heads read the code instead of the input)")
