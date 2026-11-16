@@ -522,8 +522,6 @@ class EPropCompiler(Compiler):
                 model_copy.add_additional_input_var("ISynPertEps", "scalar", 0.0)
         elif not isinstance(pop.neuron, Input):
             self._build_hidden_neuron_model(pop, model_copy, compile_state)
-            if getattr(pop, "pool_bias", False):     # last: after every other edit of the membrane update
-                neuron_logic.add_pool_bias(model_copy)
         else:
             neuron_logic.add_input_noise_code(model_copy)
 
@@ -781,7 +779,10 @@ class EPropCompiler(Compiler):
                                     relative_reset=pop.neuron.relative_reset,
                                     inhibitory_channel=self.inhibitory_channel,
                                     intrinsic_plasticity=self.intrinsic_plasticity is not None,
+                                    pool_bias=bool(getattr(pop, "pool_bias", False)),
                                     align_rate=rule.shadow_align_rate, align_tau=rule.shadow_align_tau, dt=self.dt)
+        if getattr(pop, "pool_bias", False):   # headless pool homeostasis: a current on the final integration line,
+            neuron_logic.add_pool_bias(model_copy)   # after every other edit of its input, before the neuron-type rewrites
         if isinstance(pop.neuron, BlackBoxALIF):   # last: it rewrites the final integration line
             neuron_logic.apply_black_box(model_copy, pop.neuron.coefficients(pop, self.dt))
         elif isinstance(pop.neuron, ResonatorALIF):

@@ -935,6 +935,7 @@ def build_network(spec: NetworkSpec, default_params) -> Built:
                   slow=slows, inhibitory_to_slow=i_to_s, population_optimisers=optimisers, cue=cue, boolean=booleans)
     if spec.reward_pool is not None:
         add_reward_pool(built, spec, spec.reward_pool)
+    built.motor_population = motor_pop[0] if motor_pop is not None else None   # headless: the vote population
     if spec.reward_links is not None:
         add_reward_links(built, spec.reward_links, spec)
     if spec.local_noise is not None:
@@ -1016,18 +1017,47 @@ def add_local_noise(built, cfg, spec):
             c.is_pool = True
 
 
+def _forward_hops(built, target):
+    """Forward hops from every population to `target` along the network's own (non-feedback, non-special)
+    connections: the length of the shortest path (target itself 0); populations that cannot reach it are absent."""
+    special = ("is_relay", "is_credit", "is_reward", "is_signal", "is_route", "is_pool")
+    into = {}
+    for c in built.network.connections:
+        if c.is_feedback or any(getattr(c, a, False) for a in special):
+            continue
+        into.setdefault(c.target(), set()).add(c.source())
+    hops, frontier = {target: 0}, [target]
+    while frontier:
+        nxt = []
+        for t in frontier:
+            for src in into.get(t, ()):
+                if src not in hops:
+                    hops[src] = hops[t] + 1
+                    nxt.append(src)
+        frontier = nxt
+    return hops
+
+
 def add_reward_links(built, cfg, spec=None):
     """Reward / learning-signal / route links between the network's own neurons (see NetworkSpec.reward_links).
     topology: "random" (k senders per target from all sources), "mirror" / "reverse" (along / back along the network's
     own wiring) or "local" (k senders per target drawn without replacement with probability ~ exp(-d^2 / 2 sigma^2),
-    d the distance in E-sheet cells, toroidal in x, y; sigma = cfg["sigma"], default 1.5)."""
-    unknown = set(cfg) - {"channel", "sources", "targets", "k", "scale", "seed", "topology", "init", "sigma"}
+    d the distance in E-sheet cells, toroidal in x, y; sigma = cfg["sigma"], default 1.5) or "direct" (headless,
+    channel "route": direct feedback from the motor population to every hidden population that can influence it,
+    one hop whatever the depth, as e-prop's feedback without a head. The links of a neuron fill the cone of its
+    possible influence: h = forward hops from its population to the motor population (shortest path over the
+    network's wiring), cone width sigma_h = sigma + sigma_per_hop * (h - 1) sheet cells; k motor senders drawn
+    without replacement within cutoff * sigma_h (sheet distance, toroidal), probability ~ exp(-d^2 / 2 sigma_h^2).
+    init "random" with hidden_rule.route_eta 0: fixed random feedback (DFA); init "zero" with route_eta > 0 (and
+    route_score_decay > 0 for the delayed, indirect influence): learned direct sensitivities)."""
+    unknown = set(cfg) - {"channel", "sources", "targets", "k", "scale", "seed", "topology", "init", "sigma",
+                          "sigma_per_hop", "cutoff"}
     if cfg.get("init", "random") not in ("random", "zero"):
         raise ValueError("network.reward_links.init must be 'random' or 'zero'")
     zero = cfg.get("init", "random") == "zero"     # trained links (hidden_rule.link_eta) start harmless
     topology = cfg.get("topology", "random")
-    if topology not in ("random", "mirror", "reverse", "local"):
-        raise ValueError("network.reward_links.topology must be 'random', 'mirror', 'reverse' or 'local', "
+    if topology not in ("random", "mirror", "reverse", "local", "direct"):
+        raise ValueError("network.reward_links.topology must be 'random', 'mirror', 'reverse', 'local' or 'direct', "
                          f"not {topology!r}")
     if unknown:
         raise KeyError(f"network.reward_links: unknown keys {sorted(unknown)}")
@@ -1081,6 +1111,39 @@ def add_reward_links(built, cfg, spec=None):
         with built.network:
             for src, tgt, pre, post in plan:
                 link(src, tgt, pre, post, indeg[tgt])
+        return
+    if topology == "direct":
+        if channel != "route":
+            raise ValueError("network.reward_links topology 'direct' is for the route channel")
+        motor = getattr(built, "motor_population", None)
+        if motor is None:
+            raise ValueError("network.reward_links topology 'direct' needs headless motor pools (its source)")
+        sig0, sig_hop = float(cfg.get("sigma", 1.5)), float(cfg.get("sigma_per_hop", 1.0))
+        cut = float(cfg.get("cutoff", 2.5))
+        if sig0 <= 0 or sig_hop < 0 or cut <= 0:
+            raise ValueError("network.reward_links direct: sigma, cutoff > 0 and sigma_per_hop >= 0")
+        hops = _forward_hops(built, motor)
+        tgts = [p for p in targets if p is not motor and p in hops]
+        pos, side = _hidden_positions(built, spec, set(tgts) | {motor})
+        mp = pos[motor][:, :2]
+        with built.network:
+            for tgt in tgts:
+                sg = sig0 + sig_hop * (hops[tgt] - 1)
+                pre_l, post_l = [], []
+                for j, q in enumerate(pos[tgt][:, :2]):
+                    d = np.abs(mp - q)
+                    d = np.minimum(d, side - d)                                  # toroidal sheet
+                    d2 = (d * d).sum(1)
+                    inside = np.nonzero(d2 <= (cut * sg) ** 2)[0]
+                    if len(inside) == 0:
+                        continue
+                    kk = min(k, len(inside))
+                    g = -d2[inside] / (2.0 * sg * sg) - np.log(-np.log(rng.random(len(inside))))   # Gumbel top-k
+                    pre_l.append(inside[np.argpartition(-g, kk - 1)[:kk]]); post_l.append(np.full(kk, j))
+                if not pre_l:
+                    continue
+                pre, post = np.concatenate(pre_l), np.concatenate(post_l)
+                link(motor, tgt, pre, post, np.bincount(post, minlength=int(np.prod(tgt.shape))))
         return
     sizes = [int(np.prod(p.shape)) for p in sources]
     offs = np.concatenate([[0], np.cumsum(sizes)])

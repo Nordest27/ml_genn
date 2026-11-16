@@ -269,3 +269,42 @@ def test_headless_route_pool_overlay_without_fields():
     assert len(relays) == 1 and relays[0].source() is last_e
     routes = [c for c in b.network.connections if getattr(c, "is_route", False)]
     assert any(c.source() is last_e for c in routes)          # credit leaves the motor pools backwards
+
+
+def test_direct_route_links_fill_the_influence_cone():
+    """topology 'direct': feedback links only from the motor population, into every hidden population that can reach
+    it, at most k per neuron, all within cutoff * sigma_h (sheet distance), and wider cones for deeper populations."""
+    import snake_hparams
+    import snake_network
+    from ml_genn.compilers.eprop_compiler import default_params
+    np.random.seed(0)
+    hp = dict(snake_hparams.DEFAULTS)
+    hp.update({"toroidal": "local", "ei_layers": 3, "hid_e": 8, "hid_i": 4, "fan_in": 50,
+               "network": {"fields": None, "reward_links": {"channel": "route", "topology": "direct", "init": "random",
+                                                           "k": 6, "sigma": 1.0, "sigma_per_hop": 1.5, "cutoff": 2.0}},
+               "hidden_rule": {"preset": "proposed", "route": 1.0, "route_eta": 0.0, "route_msg_own": False,
+                               "route_gate": "activity", "route_trust": "scale"},
+               "headless": {"seed": 0, "pool_credit": True}})
+    spec = snake_network.spec_from_hparams(hp, (20, 20, 3), 4, channels=3)
+    b = snake_network.build_network(spec, default_params)
+    motor = b.motor_population
+    assert motor is b.layers[-1][0]
+    links = [c for c in b.network.connections if getattr(c, "is_route", False)]
+    assert links and all(c.source() is motor for c in links)
+    hops = snake_network._forward_hops(b, motor)
+    pos, side = snake_network._hidden_positions(b, spec, {c.target() for c in links} | {motor})
+    mean_d = {}
+    for c in links:
+        tgt = c.target(); h = hops[tgt]; sg = 1.0 + 1.5 * (h - 1)
+        pre, post = np.asarray(c.connectivity.pre_ind), np.asarray(c.connectivity.post_ind)
+        assert np.bincount(post).max() <= 6
+        d = np.abs(pos[motor][pre, :2] - pos[tgt][post, :2]); d = np.minimum(d, side - d)
+        dist = np.sqrt((d * d).sum(1))
+        assert np.all(dist <= 2.0 * sg + 1e-9)
+        assert np.all(np.asarray(c.connectivity.weight) != 0.0)          # init "random": fixed random feedback
+        mean_d.setdefault(h, []).append(dist.mean())
+    deep, shallow = max(mean_d), min(mean_d)
+    assert deep > shallow and np.mean(mean_d[deep]) > np.mean(mean_d[shallow])
+    l1 = b.layers[0][0]
+    assert hops[l1] == len(b.layers) - 1                       # L1 E -> L2 E -> L3 E (the motor population)
+    assert hops[b.layers[0][1]] == hops[l1] + 1                 # its inhibitory population acts through it

@@ -1,0 +1,5 @@
+{"headless": {"pool_credit": true, "pool_homeo": 1e-4, "motor_rule": {"gradient": 1.0}},
+ "hidden_rule": {"route": 1.0, "route_link_signal": "spike", "route_eta": 0.001, "route_score_decay": 0.9,
+                 "route_msg_own": false, "route_gate": "activity", "route_gate_decay": 0.9, "route_trust": "scale"},
+ "network": {"reward_links": {"channel": "route", "topology": "direct", "init": "zero", "k": 16,
+                              "sigma": 1.5, "sigma_per_hop": 1.0, "cutoff": 2.5}}}

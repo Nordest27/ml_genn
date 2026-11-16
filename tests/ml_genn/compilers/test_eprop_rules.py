@@ -2873,3 +2873,39 @@ def test_route_headless_generalised_eprop(request):
     m = got[("end", "mot", "RtMsg")]                         # the motor neurons send their pool's noise (shared per pool)
     for k in range(3):
         assert np.allclose(m[pools == k], m[pools == k][0], atol=1e-5)
+
+
+@pytest.mark.parametrize("extra", ["intrinsic_plasticity", "shadow", "soma_noise"])
+def test_pool_bias_with_other_membrane_edits(request, extra):
+    """The pool bias joins the input of the membrane integration line whatever other features edited it (intrinsic
+    plasticity rewrote the line and broke the earlier exact-text match); the shadow integrates it too."""
+    from ml_genn.connectivity import Explicit
+    net, inp, hid, pol, val = _network()
+    pools = np.arange(N_HID) % 3
+    size = np.bincount(pools).astype(float)
+    pre = np.concatenate([np.repeat(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+    post = np.concatenate([np.tile(np.nonzero(pools == k)[0], size[k].astype(int)) for k in range(3)])
+    with net:
+        c = Connection(hid, hid, Explicit(pre, post, 1.0 / size[pools[post]]), name="pool_relay")
+        c.is_pool = True
+    hid.pool_bias = True
+    rule = {"preset": "proposed", "pool_noise": True}
+    kw = {}
+    if extra == "intrinsic_plasticity":
+        kw["intrinsic_plasticity"] = {"eta": 1e-2, "psi_target": 0.4, "decay": 0.9, "max_bias": 0.5}
+    elif extra == "shadow":
+        rule["gradient_gate"] = "shadow"
+    else:
+        rule.update(noise_site="soma")
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            net_tuple=(net, inp, hid, pol, val), hidden_rule=rule, **kw)
+    got = {}
+
+    def probe(cn, stage):
+        q = cn.neuron_populations[hid]
+        if stage == "start":
+            q.vars["PoolBias"].view[:] = 0.2; q.vars["PoolBias"].push_to_device()
+        q.vars["V"].pull_from_device(); got[stage] = np.array(q.vars["V"].view, copy=True)
+
+    h = _run(compiled, inp, pol, val, steps=50, probe=probe)
+    assert np.all(np.isfinite(h)) and np.all(np.isfinite(got["end"]))

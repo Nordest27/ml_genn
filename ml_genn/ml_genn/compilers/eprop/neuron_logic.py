@@ -476,7 +476,8 @@ def add_soma_noise(model_copy, sigma, scaling="constant", sigma_unit=None, gain=
 
 
 def add_shadow(model_copy, *, relay_sigma=None, refrac=True, integrate_during_refrac=True, relative_reset=True,
-               inhibitory_channel=False, intrinsic_plasticity=False, align_rate=0.0, align_tau=1000.0, dt=1.0):
+               inhibitory_channel=False, intrinsic_plasticity=False, align_rate=0.0, align_tau=1000.0, dt=1.0,
+               pool_bias=False):
     """The neuron's noise-free shadow: a second membrane (ShadowV, ShadowA, ShadowRef) with the same input, leak,
     adaptation, threshold, reset and refractoriness, but without the injected noise. It is prepended to the step, where
     Noise1 still holds the sample the synapses delivered in this step (it is redrawn later in the step).
@@ -486,7 +487,8 @@ def add_shadow(model_copy, *, relay_sigma=None, refrac=True, integrate_during_re
     model_copy.add_var("ShadowV", "scalar", 0.0)
     model_copy.add_var("ShadowA", "scalar", 0.0)
     model_copy.add_var("ShadowRef", "scalar", 0.0)
-    drive = "Isyn" + (" + ISynInh" if inhibitory_channel else "") + (" + IPBias" if intrinsic_plasticity else "")
+    drive = ("Isyn" + (" + ISynInh" if inhibitory_channel else "") + (" + IPBias" if intrinsic_plasticity else "")
+             + (" + PoolBias" if pool_bias else ""))
     if relay_sigma is not None:
         model_copy.add_additional_input_var("ISynCount", "scalar", 0.0)
         drive += f" - {float(relay_sigma)!r} * Noise1 * ISynCount"
@@ -627,13 +629,18 @@ def add_pool_noise(model_copy):
 
 def add_pool_bias(model_copy):
     """headless pool homeostasis: PoolBias, a current added to the input, set by the training script per motor pool
-    (each pool's bias moves toward its fair share of the decisions)."""
+    (each pool's bias moves toward its fair share of the decisions). Added to the input of the final integration line
+    "V = Alpha * V + <input>;", whatever earlier edits put there (intrinsic plasticity, soma noise, inhibitory channel
+    or reversal); the neuron-type rewrites (black box, resonator, plateau) come after and wrap it with the input."""
+    import re
     model_copy.add_var("PoolBias", "scalar", 0.0)
-    sim = model_copy.model.get("sim_code", "")
-    source = "V = Alpha * V + Isyn"
-    if sim.count(source) != 1:
-        raise RuntimeError("pool bias: the ALIF membrane update was not found exactly once")
-    model_copy.replace_sim_code(source, "V = Alpha * V + Isyn + PoolBias")
+    code = model_copy.model.get("sim_code", "")
+    found = list(re.finditer(r"V = Alpha \* V \+ (.*?);", code))
+    if len(found) != 1:
+        raise RuntimeError(f"pool bias: expected one membrane integration line 'V = Alpha * V + ...;', found "
+                           f"{len(found)}")
+    m = found[0]
+    model_copy.model["sim_code"] = code[:m.start()] + f"V = Alpha * V + {m.group(1)} + PoolBias;" + code[m.end():]
 
 
 def add_reward_input(model_copy):
