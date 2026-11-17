@@ -1467,7 +1467,7 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             spec = replace(spec, motor_optimiser=dict(hl["motor_optimiser"]))
         spec = replace(spec, motor_pool_layout=hl.get("pools", "random"),
                        motor_pool_credit=bool(hl.get("pool_credit", False)),
-                       motor_pool_bias=float(hl.get("pool_homeo", 0.0)) > 0)
+                       motor_pool_bias=float(hl.get("pool_homeo", 0.0)) > 0 or float(hl.get("joints_balance", 0.0)) > 0)
         if hl.get("pool_credit"):   # the motor pools' own rule records their pool's noise (needs a separate motor rule)
             mr = spec.motor_rule
             if mr is None:
@@ -1484,6 +1484,16 @@ def spec_from_hparams(hp, input_shape, num_actions, channels=3):
             mr = {"preset": mr} if isinstance(mr, str) else dict(mr)
             mr.update(dict(hl["motor_rule"]))
             spec = replace(spec, motor_rule=mr)
+        if spec.motor_rule is not None and (hl.get("pool_credit") or hl.get("motor_rule")):
+            from ml_genn.compilers.eprop.variants import get_hidden_rule
+            try:
+                get_hidden_rule(spec.motor_rule)
+            except ValueError as e:
+                raise ValueError(
+                    "headless pool_credit / motor_rule build the motor pools' rule from the hidden (or fields') rule "
+                    f"and add to it; the result is invalid: {e}. With a noise-free rule (e.g. the e-prop surrogate) "
+                    "drop pool_credit and any noise terms in motor_rule: the surrogate already feeds back the pools' "
+                    "exact score (pool_homeo and pools work without noise)") from e
     if hp.get("code"):
         if hp["ei_layers"] != 0:
             raise ValueError("code: only with ei_layers 0 (the heads read the code instead of the input)")

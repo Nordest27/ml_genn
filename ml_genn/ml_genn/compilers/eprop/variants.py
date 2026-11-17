@@ -293,6 +293,10 @@ class HiddenRuleConfig:
     drift: float = 1.0               # c_P: TD error x lambda-trace of the drift part
     gradient: float = 1.0            # c_G: TD error x lambda-trace of the gradient part
     center_drift: bool = False       # drift modulated by delta minus its running mean (critic bias removed)
+    center_gradient: bool = False    # the gradient part G modulated by delta minus its running mean: the same
+                                     # lambda-trace credit (TD error x trace of the noise score), with the critic's
+                                     # bias removed (lower variance; the score has zero mean, so no change in
+                                     # expectation). Needs gradient != 0 and the trace estimator
     split_optimiser: bool = False    # the gradient part (and the local objectives, credited through the same noise
                                      # score) accumulate in their own gradient variable DeltaGG with its own
                                      # optimiser state; the drift-trace terms stay in DeltaG. Both steps go to the same
@@ -602,6 +606,9 @@ class HiddenRuleConfig:
             raise ValueError("route_link_signal must be 'noise' or 'spike'")
         if not 0.0 <= self.route_score_decay < 1.0:
             raise ValueError("route_score_decay must be in [0, 1)")
+        if self.center_gradient and (self.gradient == 0 or self.estimator is Estimator.EXACT
+                                     or self.noise is NoisePlacement.NONE):
+            raise ValueError("center_gradient needs gradient != 0, noise and the trace estimator")
         if self.route_gate not in ("psi", "activity"):
             raise ValueError("route_gate must be 'psi' or 'activity'")
         if not 0.0 <= self.route_gate_decay < 1.0:

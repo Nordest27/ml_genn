@@ -508,3 +508,97 @@ CPU_DEPTH5_ARCH_VARIANTS = [{"_meta": {"variant": f"{r}|{a}"}, "hidden_rule": ru
                             for a, arch in _ARCH.items() for r, rule in _RULES5.items()]
 STUDIES["cpu_depth5_arch"] = {"base": _D5_BASE, "grid": True, "rungs": [2e6], "seeds": [2], "keep": 1.0,
                               "space": {"*": ("choice", CPU_DEPTH5_ARCH_VARIANTS)}}
+
+
+# ---- arm (per-step two-link arm, CPU): our rule vs e-prop, same head --------------------------------------------
+# Both candidates share the head: surrogate-trained motor pools (e-prop's exact per-joint Gaussian score through the
+# pool membership, centred TD), so only the hidden layers' credit differs. Network: the v057 volume (the search's most
+# stable small volume), arm drive calibrated (input x3, field gain 2.0: motor spikes in ~95% of windows).
+# Same budget and 4 dimensions each: learning rate and the head's sigma shared; two rule-specific ones each.
+import json as _json
+from pathlib import Path as _Path
+ARM_BASE = _json.loads((_Path(__file__).resolve().parent.parent / "configs" / "arm_2026-11-16" /
+                        "arm_v057_base.json").read_text())
+_ARM_HEAD = {"surrogate_sigma": 0.1}
+_ARM_SCHEDULE = {"n": 12, "rungs": [5e5, 1.5e6, 3e6], "seeds": [1, 2, 2], "keep": 1 / 3,
+                 "gates": {"max_hz": 300}}
+ARM_LR = ("log", 3e-7, 3e-5)
+ARM_SIGMA = ("log", 0.05, 0.5)
+STUDIES["arm_ours"] = {
+    **_ARM_SCHEDULE,
+    "base": {**ARM_BASE,
+             "headless": {**ARM_BASE["headless"], **_ARM_HEAD,
+                          "motor_rule": {"eprop": 1.0, "drift": 0.0, "gradient": 0.0, "local": None,
+                                         "eprop_center_td": True}},
+             "hidden_rule": {"preset": "proposed", "gradient": 0.0, "drift": 1.0, "center_drift": False,
+                             "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.0, "rate": 0.0,
+                                       "decorr": 0.001, "contrast": 1.0, "contrast_route": "GRADIENT_TRACE"}}},
+    "space": {"lr": ARM_LR, "headless.surrogate_sigma": ARM_SIGMA,
+              "hidden_rule.log_syn_sigma": WEIGHT_NOISE, "hidden_rule.local.contrast": ("log", 0.3, 3.0)},
+}
+STUDIES["arm_eprop"] = {
+    **_ARM_SCHEDULE,
+    "base": {**ARM_BASE, "c_reg": 1e-4,
+             "headless": {**ARM_BASE["headless"], **_ARM_HEAD},
+             "hidden_rule": {"preset": "eprop", "eprop_center_td": True}},
+    "space": {"lr": ARM_LR, "headless.surrogate_sigma": ARM_SIGMA,
+              "c_reg": ("log", 1e-5, 1e-2), "hidden_rule.eprop_value": ("log", 0.03, 1.0)},
+}
+
+# ---- arm (2026-11-17): two-link arm, hand-centred view, motor pools with the exact Beta surrogate ---------------
+# Both rules: the same body (8 x 4 pools trained only by the surrogate's exact gradient, centred TD), task and
+# curriculum; 9 / 8 searched genes. Intrinsic plasticity is a gene for both (on / off, target, rate): on/off is the
+# last key, so "off" overrides the sampled IP values. Score: mean progress toward the target per move-log window
+# (displacement x cosine) over the last third: at 0.5M steps it predicts the final curriculum level (rank correlation
+# 0.73) and the final progress (0.90) in 13 earlier arm runs. It replaced the cosine alone (2026-11-17), which ranked
+# slow arms that only point at the target (e-prop, level ~0.03) with ones that reach (ours, level 0.21). The base point (config 0) is the hand-tuned recipe.
+ARM2_BASE = _json.loads((_Path(__file__).resolve().parent.parent / "configs" / "arm_2026-11-17" /
+                         "arm_hand_beta_base.json").read_text())
+_IP = {"eta": 1e-5, "psi_target": 0.07}
+_IP_GENES = {"intrinsic_plasticity.psi_target": ("lin", 0.02, 0.2),
+             "intrinsic_plasticity.eta": ("log", 1e-6, 1e-4),
+             "*": ("choice", [{}, {"intrinsic_plasticity": None}])}
+# First rung: 57 configurations (~8 h at 2 jobs, about the second rung's wall time; ~60 samples give a 95% chance of
+# one in the top 5%), promoting a fixed 8 then 3. The first 24 Sobol points are those of the earlier n = 24 schedule.
+_ARM2_SCHEDULE = {"n": 57, "rungs": [5e5, 1.5e6, 3e6], "seeds": [1, 2, 2], "keep": [8, 3], "score": "arm_progress",
+                  "gates": {"max_hz": 300}}
+STUDIES["arm2_ours"] = {
+    **_ARM2_SCHEDULE,
+    "base": {**ARM2_BASE, "lr": 1e-5, "c_reg": 0.0, "intrinsic_plasticity": _IP,
+             # the motor pools' rule derives from the hidden rule: their e-prop-only rule has no drift / G to centre
+             "headless": {**ARM2_BASE["headless"],
+                          "motor_rule": {**ARM2_BASE["headless"]["motor_rule"], "center_drift": False,
+                                         "center_gradient": False}},
+             "hidden_rule": {"preset": "proposed", "drift": 1.0, "gradient": 1.0, "center_drift": True,
+                             "center_gradient": True,
+                             "local": {"route": "GRADIENT_INSTANT", "dv": 0.0, "vreg": 0.1, "rate": 0.1,
+                                       "decorr": 0.1, "contrast": 1.0, "contrast_route": "GRADIENT_TRACE"}}},
+    "space": {"lr": ("log", 2e-6, 5e-5), "hidden_rule.log_syn_sigma": WEIGHT_NOISE,
+              "hidden_rule.local.vreg": ("log", 1e-3, 1.0), "hidden_rule.local.rate": ("log", 1e-3, 1.0),
+              "hidden_rule.local.decorr": ("log", 1e-4, 1.0), "hidden_rule.local.contrast": ("log", 0.1, 3.0),
+              **_IP_GENES},
+}
+STUDIES["arm2_eprop"] = {
+    **_ARM2_SCHEDULE,
+    "base": {**ARM2_BASE, "lr": 1e-5, "c_reg": 1e-2, "f_target": 10.0, "intrinsic_plasticity": _IP,
+             "headless": {**ARM2_BASE["headless"], "motor_rule": None},
+             "hidden_rule": {"preset": "eprop", "eprop_center_td": True, "vreg_gradient": 1e-2}},
+    "space": {"lr": ("log", 2e-6, 5e-5), "c_reg": ("log", 1e-4, 1e-1),
+              "hidden_rule.vreg_gradient": ("log", 1e-4, 1e-1), "f_target": ("lin", 10.0, 60.0),
+              "hidden_rule.eprop_value": ("log", 0.03, 1.0), **_IP_GENES},
+}
+
+# ---- deep Snake on the GPU, started from the arm winners (2026-11-17) --------------------------------------------
+# sampler "mutate": config 0 is the parent (the arm study's winner, its genes applied to the Snake base config), the
+# others mutants. Genes expected to depend on depth / fan-in / task mutate often and far, those expected to transfer
+# (properties of the rule) rarely. Fill SNAKE_GPU_BASE with the 5L / 7L headless config, then e.g.
+#   STUDIES["snake_ours"] = {"sampler": "mutate", "parent_from": "<arm root>/ours/arm2_ours/best.json",
+#                            "mutate": MUTATE_OURS, "space": STUDIES["arm2_ours"]["space"], "base": {...}, ...}
+_HIGH, _MED, _LOW = (0.7, 0.7), (0.35, 0.5), (0.1, 0.3)     # (probability, step: log-normal s.d. / range fraction)
+MUTATE_OURS = {"lr": _HIGH, "hidden_rule.log_syn_sigma": (0.7, 0.15),
+               "hidden_rule.local.vreg": _MED, "hidden_rule.local.rate": _MED, "hidden_rule.local.decorr": _MED,
+               "intrinsic_plasticity.psi_target": (0.35, 0.15), "intrinsic_plasticity.eta": _MED,
+               "hidden_rule.local.contrast": _LOW, "*": (0.1, 0)}
+MUTATE_EPROP = {"lr": _HIGH, "c_reg": _HIGH, "hidden_rule.vreg_gradient": _HIGH, "f_target": (0.7, 0.15),
+                "intrinsic_plasticity.psi_target": (0.35, 0.15), "intrinsic_plasticity.eta": _MED,
+                "hidden_rule.eprop_value": _LOW, "*": (0.1, 0)}

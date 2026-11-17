@@ -1,0 +1,8 @@
+{
+ "_comment": "Merge into a full network config WITHOUT headless (set headless to null): a learned readout as a Gaussian policy over the 4 axes (readout units 2j, 2j+1 give axis j's mean). Keep your hidden_rule (the rule) or set {\"preset\": \"eprop\", \"eprop_center_td\": true} for e-prop.",
+ "selection": null,
+ "headless": null,
+ "arm": {"task": "arena", "curriculum": {}, "seed": 0},
+ "arm_readout": {"sigma": 0.1, "gain": 1.0},
+ "episodic_traces": true, "gamma_env": 0.74, "td_lambda_env": 0.74
+}

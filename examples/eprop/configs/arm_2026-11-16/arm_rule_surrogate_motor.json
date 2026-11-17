@@ -1,0 +1,5 @@
+{"selection": null, "reach": null, "episodic_traces": false,
+ "arm": {"seed": 0, "joint_speed": 0.02, "continuous": true, "curriculum": {}, "target_steps": 300,
+         "segment_steps": 3000, "reward_mode": "progress"},
+ "headless": {"decoder": "joints", "gain": 3.0, "surrogate_sigma": 0.1,
+              "motor_rule": {"eprop": 1.0, "drift": 0.0, "gradient": 0.0, "local": null, "eprop_center_td": true}}}

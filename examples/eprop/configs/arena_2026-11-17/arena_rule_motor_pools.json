@@ -1,0 +1,9 @@
+{
+ "_comment": "Merge into a full network config (e.g. your 1L / 5L headless config). The arena: coins + enemies in the dark, 4 action axes (body x/y, gaze/aim x/y) = 8 motor pools; the rule in the hidden layers, the motor pools trained by the learned joint surrogate (motor_rule as in your surrogate-motor runs).",
+ "selection": null,
+ "arm": {"task": "arena", "curriculum": {}, "seed": 0},
+ "headless": {"seed": 0, "decoder": "joints", "gain": 1.0, "surrogate_sigma": 0.1, "joints_decay": 0.97,
+              "joints_balance": 1e-4, "surrogate_learn": {"rate": 0.05},
+              "motor_rule": {"eprop": 1.0, "drift": 0.0, "gradient": 0.0, "local": null, "eprop_center_td": true}},
+ "episodic_traces": true, "gamma_env": 0.74, "td_lambda_env": 0.74
+}

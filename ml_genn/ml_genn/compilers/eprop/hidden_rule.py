@@ -123,7 +123,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     use_cdrift = cfg.contrast_drift != 0
     cdrift_rate_neutral = use_cdrift and cfg.contrast_drift_gate == "rate_neutral"
     use_dev_mean = use_cdrift and (cfg.contrast_drift_centre != 0.0 or cdrift_rate_neutral)
-    needs_split = (cfg.center_drift or cfg.center_eligibility is not None or cfg.split_optimiser or cfg.homeostat != 0 or exact
+    needs_split = (cfg.center_drift or cfg.center_gradient or cfg.center_eligibility is not None or cfg.split_optimiser
+                   or cfg.homeostat != 0 or exact
                    or use_cdrift
                    or contrast_route is LocalRoute.GRADIENT_TRACE or sens_route is LocalRoute.GRADIENT_TRACE
                    or td_route is LocalRoute.GRADIENT_TRACE
@@ -248,7 +249,8 @@ def build_td_hidden_model(cfg: HiddenRuleConfig, *, c_reg: float, alpha: float, 
     for name, used in (("FAvg", use_favg), ("FAvgTrace", use_rate_local), ("Z", use_dvc),
                        ("PrevV", use_prevv), ("DVc", use_dvc), ("PsiBar", uses_psibar),
                        ("PsiTargetN", cfg.homeostat != 0 and cfg.psi_target_warmup is not None),
-                       ("TdMean", cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
+                       ("TdMean", cfg.center_drift or cfg.center_gradient
+                        or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td))),
                        ("AbsTd", use_abs_td), ("HebbZ", use_ztrace), ("HebbMean", use_ztrace),
                        ("DevMean", use_dev_mean),
                        ("ContrD", use_contrast), ("ContrR", use_contrast), ("ContrMean", contrast_own),
@@ -371,7 +373,7 @@ else {
             # group of the neuron: they all compute the same PsiBar from the same postsynaptic state)
             post_dyn.append(f"if (PsiTargetN == 0.0 && t >= {float(cfg.psi_target_warmup)!r}) {{ "
                             "PsiTargetN = fmax(PsiBar, 1e-4); }")
-    if cfg.center_drift or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td)):
+    if cfg.center_drift or cfg.center_gradient or (use_eprop and (cfg.eprop_center_value or cfg.eprop_center_td)):
         post_dyn.append(f"TdMean = {_f(cfg.td_stats_decay)} * TdMean + {_f(1 - cfg.td_stats_decay)} * (TdE_post + PRew_post);")
     if use_abs_td:
         post_dyn.append(f"AbsTd = {_f(cfg.td_stats_decay)} * AbsTd + {_f(1 - cfg.td_stats_decay)} * fabs(TdE_post + PRew_post);")
@@ -492,7 +494,7 @@ else {
     if cfg.route != 0:   # routed credit through the learned computation sensitivities, weighted by the neuron's trust
         dg.append(f"{_f(cfg.route)} * RtW_post * reward * RLRouteTrace")
     if use_G and cfg.gradient != 0:
-        dg.append(_scaled(cfg.gradient, "reward * RLNoiseGtrace"))
+        dg.append(_scaled(cfg.gradient, ("(reward - TdMean)" if cfg.center_gradient else "reward") + " * RLNoiseGtrace"))
         g_terms.add(len(dg) - 1)
     if cfg.homeostat != 0:
         target = _f(cfg.psi_target)

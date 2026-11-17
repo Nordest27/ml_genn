@@ -87,3 +87,26 @@ What to look at:
 - the firing rates per layer in `_neurons.csv`. Routed credit raised hidden rates in the toys (to about 145 Hz in the
   last hidden layer), so watch for that. The links do not enter the membrane, so any rise comes from learning;
 - the decision shares per pool (homeostasis should keep them near 1/4).
+
+## Surrogate e-prop and the rule with surrogate-trained motor units (added 16 November)
+
+The surrogate (`headless.surrogate_tau`) feeds softmax(pool activity / tau) − onehot back through the exact pool
+membership. It is e-prop's ideal credit for this head: the upper reference, not a plausible rule. It needs the default
+decoder; the count decoders such as `lse` refuse it.
+
+- `surrogate_tau: "auto"`: the temperature is the running mean decision margin. The surrogate then follows the
+  network's own decisiveness, and the logged probabilities are calibrated (the winner typically about 0.6-0.7). With a
+  fixed tau = 1 the softmax was nearly one-hot, and the log showed a different proxy.
+- `surrogate_sample: true`: the action is drawn from the surrogate softmax instead of the argmax. The logged policy is
+  then the acting policy and e-prop's score is exact, but exploration comes from the temperature, not the network's own
+  variability. Use it as a reference run only.
+- Don't combine the surrogate with `pool_credit` or noise terms in `motor_rule` when the rule has no noise (e.g.
+  `"hidden_rule": "eprop"`); there is now a clear error for that. `pool_homeo` and `pools` work.
+
+| Overlay | |
+|---|---|
+| `eprop_surrogate.json` | surrogate e-prop (`"hidden_rule": "eprop"` replaces the whole rule block; `surrogate_tau` "auto"; no pool credit) |
+| `rule_surrogate_motor.json` | your rule in the hidden layers; the motor units are pure readouts trained only by the surrogate's e-prop term (`motor_rule: {"eprop": 1.0, "drift": 0.0, "gradient": 0.0, "local": null}`; their noise stays injected but is not credited) |
+| `rule_surrogate_all.json` | the full combination: drift + contrast + the e-prop term in every layer |
+
+All three use `surrogate_tau: "auto"`.

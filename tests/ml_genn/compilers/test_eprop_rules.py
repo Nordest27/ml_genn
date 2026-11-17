@@ -2909,3 +2909,22 @@ def test_pool_bias_with_other_membrane_edits(request, extra):
 
     h = _run(compiled, inp, pol, val, steps=50, probe=probe)
     assert np.all(np.isfinite(h)) and np.all(np.isfinite(got["end"]))
+
+
+def test_center_gradient_uses_the_centred_td_error_with_the_trace(request):
+    kw = dict(c_reg=1e-4, alpha=0.9, rho=0.99, f_target=0.01, alpha_fav=0.998, v_thresh=0.61, td_lambda=0.99)
+    model = build_td_hidden_model(replace(PRESETS["proposed"], center_gradient=True), **kw)["model"]
+    syn = model["synapse_dynamics_code"]
+    assert "(reward - TdMean) * RLNoiseGtrace" in syn
+    code = " ".join(v for v in model.values() if isinstance(v, str))
+    assert "TdMean = " in code                              # the running mean is updated (postsynaptic dynamics)
+    off = build_td_hidden_model(PRESETS["proposed"], **kw)["model"]["synapse_dynamics_code"]
+    assert "RLNoiseGtrace" not in off                         # plain proposed: one combined trace, no separate G and "(reward - TdMean) * RLNoiseGtrace" not in off
+    from ml_genn.compilers.eprop.variants import Estimator
+    for bad in (dict(gradient=0.0), dict(estimator=Estimator.EXACT, drift=0.0)):
+        with pytest.raises(ValueError):
+            replace(PRESETS["proposed"], center_gradient=True, **bad)
+    compiled, inp, hid, pol, val = _compile(EPropCompiler, request.node.name, PolicyType.GENERIC,
+                                            hidden_rule={"preset": "proposed", "center_gradient": True})
+    h = _run(compiled, inp, pol, val, steps=100)
+    assert np.all(np.isfinite(h)) and np.any(h[-1] != h[0])

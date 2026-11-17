@@ -181,3 +181,42 @@ def test_peek_blocks_are_per_block(env, capsys):
     sweep.peek("pk", env, block=1000)
     out = capsys.readouterr().out
     assert "-0.300 +0.300" in out                         # 30 * (-10 / 1000) and 30 * (+10 / 1000)
+
+
+def test_mutate_sampler_skews_to_uncertain_genes(tmp_path):
+    """sampler "mutate": point 0 is the parent; genes mutate with their own probability (clipped to the range),
+    every mutant differs; the parent can come from another study's best.json, including the "*" on/off gene."""
+    space = {"lr": ("log", 1e-6, 1e-4), "x": ("lin", 0.0, 1.0), "*": ("choice", [{}, {"ip": None}])}
+    mut = {"lr": (0.9, 0.7), "x": (0.05, 0.1), "*": (0.05, 0)}
+    parent = {"lr": 1e-5, "x": 0.5, "*": {}}
+    pts = sweep.sample_mutate(space, mut, parent, 400, 0)
+    assert pts[0] == parent and len(pts) == 400 and pts == sweep.sample_mutate(space, mut, parent, 400, 0)
+    lr_rate = np.mean([p["lr"] != parent["lr"] for p in pts[1:]])
+    x_rate = np.mean([p["x"] != parent["x"] for p in pts[1:]])
+    assert lr_rate > 0.85 and x_rate < 0.15
+    assert all(1e-6 <= p["lr"] <= 1e-4 and 0 <= p["x"] <= 1 for p in pts) and all(p != parent for p in pts[1:])
+    best = tmp_path / "best.json"
+    best.write_text(json.dumps({"lr": 3e-5, "x": 0.2, "ip": {"eta": 1}}))
+    got = sweep.parent_point({"space": space, "parent_from": str(best)}, tmp_path)
+    assert got == {"lr": 3e-5, "x": 0.2, "*": {}}
+    best.write_text(json.dumps({"lr": 3e-5, "x": 0.2, "ip": None}))
+    assert sweep.parent_point({"space": space, "parent_from": "best.json"}, tmp_path)["*"] == {"ip": None}
+
+
+def test_arm_scores_direction_and_progress(tmp_path):
+    """arm_cos: the mean cosine of the move log's last window fraction; arm_progress: cosine x displacement, so a
+    slow arm pointing at the target scores below a fast one."""
+    f = tmp_path / "m.csv"
+    rows = ["timestep,cos,speed"] + [f"{t},{c},{v}" for t, c, v in
+                                     [(100, 0.0, 0.1), (200, 0.5, 0.02), (300, 0.5, 0.02), (400, float("nan"), 0.0)]]
+    f.write_text("\n".join(rows))
+    assert sweep.arm_cos(f, 0.5) == pytest.approx(0.5)
+    assert sweep.arm_cos(f, 0.5, progress=True) == pytest.approx(0.01)
+
+
+def test_keep_per_rung_counts_and_fractions(env, monkeypatch):
+    """keep may be a list per promotion: counts (>= 1) or fractions (< 1)."""
+    s = {**sweep.STUDIES["toy"], "n": 20, "rungs": [1e5, 2e5, 3e5], "seeds": [1, 1, 1], "keep": [8, 0.5]}
+    monkeypatch.setitem(sweep.STUDIES, "toy3", s)
+    configs, runs, _ = sweep.plan_study("toy3")
+    assert configs == [20, 8, 4]

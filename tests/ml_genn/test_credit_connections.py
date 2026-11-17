@@ -308,3 +308,19 @@ def test_direct_route_links_fill_the_influence_cone():
     l1 = b.layers[0][0]
     assert hops[l1] == len(b.layers) - 1                       # L1 E -> L2 E -> L3 E (the motor population)
     assert hops[b.layers[0][1]] == hops[l1] + 1                 # its inhibitory population acts through it
+
+
+@pytest.mark.parametrize("headless", [{"pool_credit": True}, {"motor_rule": {"gradient": 1.0}}])
+def test_headless_pool_options_with_a_noise_free_rule_explain_themselves(headless):
+    """pool_credit / noise terms in motor_rule on top of the noise-free e-prop rule (surrogate e-prop): a clear error
+    that says why; pool_homeo alone is fine."""
+    import snake_hparams
+    import snake_network
+    hp = dict(snake_hparams.DEFAULTS)
+    hp.update({"toroidal": "local", "ei_layers": 1, "hid_e": 6, "hid_i": 4, "fan_in": 50, "hidden_rule": "eprop",
+               "headless": {"seed": 0, "surrogate_tau": "auto", **headless}})
+    with pytest.raises(ValueError, match="surrogate already feeds back"):
+        snake_network.spec_from_hparams(hp, (20, 20, 3), 4, channels=3)
+    hp["headless"] = {"seed": 0, "surrogate_tau": "auto", "pool_homeo": 1e-4}
+    spec = snake_network.spec_from_hparams(hp, (20, 20, 3), 4, channels=3)
+    assert spec.motor_pool_bias and spec.motor_rule is None

@@ -1,0 +1,9 @@
+{
+ "_comment": "Merge into a full network config. Centred e-prop with the same motor pools and learned surrogate.",
+ "selection": null,
+ "arm": {"task": "arena", "curriculum": {}, "seed": 0},
+ "headless": {"seed": 0, "decoder": "joints", "gain": 1.0, "surrogate_sigma": 0.1, "joints_decay": 0.97,
+              "joints_balance": 1e-4, "surrogate_learn": {"rate": 0.05}},
+ "hidden_rule": {"preset": "eprop", "eprop_center_td": true},
+ "episodic_traces": true, "gamma_env": 0.74, "td_lambda_env": 0.74
+}

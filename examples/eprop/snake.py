@@ -77,7 +77,10 @@ import csv
 #     most active pool at the decision (ties at random). Exploration is the network's own variability. The critic is
 #     the usual per-step value head. Without surrogate_tau the policy error is 0 (the perturbation rules need none);
 #     with it, softmax(pool activity / tau) - onehot is fed back through the exact pool membership (e-prop's best
-#     surrogate, a modelling choice the task does not define)
+#     surrogate, a modelling choice the task does not define); "surrogate_tau": "auto" - the temperature is the
+#     running mean decision margin (follows the network's own decisiveness, as the logged display proxy);
+#     "surrogate_sample": true - the action is drawn from the surrogate softmax (exact e-prop score, logged policy =
+#     the acting policy; exploration from the temperature instead of the network's own variability)
 #     "decoder": "argmax" | "vector" - vector: two motor pools (left, right) read as a population vector
 #     x = (right - left) / (right + left) in [-1, 1] that steers (x < -threshold turn left, x > threshold turn right,
 #     else forward; relative to the snake's heading): a fixed continuous decoder with no distribution;
@@ -88,7 +91,25 @@ import csv
 #     from the pool mean (beta -> 0) to the pool max (beta -> inf); deterministic, no distribution, random pools;
 #     "popvec" (continuous actions, reach): every motor neuron has a fixed random preferred direction (seeded by
 #     "seed") and the action is the population vector gain * sum_i c_i u_i / sum_i c_i of the spike counts c over
-#     the move ("gain", 4.0; clipped to unit length by the environment)
+#     the move ("gain", 4.0; clipped to unit length by the environment); "joints" (the arm): four motor pools, the
+#     flexor and extensor of each of the two joints; each joint's velocity is gain * (flexor - extensor) /
+#     (flexor + extensor) of a trace of the pools' mean spike counts ("joints_decay" 0.9 per step, "gain" 3.0;
+#     clipped to [-1, 1]); the arm is controlled every step.
+#     "surrogate_sigma": s (joints only) - e-prop's Gaussian surrogate over the joint velocities: the action is drawn
+#     around the decoded velocities with s.d. s and the score (velocity - action) / s goes back to each joint's flexor
+#     pool (and its negative to the extensor pool) through the exact pool membership; "surrogate_rho": r (0) - the
+#     exploration noise is an Ornstein-Uhlenbeck process with per-step correlation r (committed movements over
+#     ~1 / (1 - r) steps); the score sent back is then the noise's innovation, still exact; "surrogate_learn":
+#     {"rate": 0.05, "signal": "command" | "movement"} (None) - the learned surrogate: instead of +-1 per pool, each
+#     pool's credit is scaled by a learned estimate of the decoder's local Jacobian (snake_switch.SurrogateGain: NLMS
+#     on the step-to-step changes of the pools' traces and of the efference copy of the command, or of the executed
+#     movement; starts at +-1, normalised to the fixed surrogate's scale); "joints_dist": "beta" (None) - the Beta
+#     surrogate instead of the Gaussian one: per joint alpha = 1 + beta_scale x flexor trace, beta = 1 + beta_scale x
+#     extensor trace (capped at "beta_max", 50), action = 2 x - 1 with x ~ Beta(alpha, beta), the exact score sent back
+#     per pool ("beta_scale" 50: the pools' traces are ~0.07 spikes per neuron per step); "joints_balance": rate (0)
+#     - antagonist balance: every step each pool pair's bias current moves against its decoded command
+#     (flexor -= rate * command, extensor += rate * command), so each axis' average command stays near zero and a
+#     random flexor / extensor imbalance cannot hold the command saturated (the continuous counterpart of pool_homeo)
 #     "motor_log_syn_sigma": x - the policy field (motor pools) gets its own rule with weight noise exp(x - 5) (the
 #     default is x = 0, i.e. 0.0067): more of the variability that picks the action is noise the rule can credit
 #     "pools": "random" | "contiguous" - the motor pools: a random partition of the motor sheet, or contiguous regions
@@ -113,6 +134,14 @@ import csv
 # reach: None or {"speed": 0.08, "radius": 0.08, "progress": 10.0, "reach_reward": 1.0, "max_moves": 40, "near": 0.3,
 #     "noise": 0.0, "blob": 1, "seed": None} - instead of Snake, continuous reaching (snake_switch.ReachEnv): a point
 #     agent moves toward a target with a 2D velocity each move; egocentric view; needs headless with decoder "popvec".
+#     The logged score is the episode's reward (progress + reach bonus); "Snake len" 1 = reached
+# arm: None or {"l1": 0.45, "l2": 0.45, "joint_speed": 0.005, "elbow_limit": 2.6, "radius": 0.1, "progress": 10.0,
+#     "reach_reward": 1.0, "max_steps": 1200, "near": 0.3, "min_reach": 0.2, "noise": 0.0, "blob": 2, "width": 1,
+#     "hand_blob": 1, "seed": None, "record_every": 0, "record_dir": "outputs/arm_episodes"} -
+#     instead of Snake, a two-link arm with two joint motors reaching for a target (snake_switch.ArmEnv): top-down view
+#     (arm, target, hand channels), the action is the two joint velocities, set every simulation step (no decision
+#     window: joint_speed sets the thinking time per unit of movement); the input is updated every step; logs, frames and
+#     the move log keep the per-move cadence; needs headless with decoder "joints".
 #     The logged score is the episode's reward (progress + reach bonus); "Snake len" 1 = reached
 # field_ei: None or {"gain_ee": 1.0, "gain_ei": 1.0, "gain_i": 1.0, "i_side": None} - each field becomes an E/I layer:
 #     its own inhibitory population (side i_side, default as much smaller than the field as the last layer's I is than
@@ -177,7 +206,7 @@ import csv
 # readout_optimiser: None (the readout uses the main optimiser) or {"type": "adam" | "adabelief" | "sgd", "lr": lr,
 #     "betas": [...]} - own optimiser for the readout weights, output biases and optimised feedback weights (modular
 #     compiler), e.g. Adam on the raw readout gradient when the hidden rule is factor-normalised and uses SGD
-SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None,
+SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None, "intrinsic_plasticity": None,
                         "value_transform": None, "reward_centring": None,
                         "optimiser_betas": None, "l2_init": None,
                         "readout_optimiser": None, "monitor_score_factors": False,
@@ -187,7 +216,8 @@ SNAKE_EXTRA_DEFAULTS = {"reward_decay_normalise": False, "value_afterglow": None
                         "episodic_traces": False, "episodic_debug": 0, "readout_lambda_env": None,
                         "policy_head": None, "code": None, "boolean_head": None, "cnn_head": None,
                         "headless": None, "selection": None, "diagnose_parts_every": None,
-                        "move_log": None, "field_ei": None, "reach": None}
+                        "move_log": None, "field_ei": None, "reach": None, "arm": None,
+                        "arm_readout": None}
 HP = snake_hparams.load({**SNAKE_EXTRA_DEFAULTS, **snake_hparams.DEFAULTS})
 
 def compute_returns(rewards, gamma):
@@ -697,9 +727,24 @@ def compute_p_max(desired_fan_in, sigma, src_shape, dst_shape=None, wrap=True):
 
 
 HEADLESS_VECTOR = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") == "vector"
-HEADLESS_COUNTS = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") in ("max", "topk", "lse", "popvec")
+HEADLESS_COUNTS = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") in ("max", "topk", "lse", "popvec",
+                                                                                      "joints")
 HEADLESS_POPVEC = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") == "popvec"
+HEADLESS_JOINTS = bool(HP["headless"]) and HP["headless"].get("decoder", "argmax") == "joints"
+ARM_STEP = bool(HP["arm"])     # the arm is controlled every step (decode + policy error each step, logs per move)
 NUM_OUTPUT = 2 if (HP["selection"] or HEADLESS_VECTOR or HP["reach"]) else 4   # selection: commit / skip; vector: left / right pools
+if HP["arm"] and HP["arm"].get("task") in ("coins", "shooter", "arena"):
+    NUM_OUTPUT = 8                  # coins: body x / y and gaze x / y; shooter: body x / y and aim x / y (pool pairs)
+if HEADLESS_JOINTS and not HP["arm"]:
+    raise ValueError("headless decoder 'joints' needs arm")
+if HP["arm"] and HP["headless"] is None and HP["arm_readout"] is None:
+    raise ValueError("arm without headless needs arm_readout (a learned Gaussian readout)")
+if HP["arm_readout"] is not None and (not HP["arm"] or HP["headless"] is not None
+                                      or set(HP["arm_readout"]) - {"sigma", "gain", "rho", "dist", "max_conc"}
+                                      or float(HP["arm_readout"].get("sigma", 0.1)) <= 0
+                                      or HP["arm_readout"].get("dist", "gaussian") not in ("gaussian", "beta")):
+    raise ValueError("arm_readout: {sigma > 0, gain, rho, dist 'gaussian' | 'beta', max_conc}, with arm and "
+                     "without headless")
 NUM_OUTPUT_CHART = NUM_OUTPUT
 if GAUSSIAN_TRACE_POLICY:
     NUM_OUTPUT = 1
@@ -879,19 +924,49 @@ def build_compiled_network(connectivity_type="fixed"):
     if HP["headless"] is not None:
         if HP["hidden_rule"] is None:
             raise ValueError("headless needs the modular compiler (set hidden_rule)")
-        if HP["headless"].get("decoder", "argmax") not in ("argmax", "vector", "max", "topk", "lse", "popvec"):
-            raise ValueError(f"headless decoder must be 'argmax', 'vector', 'max', 'topk', 'lse' or 'popvec', not "
-                             f"{HP['headless']['decoder']!r}")
+        if HP["headless"].get("decoder", "argmax") not in ("argmax", "vector", "max", "topk", "lse", "popvec", "joints"):
+            raise ValueError(f"headless decoder must be 'argmax', 'vector', 'max', 'topk', 'lse', 'popvec' or 'joints', "
+                             f"not {HP['headless']['decoder']!r}")
         if bool(HP["reach"]) != HEADLESS_POPVEC:
             raise ValueError("reach needs headless decoder 'popvec' (and 'popvec' needs reach)")
+        if HP["arm"] and HP["reach"]:
+            raise ValueError("arm and reach are two different tasks: set one")
+        if HP["arm"] and not HEADLESS_JOINTS:
+            raise ValueError("arm with headless needs decoder 'joints'")
+        sg = HP["headless"].get("surrogate_sigma")
+        if sg is not None and (not HEADLESS_JOINTS or not (isinstance(sg, (int, float)) and sg > 0)):
+            raise ValueError("headless surrogate_sigma: a number > 0, with decoder 'joints' (the arm) only")
+        sl = HP["headless"].get("surrogate_learn")
+        if sl is not None and (not isinstance(sl, dict) or sg is None or float(sl.get("rate", 0.05)) <= 0
+                               or sl.get("signal", "command") not in ("command", "movement")
+                               or set(sl) - {"rate", "signal"}):
+            raise ValueError("headless surrogate_learn: {rate > 0, signal 'command' | 'movement'}, with surrogate_sigma")
+        jd = HP["headless"].get("joints_dist")
+        if jd is not None and (jd != "beta" or not HEADLESS_JOINTS or sg is not None or sl is not None
+                               or float(HP["headless"].get("beta_scale", 50.0)) <= 0):
+            raise ValueError("headless joints_dist: 'beta' (decoder 'joints'), instead of surrogate_sigma / "
+                             "surrogate_learn, beta_scale > 0")
+        jb = HP["headless"].get("joints_balance", 0.0)
+        if not (isinstance(jb, (int, float)) and jb >= 0) or (jb > 0 and not HEADLESS_JOINTS):
+            raise ValueError("headless joints_balance: a rate >= 0, with decoder 'joints' only")
+        rho = HP["headless"].get("surrogate_rho", 0.0)
+        if not (isinstance(rho, (int, float)) and 0.0 <= rho < 1.0) or (rho > 0 and sg is None):
+            raise ValueError("headless surrogate_rho: in [0, 1), with surrogate_sigma")
         if HEADLESS_VECTOR and (HP["selection"] or HP["headless"].get("surrogate_tau") is not None):
             raise ValueError("headless decoder 'vector' steers the snake: no selection task, no surrogate_tau")
         if (HP["policy_head"] is not None or HP["cnn_head"] is not None
                 or (HP["boolean_head"] is not None and HP["boolean_head"].get("position") != "before_fields")):
             raise ValueError("headless has no policy head: no policy_head / cnn_head / boolean_head (a boolean_head "
                              "only before the fields)")
-        if HP["entropy_bonus"] > 0 and HP["headless"].get("surrogate_tau") is None:
+        if HP["entropy_bonus"] > 0 and HP["headless"].get("surrogate_tau") is None and sg is None \
+                and HP["headless"].get("joints_dist") is None:
             raise ValueError("headless defines no policy distribution: set entropy_bonus to 0 (or a surrogate_tau)")
+        tau = HP["headless"].get("surrogate_tau")
+        if tau is not None and tau != "auto" and not (isinstance(tau, (int, float)) and not isinstance(tau, bool)
+                                                       and tau > 0):
+            raise ValueError(f"headless surrogate_tau must be None, 'auto' or a number > 0, not {tau!r}")
+        if HP["headless"].get("surrogate_sample") and tau is None:
+            raise ValueError("headless surrogate_sample needs a surrogate_tau (the softmax it samples from)")
         rule_kwargs.update(train_readout="value")
     if HP["cnn_head"] is not None:
         if HP["hidden_rule"] is None:
@@ -1159,15 +1234,15 @@ class MoveLog:
             self.act_start = self.act_at.pop(0)      # a new window: clear the counters, record from the next move
             self.act = {"ctype": [], "timestep": [], **{k: [] for k, _ in self.act_pops}}
             for k, gp in self.act_pops:
-                if MOTOR and gp is MOTOR["gp"]:
+                if gp is MOTOR.get("gp"):           # (MOTOR also holds the readout's noise state: test the population)
                     continue
                 gp.vars["SpkCount"].view[:] = 0.0
                 gp.vars["SpkCount"].push_to_device()
             self.act_rec = True
         elif self.act_pops and self.act_rec and len(self.act["ctype"]) < self.n_act:
             for k, gp in self.act_pops:
-                if MOTOR and gp is MOTOR["gp"]:      # count decoders read (and zero) the motor counters first
-                    self.act[k].append(MOTOR["last"].astype(np.float32))
+                if gp is MOTOR.get("gp"):            # count decoders read (and zero) the motor counters first
+                    self.act[k].append(np.asarray(MOTOR.get("win", MOTOR["last"])).astype(np.float32))
                     continue
                 gp.vars["SpkCount"].pull_from_device()
                 self.act[k].append(np.asarray(gp.vars["SpkCount"].view, dtype=np.float32).ravel().copy())
@@ -1180,6 +1255,8 @@ class MoveLog:
                 np.savez_compressed(f"outputs/{CSV_PREFIX}({REPETITION})_activity{suffix}.npz",
                                     **{k: np.array(v) for k, v in self.act.items()})
                 self.act_rec = False
+        if MOTOR:
+            MOTOR["win"] = 0.0          # the motor counts of the next move start here (recorded or not)
         if not self.conns:
             return
         if self.probe is None and t >= self.next_probe:
@@ -1335,6 +1412,7 @@ def headless_counts():
     gp.vars["SpkCount"].view[:] = 0.0
     gp.vars["SpkCount"].push_to_device()
     MOTOR["last"] = c
+    MOTOR["win"] = MOTOR.get("win", 0.0) + c       # summed since the move log last read it (the arm reads every step)
     dec = HP["headless"]["decoder"]
     if dec == "popvec":
         if "u" not in MOTOR:
@@ -1344,7 +1422,9 @@ def headless_counts():
     out = np.zeros(NUM_OUTPUT)
     for a in range(NUM_OUTPUT):
         x = c[MOTOR["pools"] == a]
-        if dec == "max":
+        if dec == "joints":
+            out[a] = x.mean()
+        elif dec == "max":
             out[a] = x.max()
         elif dec == "topk":
             out[a] = np.sort(x)[-int(HP["headless"].get("k", 5)):].mean()
@@ -1381,28 +1461,115 @@ def headless_pool_homeo(action):
 
 def headless_counts_reset():
     """After the drain: the drain's spikes are not part of the next episode's first move."""
-    if MOTOR:
+    if "gp" in MOTOR:
         MOTOR["gp"].vars["SpkCount"].view[:] = 0.0
         MOTOR["gp"].vars["SpkCount"].push_to_device()
+        MOTOR["win"] = 0.0
+
+
+def headless_joints(stats):
+    """headless decoder "joints" (the arm, every step): the two joint velocities from a trace of the four pools'
+    statistics (flexor and extensor per joint; trace decay joints_decay, default 0.9 per step). Without surrogate_sigma the action is the decoded velocities and no policy error is sent; with
+    it, e-prop's Gaussian surrogate draws the action around them and sends the score back through the pool membership.
+    The logged policy is a display proxy (each pool's share of the statistics)."""
+    d = float(HP["headless"].get("joints_decay", 0.9))     # per-step counts are mostly 0 / 1: a short trace of them
+    tr = MOTOR.get("jtrace")
+    tr = np.asarray(stats, dtype=np.float64) * (1 - d) if tr is None else d * tr + (1 - d) * np.asarray(stats)
+    MOTOR["jtrace"] = tr
+    omega = snake_switch.joint_velocities(tr, HP["headless"].get("gain", 3.0))
+    rate = float(HP["headless"].get("joints_balance", 0.0))
+    if rate > 0:                    # antagonist balance: each axis' mean command is held near zero by the pools' bias
+        info = motor_info()
+        hb = MOTOR.setdefault("hb", np.zeros(NUM_OUTPUT))
+        hb[0::2] -= rate * omega; hb[1::2] += rate * omega
+        var = info["gp"].vars["PoolBias"]
+        var.view[:] = np.reshape(hb[info["pools"]], var.view.shape)
+        var.push_to_device()
+    sg = HP["headless"].get("surrogate_sigma")
+    if HP["headless"].get("joints_dist") == "beta":     # the Beta surrogate: exact score per pool, bounded actions
+        action, pg, _ = snake_switch.joint_beta(tr, float(HP["headless"].get("beta_scale", 50.0)), np.random,
+                                                float(HP["headless"].get("beta_max", 50.0)))
+    elif sg is None:
+        action, pg = omega, np.zeros(NUM_OUTPUT)
+    else:
+        sl = HP["headless"].get("surrogate_learn")
+        gains = None
+        if sl:                      # the learned surrogate: the decoder's local Jacobian from the pools' own changes
+            if "sgain" not in MOTOR:
+                MOTOR["sgain"] = snake_switch.SurrogateGain(len(omega), float(sl.get("rate", 0.05)))
+            if sl.get("signal", "command") == "command":
+                gains = MOTOR["sgain"].update(tr, omega)       # efference copy of the decoded command
+            else:
+                gains = MOTOR["sgain"].gains()                 # proprioception: updated below from the movement
+        action, pg, MOTOR["ou"] = snake_switch.joint_surrogate(omega, sg, np.random,
+                                                               HP["headless"].get("surrogate_rho", 0.0), MOTOR.get("ou"),
+                                                               gains)
+        if sl and sl.get("signal", "command") == "movement":
+            MOTOR["sgain"].update(tr, action)
+        if sl:
+            MOTOR["sgn"] = MOTOR.get("sgn", 0) + 1
+            if MOTOR["sgn"] % 50000 == 0:
+                print(f"surrogate_learn step {MOTOR['sgn']}: gains {np.round(MOTOR['sgain'].gains(), 3).tolist()}",
+                      flush=True)
+    probs = headless_share(np.asarray(stats, dtype=np.float64))
+    HEADLESS_LAST["probs"] = probs
+    return action, pg, probs
+
+
+def arm_readout_policy(readout):
+    """arm_readout (no headless): the learned readout is a Gaussian policy over the joint velocities: readout units
+    (2j, 2j + 1) give joint j's mean, gain * (r_2j - r_2j+1), the action is drawn around it with s.d. sigma (white,
+    or an OU process with per-step correlation rho; the score is the innovation's) and the exact score goes back to
+    the two readout units with opposite signs (PG = -d log pi / d readout up to the 1 / sigma scale, the surrogate's
+    convention). The environment clips what it executes; the score is the unclipped sample's.
+    "dist": "beta": a bounded Beta policy instead (snake_switch.beta_policy: alpha from unit 2j, beta from 2j + 1,
+    action 2 x - 1; no clipping, the concentration alpha + beta set by the pair's drive; "gain" scales the readout,
+    "max_conc" caps alpha and beta)."""
+    cfg = HP["arm_readout"]
+    if cfg.get("dist", "gaussian") == "beta":                 # bounded: a Beta per axis from the antagonist pair
+        action, pg, mean = snake_switch.beta_policy(readout, np.random, float(cfg.get("gain", 1.0)),
+                                                    float(cfg.get("max_conc", 50.0)))
+        probs = np.clip(np.stack([mean, -mean], 1).ravel(), 0, None)
+        probs = probs / probs.sum() if probs.sum() > 0 else np.full(len(probs), 1.0 / len(probs))
+        return action, pg, probs
+    r = np.asarray(readout, dtype=np.float64).reshape(-1, 2)
+    gain = float(cfg.get("gain", 1.0))
+    mean = gain * (r[:, 0] - r[:, 1])
+    action, pg, MOTOR["ou"] = snake_switch.joint_surrogate(mean, float(cfg.get("sigma", 0.1)), np.random,
+                                                           float(cfg.get("rho", 0.0)), MOTOR.get("ou"))
+    probs = np.clip(np.stack([mean, -mean], 1).ravel(), 0, None)
+    probs = probs / probs.sum() if probs.sum() > 0 else np.full(len(probs), 1.0 / len(probs))
+    return action, gain * pg, probs                   # probs: a display proxy only
 
 
 def headless_decide(pool_activity):
     """headless: act on the most active motor pool (ties at random). Returns the action, the policy error sent back
     (0, or the softmax surrogate with surrogate_tau) and the logged policy (headless_contrast of the pool statistics,
-    a display proxy since no policy is defined, or the surrogate); the decision margin goes to HEADLESS_LAST."""
+    a display proxy since no policy is defined, or the surrogate); the decision margin goes to HEADLESS_LAST.
+    surrogate_tau "auto": the temperature is the running mean decision margin (the display proxy's scale), so the
+    surrogate follows the network's own decisiveness instead of a fixed scale. surrogate_sample: the action is drawn
+    from the surrogate softmax (then the logged policy is the policy that acted and e-prop's score is exact; the
+    exploration is the temperature's, not the network's own variability)."""
     best = np.flatnonzero(pool_activity >= pool_activity.max() - 1e-9)
     action = int(np.random.choice(best))
-    headless_pool_homeo(action)
-    onehot = np.zeros(NUM_OUTPUT)
-    onehot[action] = 1.0
     top = np.sort(np.asarray(pool_activity, dtype=np.float64))
     HEADLESS_LAST["margin"] = float(top[-1] - top[-2]) if top.size > 1 else 0.0
     tau = HP["headless"].get("surrogate_tau")
     if tau is None:
+        headless_pool_homeo(action)
         HEADLESS_LAST["probs"] = headless_contrast(pool_activity)
         return action, np.zeros(NUM_OUTPUT), HEADLESS_LAST["probs"]
-    z = np.exp((pool_activity - pool_activity.max()) / float(tau))
-    surrogate = z / z.sum()
+    if tau == "auto":
+        surrogate = headless_contrast(pool_activity)      # softmax(activity / running mean margin)
+    else:
+        z = np.exp((pool_activity - pool_activity.max()) / float(tau))
+        surrogate = z / z.sum()
+    if HP["headless"].get("surrogate_sample"):
+        action = int(np.random.choice(NUM_OUTPUT, p=surrogate))
+    headless_pool_homeo(action)
+    onehot = np.zeros(NUM_OUTPUT)
+    onehot[action] = 1.0
+    HEADLESS_LAST["probs"] = surrogate
     return action, surrogate - onehot, surrogate
 
 
@@ -2016,7 +2183,11 @@ def train_snake_agent_with_ipc(episodes=10000,
             env = snake_switch.SelectionEnv(WAIT_INC, INPUT_SHAPE, **HP["selection"])
         if HP["reach"]:
             env = snake_switch.ReachEnv(WAIT_INC, INPUT_SHAPE, **HP["reach"])
-        if HP["move_log"] and (HP["selection"] or HP["reach"]):
+        if HP["arm"]:
+            env = {"coins": snake_switch.CoinGazeEnv, "shooter": snake_switch.ShooterEnv,
+                   "arena": snake_switch.ArenaEnv}.get(
+                HP["arm"].get("task"), snake_switch.ArmEnv)(WAIT_INC, INPUT_SHAPE, **HP["arm"])
+        if HP["move_log"] and (HP["selection"] or HP["reach"] or HP["arm"]):
             MOVE_LOG = MoveLog(HP["move_log"], env)
         if HP["memory"]:
             env = snake_switch.MemoryEnv(env, **HP["memory"])
@@ -2200,7 +2371,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                     reward_trace,
                 )
 
-                if env.wait_count == 0:
+                boundary = env.wait_count == 0          # a decision (Snake, selection) / the per-move bookkeeping (arm)
+                if boundary or ARM_STEP:
                     # compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].pull_from_device()
                     # print(sum(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view), sum(np.exp(compiled_net.neuron_populations[hidden_layers["E"]].vars["ISynSigmaEps"].view)) )
                     # print("----------------")
@@ -2257,8 +2429,12 @@ def train_snake_agent_with_ipc(episodes=10000,
                             if HEADLESS_POPVEC:     # continuous action: the population vector itself
                                 action_label, PG = logits.copy(), np.zeros(NUM_OUTPUT)
                                 probs = headless_share(np.abs(logits))     # display proxy only
+                            elif HEADLESS_JOINTS:   # the arm: two joint velocities from four flexor / extensor pools
+                                action_label, PG, probs = headless_joints(logits)
                             else:
                                 action_label, PG, probs = headless_decide(logits)
+                        elif HP["arm_readout"] is not None:     # e-prop's own readout: a Gaussian policy
+                            action_label, PG, probs = arm_readout_policy(logits)
                         else:
                             action_label = np.random.choice(NUM_OUTPUT, p=probs)
 
@@ -2267,7 +2443,7 @@ def train_snake_agent_with_ipc(episodes=10000,
                             PG = (probs - y_true)
                         if CNN is not None:
                             cnn_state["prev"][2] = action_label
-                        if MOVE_LOG is not None:
+                        if MOVE_LOG is not None and boundary:
                             MOVE_LOG.decide(env, ep, action_label, logits)
                         
                         # log_p = np.log(probs + 1e-8)
@@ -2282,15 +2458,16 @@ def train_snake_agent_with_ipc(episodes=10000,
                         compiled_net.neuron_populations[policy].push_var_to_device("pre_PG")
                         abs_td_now = abs_td_sum / max(abs_td_weight, 1e-12)
                         coeff_now, e_now = 0.0, None
-                        if HP["entropy_bonus"] > 0:
+                        if HP["entropy_bonus"] > 0 and boundary:
                             coeff_now = entropy_bonus * (abs_td_now if HP["entropy_scale"] == "abs_td" else 1.0)
                             e_now = snake_switch.entropy_error(probs, coeff_now)
                             compiled_net.neuron_populations[policy].vars["pre_E"].view[:] = e_now
                             compiled_net.neuron_populations[policy].push_var_to_device("pre_E")
                             entropy_bonus *= HP["entropy_bonus_decay_env"]
-                        policy_monitor.decision(probs, PG, coeff_now, e_now, abs_td_now,
-                                                margin=HEADLESS_LAST["margin"] if HP["headless"] is not None else None)
-                        if HP["entropy_reward"] > 0:
+                        if boundary:
+                            policy_monitor.decision(probs, PG, coeff_now, e_now, abs_td_now,
+                                                    margin=HEADLESS_LAST["margin"] if HP["headless"] is not None else None)
+                        if HP["entropy_reward"] > 0 and boundary:
                             ent_r = HP["entropy_reward"] * float(
                                 -(probs * np.log(np.clip(probs, 1e-8, 1.0))).sum())
 
@@ -2311,8 +2488,9 @@ def train_snake_agent_with_ipc(episodes=10000,
                         #     compiled_net.neuron_populations[policy], "actionTaken", 1.0
                         # )
                         
-                    current_probs.append(env.env_probs(probs) if isinstance(env, snake_switch.SwitchingEnv)
-                                         else probs)
+                    if boundary:
+                        current_probs.append(env.env_probs(probs) if isinstance(env, snake_switch.SwitchingEnv)
+                                             else probs)
 
                 obs, reward, done = env.step(action_label)
                 if done and HP["episodic_traces"]:
@@ -2347,6 +2525,8 @@ def train_snake_agent_with_ipc(episodes=10000,
                     compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
                     feed_cue(env)
                     feed_code(obs, env)
+                elif ARM_STEP:                          # the arm moves every step: so does the view
+                    compiled_net.set_input({input_pop: obs_to_poisson_rate(obs)})
                 # spikes = make_rate_coded_spikes(
                 #     obs.reshape(-1),
                 #     compiled_net.genn_model.timestep,

@@ -8,14 +8,18 @@
     python sweep.py evaluate STUDY --seeds 100-104           # full-length runs of the study's best config
 
 Each study (studies.py) samples `n` configurations (the inherited/hand-tuned point plus a scrambled Sobol
-sequence over `space`), runs all of them for rungs[0] timesteps, keeps the best `keep` fraction, reruns those
+sequence over `space`; or, with "sampler": "mutate", a parent point and mutants of it, each gene mutating with its
+own probability and step from "mutate": {gene: (probability, step)}), runs all of them for rungs[0] timesteps, keeps the best `keep` fraction, reruns those
 for rungs[1] timesteps with more seeds, and so on. Every run is an independent `run_headless.py` process with
 its own folder and a complete SNAKE_CONFIG json. The study's winner is written to studies/<study>/best.json:
 
     SNAKE_CONFIG=hpo/studies/proposed/best.json python run_headless.py
 
 Score of a run: reward per environment step over the last `window` fraction of its timesteps (from the
-CSV the Snake script writes; independent of episode length). Runs are compared on common seeds.
+CSV the Snake script writes; independent of episode length). Runs are compared on common seeds. A study with
+"score": "arm_cos" (the arm) is scored instead by the mean cosine between the hand's movement and the target
+direction in the move log over the last `window` of its timesteps; "arm_progress" by the mean progress toward the
+target per move-log window (displacement x cosine: direction and speed).
 """
 import argparse
 import atexit
@@ -134,6 +138,57 @@ def sample(space, n, seed):
     return points
 
 
+def parent_point(s, root):
+    """The parent of a "mutate" study: s["parent"] ({gene: value}), or the gene values of the config in
+    s["parent_from"] (a best.json path, absolute or relative to the studies root). Gene "*" (a whole override,
+    e.g. intrinsic plasticity on / off) is read as its non-empty choice if the parent matches it, else {}."""
+    if s.get("parent") is not None:
+        return dict(s["parent"])
+    path = Path(s["parent_from"])
+    cfg = json.loads((path if path.is_absolute() else root / path).read_text())
+    out = {}
+    for k, spec in s["space"].items():
+        if k == "*":                     # the "off" override: matched when the parent has those keys set to it
+            off = next((v for v in spec[1] if v), {})
+            out[k] = off if off and all(cfg.get(kk, None) == vv for kk, vv in off.items()) else {}
+        else:
+            out[k] = get_path(cfg, k)
+    missing = [k for k, v in out.items() if v is None]
+    if missing:
+        raise SystemExit(f"parent {path} has no value for {missing}")
+    return out
+
+
+def sample_mutate(space, mutate, parent, n, seed):
+    """n points around `parent`: index 0 is the parent itself, the rest mutants. Gene k mutates with probability
+    mutate[k][0]: "log" genes are multiplied by exp(N(0, step)), "lin" genes move by N(0, step x range), both
+    clipped to the space's range; "choice" genes switch to another value. Every mutant changes at least one gene."""
+    rng = np.random.default_rng(seed)
+    keys = list(space)
+    points = [dict(parent)]
+    while len(points) < n:
+        p, changed = dict(parent), False
+        for k in keys:
+            prob, step = mutate.get(k, (0.0, 0.0))
+            if rng.random() >= prob:
+                continue
+            kind, *args = space[k]
+            if kind == "log":
+                v = float(np.clip(parent[k] * math.exp(rng.normal(0, step)), args[0], args[1]))
+            elif kind == "lin":
+                v = float(np.clip(parent[k] + rng.normal(0, step * (args[1] - args[0])), args[0], args[1]))
+            elif kind == "choice":
+                others = [x for x in args[0] if x != parent[k]]
+                v = others[rng.integers(len(others))] if others else parent[k]
+            else:
+                raise ValueError(f"{k}: unknown kind {kind}")
+            p[k] = float(f"{v:.4g}") if isinstance(v, float) else v
+            changed = changed or p[k] != parent[k]
+        if changed:
+            points.append(p)
+    return points
+
+
 def grid_points(space):
     import itertools
     keys = list(space)
@@ -156,6 +211,9 @@ def apply_point(cfg, point):
 def run_config(base, point, seed, budget, prefix):
     cfg = apply_point(copy.deepcopy(base), point)
     cfg.update(seed=seed, max_timesteps=budget, min_episodes=0, csv_prefix=prefix, repetition=0, trace_log=False)
+    if isinstance(cfg.get("arm"), dict):
+        # paired design: within a seed every configuration reaches for the same sequence of targets
+        cfg["arm"] = {**cfg["arm"], "seed": seed}
     if isinstance(cfg.get("switch"), dict):
         # paired design: within a seed every rule gets the same sequence of task switches; seeds get different ones
         cfg["switch"] = {**cfg["switch"], "seed": seed}
@@ -251,6 +309,9 @@ class Job:
             # the run exits normally only after max_timesteps; the CSV's ep_steps add up to a few % less than
             # the simulation's timesteps, so the window is placed on the CSV's own timeline
             score = window_rate(data[0], data[1], timesteps, frac)
+            if SCORE["mode"] in ("arm_cos", "arm_progress"):
+                score = arm_cos(self.csv.with_name(self.csv.stem + "_moves.csv"), frac,
+                                progress=SCORE["mode"] == "arm_progress")
             score = score if np.isfinite(score) else float("-inf")
             if self.cfg.get("switch"):
                 # snake_switch: the score is the number of task switches reached; the reward rate at the end
@@ -264,6 +325,25 @@ class Job:
 
 
 RUNNING = set()
+SCORE = {"mode": "reward"}          # set per study by run_study / evaluate ("reward" | "arm_cos" | "arm_progress")
+
+
+def arm_cos(moves_path, frac, progress=False):
+    """Mean cosine (hand movement vs target direction) of the move log over its last `frac` of timesteps; with
+    progress, the mean progress toward the target per window instead (the hand's displacement x that cosine:
+    direction and speed, so a slow arm that only points at the target does not score as one that gets there)."""
+    try:
+        a = np.genfromtxt(moves_path, delimiter=",", names=True)
+    except (OSError, ValueError, StopIteration):
+        return float("nan")
+    if a.size == 0 or a.dtype.names is None or "cos" not in a.dtype.names:
+        return float("nan")
+    a = np.atleast_1d(a)
+    t = a["timestep"]
+    sel = (t > t.max() * (1 - frac)) & np.isfinite(a["cos"])
+    if not sel.any():
+        return float("nan")
+    return float((a["cos"][sel] * a["speed"][sel]).mean() if progress else a["cos"][sel].mean())
 
 
 def _die_with_parent():
@@ -363,21 +443,34 @@ def rung_scores(results, rung):
     return {c: (float(np.mean(v)) if all(np.isfinite(v)) else float("-inf")) for c, v in by.items()}
 
 
+def n_keep(s, rung, alive):
+    """Configurations promoted to `rung` (>= 1): s["keep"] is a fraction for every rung, or a list per promotion
+    whose entries are fractions (< 1) or counts (>= 1)."""
+    k = s["keep"][rung - 1] if isinstance(s["keep"], (list, tuple)) else s["keep"]
+    return max(1, min(alive, int(k) if k >= 1 else math.ceil(alive * k)))
+
+
 def plan_study(name):
     s = study(name)
     configs = [s["n"]]
-    for _ in s["rungs"][1:]:
-        configs.append(max(1, math.ceil(configs[-1] * s["keep"])))
+    for r in range(1, len(s["rungs"])):
+        configs.append(n_keep(s, r, configs[-1]))
     runs = [c * k for c, k in zip(configs, s["seeds"])]
     return configs, runs, sum(r * b for r, b in zip(runs, s["rungs"]))
 
 
 def run_study(name, root, jobs, retry_failed=False):
     s = study(name)
+    SCORE["mode"] = s.get("score", "reward")
     sdir = root / name
     sdir.mkdir(parents=True, exist_ok=True)
     base = base_config(name, root)
-    points = grid_points(s["space"]) if s.get("grid") else sample(s["space"], s["n"], s.get("sobol_seed", 0))
+    if s.get("grid"):
+        points = grid_points(s["space"])
+    elif s.get("sampler") == "mutate":         # mutants of a parent (e.g. another task's winner)
+        points = sample_mutate(s["space"], s["mutate"], parent_point(s, root), s["n"], s.get("sobol_seed", 0))
+    else:
+        points = sample(s["space"], s["n"], s.get("sobol_seed", 0))
     (sdir / "points.json").write_text(json.dumps({"base": base, "points": points}, indent=1))
     res_path = sdir / "results.jsonl"
     alive = list(range(len(points)))
@@ -385,7 +478,7 @@ def run_study(name, root, jobs, retry_failed=False):
         results = load_results(res_path)
         if rung > 0:
             prev = rung_scores(results, rung - 1)
-            k = max(1, math.ceil(len(alive) * s["keep"]))
+            k = n_keep(s, rung, len(alive))
             alive = sorted(alive, key=lambda c: -prev.get(c, float("-inf")))[:k]
         specs = []
         for c in alive:
@@ -459,6 +552,7 @@ def evaluate(name, root, seeds, jobs, budget):
     best = root / name / "best.json"
     if not best.exists():
         raise SystemExit(f"{best} not found: run the study first")
+    SCORE["mode"] = study(name).get("score", "reward")
     cfg0 = json.loads(best.read_text())
     edir = root / name / "eval"
     res_path = edir / "results.jsonl"
