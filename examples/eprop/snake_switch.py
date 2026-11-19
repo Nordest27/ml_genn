@@ -1326,6 +1326,11 @@ class ArmEnv:
             a = a * np.array([1.0, (self.l1 + self.l2) / 2])
         self.theta = self._clip(self.theta + self.joint_speed * a)
         self.steps += 1
+        from collections import deque
+        if not hasattr(self, "_trail"):
+            self._trail = deque(maxlen=150)
+        self._trail.append(self.hand().copy())
+        self._flash = max(0, getattr(self, "_flash", 0) - 1)
         d1 = np.linalg.norm(self.offset)
         if boundary:                                  # the move log's measures: the hand's displacement over the window
             h0, o0 = self._win
@@ -1343,6 +1348,7 @@ class ArmEnv:
             reward = w * self.progress * (n0 - d1)
         self._tsteps += 1
         if d1 < self.cur_radius:
+            self._flash = 15
             self.snake.append(None)
             reward += self.reach_reward
             self.reaches += 1
@@ -1375,8 +1381,51 @@ class ArmEnv:
         self._render()
         return self._obs, reward, self.done
 
+    def world_img(self, size=200):
+        """The arm from above, RGB uint8 (size x size): the reachable disc, the links, the hand and its recent trail,
+        the target (red; green for a few steps after a reach). Point kinematics: a frame of +-1 around the hand.
+        Drawn at <= 120 px with each disc painted only inside its bounding box, then scaled up (cheap enough for the
+        training loop's per-move frames)."""
+        k = int(np.ceil(size / 120))
+        n = size // k                                          # rendered at n px, scaled by k (n k <= size)
+        c0 = self.hand() if self.kinematics == "point" else np.zeros(2)
+        half, px = 1.0, 2.0 / n
+        img = np.full((n, n, 3), 30, np.uint8)
+        def disc(p, r, col):
+            p = np.asarray(p, dtype=np.float64)
+            cx, cy = (p[0] - c0[0] + half) / px, (half - (p[1] - c0[1])) / px      # pixel coordinates
+            rr = max(r / px, 0.5)
+            x0, x1 = int(max(0, np.floor(cx - rr))), int(min(n, np.ceil(cx + rr) + 1))
+            y0, y1 = int(max(0, np.floor(cy - rr))), int(min(n, np.ceil(cy + rr) + 1))
+            if x0 >= x1 or y0 >= y1:
+                return
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            m = (xx + 0.5 - cx) ** 2 + (yy + 0.5 - cy) ** 2 <= rr * rr
+            img[y0:y1, x0:x1][m] = col
+        if self.kinematics != "point":
+            disc(np.zeros(2), self.l1 + self.l2, (70, 70, 70))
+        if self.target is not None:
+            disc(self.target, self.cur_radius, (60, 200, 90) if getattr(self, "_flash", 0) > 0 else (220, 70, 70))
+        for p in list(getattr(self, "_trail", []))[::3]:
+            disc(p, 1.2 * px, (90, 140, 220))
+        if self.kinematics != "point":
+            e, hd = self.elbow(), self.hand()
+            for a, b in ((np.zeros(2), e), (e, hd)):
+                for t in np.linspace(0, 1, max(8, int(np.linalg.norm(b - a) / px))):
+                    disc(a + t * (b - a), 1.0 * px, (235, 235, 235))
+            disc(np.zeros(2), 2 * px, (200, 200, 200)); disc(e, 2 * px, (200, 200, 200))
+        disc(self.hand(), 2.5 * px, (60, 120, 255))
+        if k == 1 and n == size:
+            return img
+        big = np.kron(img, np.ones((k, k, 1), np.uint8))
+        pad = size - big.shape[0]
+        return np.pad(big, ((pad // 2, pad - pad // 2), (pad // 2, pad - pad // 2), (0, 0)), constant_values=30)
+
     def img(self, scale=10):
-        return np.kron((self._obs * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))
+        """The arm from above (left) next to the network's input (right), for the training loop's frames."""
+        view = np.kron((np.clip(self._obs, 0, 1) * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))
+        h = view.shape[0]
+        return np.concatenate([self.world_img(h), np.full((h, 4, 3), 255, np.uint8), view], axis=1)
 
 
 def joint_velocities(stats, gain):
@@ -1841,11 +1890,14 @@ class ArenaEnv:
     positions (sub-pixel: the share of brightness between neighbouring cells encodes where in the cell an object is;
     drawn over the floor with a maximum per channel); "pixels": single cells (`blob` 0; squares of half-size `blob`
     cells otherwise). Projectiles are bumps / single cells too.
-    `curriculum`: None or {"n0": 8, "n1": 2, "e0": 1, "e1": 3, "v0": 0.004, "v1": 0.012, "light0": 0.45,
-    "light1": 0.2, "step": 0.05, "up": 15, "down": 3}: a level in [0, 1] sets coins, enemies, their speed and both
+    `curriculum`: None or {"n0": 16, "n1": 2, "e0": 0, "e1": 3, "v0": 0.004, "v1": 0.012, "light0": 0.6,
+    "light1": 0.2, "step": 0.05, "up": 15, "down": 3, "d0": 0, "d1": 4} (PPO learns this one: foraging first, no
+    enemies and big lights at level 0; with 8 coins, 1 enemy and 0.45 lights it learned to hide instead): a level in [0, 1] sets coins, enemies, their speed and both
     lights' radius (each from its first to its second value); after each segment the level rises by `step` if
-    coins + kills - hits >= `up`, falls if <= `down`.
-    `done` only every `segment_steps` steps (the world carries on); len(snake) - 1 the coins + kills of the segment.
+    coins - hits >= `up`, falls if <= `down`.
+    Only coins pay (`kill_reward` 0 by default: with a kill reward, enemies that respawn and chase the body were
+    farmed from a corner, coins ignored); shooting is defence against `hit_penalty`.
+    `done` only every `segment_steps` steps (the world carries on); len(snake) - 1 the coins of the segment.
     Move log: ctype = 8 directions to the nearest coin; good = the body moved within 45 degrees of it over the last
     window; move_info: coins, kills, hits, shots, lit (a coin or enemy lit), gaze, light, level.
     img(): the world from above next to the agent's view.
@@ -1862,7 +1914,7 @@ class ArenaEnv:
     def __init__(self, wait_inc, inp_shape, world=1.0, n_coins=8, n_enemies=1, body_speed=0.02, enemy_speed=0.004,
                  reach=0.6, light=0.45, gaze_smooth=0.3, shot_speed=0.06, cooldown=8, fire_threshold=0.5,
                  coin_radius=0.06, hit_radius=0.07, touch_radius=0.06, spawn_dist=0.6, coin_reward=1.0,
-                 kill_reward=1.0, hit_penalty=1.0, floor=0.3, dark=0.01, glow=0.05, blob=0, frame=None,
+                 kill_reward=0.0, hit_penalty=1.0, floor=0.3, dark=0.01, glow=0.05, blob=0, frame=None,
                  segment_steps=3000, noise=0.0, seed=None, task="arena", curriculum=None, render="bumps",
                  sigma=0.8, record_every=0, record_dir="outputs/arena_segments", n_coin_decoys=0, n_enemy_decoys=0):
         self.wait_inc, self.wait_count = int(wait_inc), int(wait_inc)
@@ -1883,9 +1935,9 @@ class ArenaEnv:
             raise ValueError("arena render: 'bumps' or 'pixels'")
         if self.inp_shape[2] != 3 or self.n_coins < 1 or self.n_enemies < 0 or self.light <= 0 or self.cooldown < 1:
             raise ValueError("arena: 3 input channels (RGB), n_coins >= 1, n_enemies >= 0, light > 0, cooldown >= 1")
-        self.curriculum = None if curriculum is None else {"n0": 8, "n1": 2, "e0": 1, "e1": 3, "v0": 0.004,
-                                                           "v1": 0.012, "light0": 0.45, "light1": 0.2, "step": 0.05,
-                                                           "up": 15, "down": 3, "d0": None, "d1": None,
+        self.curriculum = None if curriculum is None else {"n0": 16, "n1": 2, "e0": 0, "e1": 3, "v0": 0.004,
+                                                           "v1": 0.012, "light0": 0.6, "light1": 0.2, "step": 0.05,
+                                                           "up": 15, "down": 3, "d0": 0, "d1": 4,
                                                            **dict(curriculum)}
         c = self.curriculum
         self.half = (self.reach + (self.light if c is None else max(c["light0"], c["light1"]))) if frame is None \
@@ -2025,7 +2077,7 @@ class ArenaEnv:
 
     def reset(self):
         if self.curriculum is not None and self.episode >= 0:
-            c, score = self.curriculum, (len(self.snake) - 1) - self.hits      # the segment that ended
+            c, score = self.curriculum, self.n_got - self.hits              # the segment that ended: coins - hits
             if score >= c["up"]:
                 self.level = min(1.0, self.level + c["step"])
             elif score <= c["down"]:
@@ -2108,7 +2160,7 @@ class ArenaEnv:
                 hit = keep & (np.linalg.norm(self.shots[:, :2] - self.enemies[i], axis=1) < self.hit_radius)
                 if hit.any():
                     keep[np.flatnonzero(hit)[0]] = False
-                    reward += self.kill_reward; self.kills += 1; self.snake.append(None)
+                    reward += self.kill_reward; self.kills += 1
                     self.enemies[i] = self._spawn_enemy()
                     continue
             if np.linalg.norm(self.enemies[i] - self.body) < self.touch_radius:
@@ -2136,25 +2188,40 @@ class ArenaEnv:
         return self._obs, reward, self.done
 
     def world_img(self, size=80):
-        xs = ((np.arange(size) + 0.5) / size * 2 - 1) * self.world
+        """The whole world from above, RGB uint8 (size x size), drawn at <= 120 px with local discs, then scaled up."""
+        k = int(np.ceil(size / 120))
+        n = size // k                                          # rendered at n px, scaled by k (n k <= size)
+        px = 2 * self.world / n
+        img = np.full((n, n, 3), 25, np.uint8)
+        xs = ((np.arange(n) + 0.5) / n * 2 - 1) * self.world
         g = np.stack(np.broadcast_arrays(xs[None, :], xs[::-1][:, None]), -1)
-        img = np.full((size, size, 3), 25, np.uint8)
         img[self.lit(g)] = (90, 90, 90)
         def dot(p, col, r):
-            img[np.linalg.norm(g - p, axis=-1) <= r] = col
+            cx, cy = (p[0] + self.world) / px, (self.world - p[1]) / px
+            rr = max(r / px, 0.5)
+            x0, x1 = int(max(0, np.floor(cx - rr))), int(min(n, np.ceil(cx + rr) + 1))
+            y0, y1 = int(max(0, np.floor(cy - rr))), int(min(n, np.ceil(cy + rr) + 1))
+            if x0 >= x1 or y0 >= y1:
+                return
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            img[y0:y1, x0:x1][(xx + 0.5 - cx) ** 2 + (yy + 0.5 - cy) ** 2 <= rr * rr] = col
         for p in self.coins:
             dot(p, (240, 220, 40) if self.lit(p) else (100, 90, 30), self.coin_radius)
         for p in self.enemies:
             dot(p, (230, 50, 50) if self.lit(p) else (100, 30, 30), 0.05)
         for p in (self.coin_decoys if self.coin_decoys is not None else []):
-            dot(p, (70, 70, 40), self.coin_radius)              # decoys: dull, they glow only to the agent
+            dot(p, (70, 70, 40), self.coin_radius)
         for p in (self.enemy_decoys if self.enemy_decoys is not None else []):
             dot(p, (70, 40, 40), 0.05)
         for sh in self.shots:
             dot(sh[:2], (120, 160, 255), 0.02)
         dot(self.gaze, (220, 220, 255), 0.02)
         dot(self.body, (60, 120, 255), 0.05)
-        return img
+        if k == 1 and n == size:
+            return img
+        big = np.kron(img, np.ones((k, k, 1), np.uint8))
+        pad = size - big.shape[0]
+        return np.pad(big, ((pad // 2, pad - pad // 2), (pad // 2, pad - pad // 2), (0, 0)), constant_values=30)
 
     def img(self, scale=10):
         view = np.kron((np.clip(self._obs, 0, 1) * 255).astype(np.uint8), np.ones((scale, scale, 1), dtype=np.uint8))

@@ -533,7 +533,7 @@ def test_arena():
     e.body = np.array([0.95, 0.0]); e._render(); o = e.get_local_img_observation()
     assert np.allclose(o[10, 19], 0.0)                                             # outside the world: black
     c = snake_switch.ArenaEnv(0, SHAPE, seed=0, curriculum={"step": 1.0, "up": 1, "down": -1})
-    c.reset(); c.snake.append(None); c.reset()
+    c.reset(); c.n_got = 1; c.reset()
     assert c.level == 1.0 and len(c.coins) == 2 and len(c.enemies) == 3 and c.light == pytest.approx(0.2)
     assert c.img(scale=4).shape == (80, 164, 3)
 
@@ -621,4 +621,17 @@ def test_arena_decoys():
     assert r == 0.0 and e.hits == 0 and e.n_got == 0
     c = snake_switch.ArenaEnv(0, SHAPE, seed=0, curriculum={"d0": 0, "d1": 4, "step": 1.0, "up": 1, "down": -1})
     c.reset(); assert len(c.coin_decoys) == 0
-    c.snake.append(None); c.reset(); assert len(c.coin_decoys) == 4 and len(c.enemy_decoys) == 4
+    c.n_got = 1; c.reset(); assert len(c.coin_decoys) == 4 and len(c.enemy_decoys) == 4
+
+
+@pytest.mark.parametrize("kin", ["arm", "polar", "point"])
+def test_arm_img_shows_world_and_view(kin):
+    """ArmEnv.img: the arm from above next to the network's input (as the arena's), uint8 RGB."""
+    e = snake_switch.ArmEnv(0, SHAPE, seed=0, kinematics=kin, view="ego" if kin == "point" else "hand",
+                            joint_speed=0.02, continuous=True, episode_per_target=True)
+    e.reset()
+    for _ in range(20):
+        e.step([0.5, -0.5])
+    im = e.img(scale=6)
+    assert im.dtype == np.uint8 and im.shape == (120, 120 + 4 + 120, 3)
+    assert (im[:, :120] == [60, 120, 255]).all(-1).any()                     # the hand is drawn

@@ -1,0 +1,113 @@
+{
+ "monitor": false,
+ "monitor_every": 10000,
+ "backend": null,
+ "gamma_env": 0.74,
+ "td_lambda_env": 0.74,
+ "episodic_traces": true,
+ "entropy_bonus": 0.0,
+ "headless": {
+  "seed": 0,
+  "decoder": "joints",
+  "gain": 1.0,
+  "motor_rule": {
+   "eprop": 1.0,
+   "drift": 0.0,
+   "gradient": 0.0,
+   "local": null,
+   "eprop_center_td": true,
+   "center_drift": false,
+   "center_gradient": false
+  },
+  "joints_decay": 0.97,
+  "joints_balance": 0.0001,
+  "joints_dist": "beta",
+  "beta_scale": 50
+ },
+ "selection": null,
+ "move_log": {
+  "probe_every": 1000000000000,
+  "probe_moves": 16
+ },
+ "toroidal": "local",
+ "local": {
+  "sigma_cells": 0.75,
+  "p_max": 0.791,
+  "input_sigma_cells": 1.857,
+  "inhibition_scale": 7.963,
+  "feedforward_inhibition": true,
+  "p_global": 0.0,
+  "inhibition_sigma_ratio": 1.891,
+  "input_sigma_ref": "source"
+ },
+ "network": {
+  "fields": {
+   "conn": {
+    "sigma_cells": 1.124,
+    "mean_scale": 2.067815588166857,
+    "sd_scale": 0.4135631176333714
+   },
+   "shape": 4,
+   "conn_i": {
+    "sigma_cells": 1.124,
+    "mean_scale": 0.25,
+    "sd_scale": 0.05
+   }
+  },
+  "input": {
+   "mean_scale": 0.4725751766572225,
+   "sd_scale": 0.23628758832861124
+  },
+  "layers": [
+   {}
+  ]
+ },
+ "ei_layers": 1,
+ "hid_e": 6,
+ "hid_i": 4,
+ "fan_in": 50,
+ "arm": {
+  "joint_speed": 0.02,
+  "continuous": true,
+  "episode_per_target": true,
+  "curriculum": {},
+  "target_steps": 300,
+  "reward_mode": "progress",
+  "progress_fade": 0.5,
+  "kinematics": "arm",
+  "view": "hand",
+  "target_time": {},
+  "seed": 0,
+  "record_every": 1000,
+  "record_dir": "outputs/arm_episodes"
+ },
+ "lr": 5.34e-06,
+ "c_reg": 0.0,
+ "intrinsic_plasticity": {
+  "eta": 1.362e-06,
+  "psi_target": 0.1677
+ },
+ "hidden_rule": {
+  "preset": "proposed",
+  "drift": 1.0,
+  "gradient": 1.0,
+  "center_drift": true,
+  "center_gradient": true,
+  "local": {
+   "route": "GRADIENT_INSTANT",
+   "dv": 0.0,
+   "vreg": 0.007651,
+   "rate": 0.002149,
+   "decorr": 0.001316,
+   "contrast": 0.1401,
+   "contrast_route": "GRADIENT_TRACE"
+  },
+  "log_syn_sigma": 1.122
+ },
+ "seed": 0,
+ "max_timesteps": 30000000,
+ "min_episodes": 0,
+ "csv_prefix": "arm_mexhat1L_ours_lr025",
+ "repetition": 0,
+ "trace_log": false
+}
